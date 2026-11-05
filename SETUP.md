@@ -10,7 +10,7 @@
 | 운용 스크립트·설정 (`*.sh`, `.env`, `docker-compose.yaml`, `config/`, `core/etc/*.yaml`, `docs/`, `MANUAL.md`) | 추적 | — |
 | VA / non-VA 서비스 (`va_service/`, `nonva_service/` 코드, `requirements.txt`) | 추적 | venv: `scripts/setup_venvs.sh`, 인증서: `scripts/make_certs.sh` |
 | PPO 슬라이싱 xApp Python 번들 (`xapp_ppo/*`, 학습된 `actor.pt` 포함) | 추적 | venv: `scripts/setup_venvs.sh` |
-| Aerial cuPHY (FAPI-Aware Scheduler L1) `aerial-cuda-accelerated-ran/` | **서브모듈** = 포크 `MySprtlty/aerial-cuda-accelerated-ran` 브랜치 `hybrid` | 빌드: `./dgist.sh build-l1` (컨테이너 안 Ninja, `build.aarch64_f1002/`) |
+| Aerial cuPHY (FAPI-Aware Scheduler L1) `aerial-cuda-accelerated-ran/` | **서브모듈**(포크 `MySprtlty/aerial-cuda-accelerated-ran`, GitHub에 있는 커밋 `aerial/BASE_COMMIT`) **+ 패치 묶음 `aerial/`**(그 이후 우리 변경분; 포크에는 푸시하지 않음) | `./aerial/apply_patches.sh` → 빌드: `./dgist.sh build-l1` (컨테이너 안 Ninja, `build.aarch64_f1002/`) |
 | OAI gNB + FlexRIC (연구실 MAC 쿼터 스케줄러·E2 agent·xApp) `openairinterface5g/` | **패치 묶음** `oai/` (업스트림 커밋 고정 + 변경분) | `./oai/fetch_oai.sh` → 이미지: `./dgist.sh build-oai`, RIC/xApp: `./ric.sh build` |
 | Open5GS 소스 `open5gs/` (v2.8.0) | **서브모듈** (업스트림) | 실행은 apt 패키지; 소스 빌드는 선택(`./core.sh build`) |
 | YOLO 가중치·ONNX·TensorRT 엔진 (`models/full26*/seg00_sm<N>.engine`) | 없음 | `scripts/build_yolo_engines.sh` (~3 h) |
@@ -30,8 +30,10 @@
 
 ```bash
 sudo -u nvidia -H bash
-git clone --recursive https://github.com/MySprtlty/dgist-ai-ran.git /home/nvidia/_dgist   # 서브모듈: aerial(hybrid), open5gs(v2.8.0)
+git lfs install                                                                           # Aerial의 testVectors/*.h5 는 git-lfs 객체
+git clone --recursive https://github.com/MySprtlty/dgist-ai-ran.git /home/nvidia/_dgist   # 서브모듈: aerial(포크 커밋), open5gs(v2.8.0)
 cd /home/nvidia/_dgist
+./aerial/apply_patches.sh     # 포크 커밋 이후의 DGIST 변경분(aerial/local.patch + files/) 적용 → 이 서버의 Aerial 트리와 동일
 ./oai/fetch_oai.sh            # OAI 87c016b + FlexRIC ef6d722f 얕은 클론 + 연구실/DGIST 패치 → ./openairinterface5g (약 1분)
 vi .env                       # 호스트에 맞게: FH_IF, RU_IP, BUILD_CPUS와 CPU 코어 지정, VA_IMSIS/NONVA_IMSIS(전화기 SIM), SM 클래스(DAPP_TENANT_CLASSES)
 ```
@@ -68,9 +70,9 @@ for nf in amf smf upf nrf ausf udm udr pcf nssf bsf scp; do ./core.sh install-co
 | 고치는 것 | 위치 | 빌드 | 커밋 |
 |---|---|---|---|
 | 스크립트·설정·서비스·xApp Python | `_dgist` 최상위 | — / `./va.sh restart` 등 | 이 저장소에 바로 `git commit && git push` |
-| cuPHY / FAPI-Aware Scheduler / dApp 테넌트 | `aerial-cuda-accelerated-ran/` (브랜치 `hybrid`) | `./dgist.sh build-l1` | 서브모듈 안에서 commit → 포크에 push → 상위에서 `git add aerial-cuda-accelerated-ran && git commit` |
+| cuPHY / FAPI-Aware Scheduler / dApp 테넌트 | `aerial-cuda-accelerated-ran/` | `./dgist.sh build-l1` | `./aerial/update_patches.sh` → `git add aerial && git commit` (포크에는 푸시하지 않음; 포크를 올리는 날에는 `aerial/BASE_COMMIT`을 그 커밋으로 바꾸고 패치를 재생성) |
 | OAI gNB / FlexRIC xApp | `openairinterface5g/` | `./dgist.sh build-oai`, `./ric.sh build` | `./oai/update_patches.sh` → `git add oai && git commit` |
 | Open5GS 소스 | `open5gs/` | `./core.sh build` | 수정 시 포크를 만들어 서브모듈 URL 변경 |
 | Open5GS 설정 | `core/etc/*.yaml` | `./core.sh install-config <nf>` | 이 저장소 |
 
-버전 기록: Aerial 25-3(커밋 654c249) 기반 포크 `hybrid`; OAI `87c016b5` + FlexRIC `ef6d722f`(`oai/README.md`); Open5GS v2.8.0; 변경 요약 `docs/CHANGES_DGIST_AERIAL.md`, `docs/CHANGES_HSW_OAI.md`, 개별 패치 `docs/patches/`.
+버전 기록: Aerial 25-3(커밋 654c249) 기반 포크 `hybrid` 커밋 `aerial/BASE_COMMIT` + `aerial/local.patch`; OAI `87c016b5` + FlexRIC `ef6d722f`(`oai/README.md`); Open5GS v2.8.0; 변경 요약 `docs/CHANGES_DGIST_AERIAL.md`, `docs/CHANGES_HSW_OAI.md`, 개별 패치 `docs/patches/`.

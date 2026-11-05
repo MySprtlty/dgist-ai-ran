@@ -1,0 +1,15 @@
+examples/xApp/c/kpm_rc/CMakeLists_original.txt
+examples/xApp/c/kpm_rc/xapp_ul_input_moni.c
+examples/xApp/c/slice/CMakeLists_1ue.txt
+examples/xApp/c/slice/CMakeLists_2ue.txt
+examples/xApp/c/slice/CMakeLists_original.txt
+examples/xApp/c/slice/xapp_slice_ppo_ctrl.c
+examples/xApp/c/slice/xapp_slice_prb_ctrl.c
+examples/xApp/c/slice/xapp_slice_quota_ctrl.c
+examples/xApp/c/slice/xapp_slice_two_service_ctrl.c
+src/ric/iApp/xapp_ric_id_original.c
+src/sm/mac_sm/mac_data_ie.c
+src/sm/mac_sm/mac_data_ie.h
+src/sm/mac_sm/mac_dec_plain.c
+src/xApp/msg_handler_xapp_original.c
+src/xApp/sync_ui_original.c

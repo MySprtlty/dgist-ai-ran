@@ -1,0 +1,1137 @@
+--- upstream_hsw/app.py	2026-10-21 18:33:54.661810544 +0900
++++ app.py	2026-11-05 23:43:24.967707459 +0900
+@@ -1,13 +1,27 @@
+-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
++"""YOLO26x VA Service - UL/DL Latency Test (hsw yolo_service), DGIST dApp edition 2026-11-05
++
++What stays: the phone page (camera -> JPEG -> POST /detect_frame -> boxes + latency breakdown), /clock_sync, /save_latency_log (CSV),
++the PPO telemetry (/telemetry/*, service_common/) and the background virtual UE (bg_yolo.py). The hsw original is kept in upstream_hsw/.
++What changes: the inference. Instead of ultralytics YOLO inside this process, every frame is sent as one RUN request
++(model, QoS deadline, 4K JPEG) to the DGIST dApp agent inside the cuphycontroller (L1) process, and its reply - result figures and
++the detections - comes back to the phone (dapp_backend.py; protocol aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/docs/XAPP_INTERFACE.md).
++
++Settings come from the environment (_dgist/.env, exported by va.sh):
++  VA_BACKEND=dapp|local  VA_MODEL=26x  VA_DEADLINE_MS=200  VA_TARGET_FPS=5  VA_CAMERA_WIDTH=3840  VA_CAMERA_HEIGHT=2160
++  VA_JPEG_QUALITY=0.90  VA_MAX_INFLIGHT=4  VA_AGENT=127.0.0.1:9810  VA_LOG_DIR=<_dgist>/runs/va_service_log  VA_VERBOSE=0
++Run (va.sh start):  uvicorn app:app --host 0.0.0.0 --port 8000 --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt
++"""
++from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
+ from fastapi.responses import HTMLResponse
+ from pydantic import BaseModel
+-from ultralytics import YOLO
+ from PIL import Image
+ from pathlib import Path
+ from datetime import datetime
+ 
+ import csv
+ import io
++import os
++import sys
+ import time
+ import threading
+ from starlette.concurrency import run_in_threadpool
+@@ -15,30 +29,54 @@
+ 
+ 
+ # =====================================================
+-# Configuration
++# Configuration (environment; see the module docstring)
+ # =====================================================
+ 
+-MODEL_PATH = "yolo26x.pt"
+-DEVICE = 0
++HERE = Path(__file__).resolve().parent
++DGIST = HERE.parent
+ 
+-CAMERA_WIDTH = 1920
+-CAMERA_HEIGHT = 1080
+ 
+-TARGET_FPS = 10
+-JPEG_QUALITY = 0.90
++def _env(name, default, cast=str):
++    v = os.environ.get(name)
++    if v is None or v == "":
++        return default
++    try:
++        return cast(v)
++    except ValueError:
++        print(f"[VA] bad {name}={v!r}, using {default!r}", flush=True)
++        return default
++
++
++VA_BACKEND = _env("VA_BACKEND", "dapp")                 # dapp = DGIST agent in the L1 process | local = hsw original (ultralytics here)
++VA_MODEL = _env("VA_MODEL", "26x")                      # the one dApp model every frame asks for
++VA_DEADLINE_MS = _env("VA_DEADLINE_MS", 200, int)       # QoS: RUN qos.deadline_ms, and the per-frame E2E target judged on the phone
++VA_AGENT = _env("VA_AGENT", "127.0.0.1:9810")           # dApp agent (TCP; the dgist-l1 container runs with network host)
++VA_VERBOSE = _env("VA_VERBOSE", 0, int)                 # 1 = one console line per frame
++
++CAMERA_WIDTH = _env("VA_CAMERA_WIDTH", 3840, int)       # 4K UHD capture on the phone
++CAMERA_HEIGHT = _env("VA_CAMERA_HEIGHT", 2160, int)
++TARGET_FPS = _env("VA_TARGET_FPS", 5.0, float)          # requests per second per UE
++MAX_INFLIGHT = _env("VA_MAX_INFLIGHT", 4, int)          # unanswered frames a UE tolerates before skipping a capture
++JPEG_QUALITY = _env("VA_JPEG_QUALITY", 0.90, float)
++
++MODEL_PATH = _env("VA_LOCAL_MODEL", str(HERE / "yolo26x.pt"))   # local backend only
++DEVICE = 0
+ 
+ CLOCK_SYNC_SAMPLES = 30
+ CLOCK_SYNC_BEST_SAMPLES = 5
+ 
+ 
+ # =====================================================
+-# YOLO Model
++# Inference backend: dApp agent RUN (default) or the local YOLO
+ # =====================================================
+ 
+-print("Loading YOLO26x...")
+-model = YOLO(MODEL_PATH)
+-model_lock = threading.Lock()
+-print("YOLO26x loaded.")
++if str(HERE) not in sys.path:
++    sys.path.insert(0, str(HERE))
++from dapp_backend import make_backend   # noqa: E402
++
++print(f"VA service: backend {VA_BACKEND}, model {VA_MODEL}, QoS deadline {VA_DEADLINE_MS} ms, {TARGET_FPS:g} req/s per UE, "
++      f"camera {CAMERA_WIDTH}x{CAMERA_HEIGHT} JPEG q{JPEG_QUALITY:g}, agent {VA_AGENT}", flush=True)
++backend = make_backend(VA_BACKEND, agent=VA_AGENT, model=VA_MODEL, deadline_ms=VA_DEADLINE_MS, local_model_path=MODEL_PATH, device=DEVICE)
+ 
+ # GPU-wide NVML metrics (not per-UE). Initialized once at startup.
+ pynvml.nvmlInit()
+@@ -56,10 +94,10 @@
+ 
+ 
+ # =====================================================
+-# Log Directory
++# Log Directory (per-session CSVs of the phone / ue_sim.py)
+ # =====================================================
+ 
+-LOG_DIR = Path(__file__).resolve().parent.parent / "log" / "va_service_log"
++LOG_DIR = Path(_env("VA_LOG_DIR", str(DGIST / "runs" / "va_service_log")))
+ LOG_DIR.mkdir(parents=True, exist_ok=True)
+ 
+ 
+@@ -68,11 +106,9 @@
+ # =====================================================
+ 
+ app = FastAPI(
+-    title="YOLO26x VA Service - UL/DL Latency Test"
++    title="YOLO26x VA Service (DGIST dApp) - UL/DL Latency Test"
+ )
+-import sys
+-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+-from service_common.service_telemetry import attach_telemetry
++from service_common.service_telemetry import attach_telemetry   # noqa: E402  (./service_common, hsw module unchanged)
+ telemetry = attach_telemetry(app, 'va')
+ 
+ 
+@@ -109,6 +145,18 @@
+     sync_rtt_ms: float
+     gpu_util_percent: float | None = None
+     gpu_memory_used_gb: float | None = None
++    # DGIST additions (dApp backend): QoS verdict and the agent's per-request figures
++    qos_deadline_ms: float | None = None
++    qos_met: bool | None = None
++    dapp_status: str | None = None
++    dapp_reason: str | None = None
++    dapp_model: str | None = None
++    dapp_sm: int | None = None
++    dapp_wait_ms: float | None = None
++    dapp_decode_ms: float | None = None
++    dapp_infer_ms: float | None = None
++    dapp_latency_ms: float | None = None
++    detections: int | None = None
+ 
+ 
+ class LatencySession(BaseModel):
+@@ -121,10 +169,19 @@
+ # Web Page
+ # =====================================================
+ 
++def _page(s):
++    """fill the configuration placeholders of the page (camera size, rate, in-flight cap, JPEG quality, QoS, backend, model)"""
++    for k, v in (("__CAMERA_WIDTH__", CAMERA_WIDTH), ("__CAMERA_HEIGHT__", CAMERA_HEIGHT), ("__TARGET_FPS__", f"{TARGET_FPS:g}"),
++                 ("__MAX_INFLIGHT__", MAX_INFLIGHT), ("__JPEG_QUALITY__", f"{JPEG_QUALITY:g}"), ("__QOS_DEADLINE_MS__", VA_DEADLINE_MS),
++                 ("__VA_BACKEND__", VA_BACKEND), ("__VA_MODEL__", VA_MODEL)):
++        s = s.replace(k, str(v))
++    return s
++
++
+ @app.get("/", response_class=HTMLResponse)
+ async def home():
+ 
+-    return """
++    return _page("""
+ <!DOCTYPE html>
+ 
+ <html>
+@@ -136,7 +193,7 @@
+ <meta name="viewport"
+       content="width=device-width, initial-scale=1.0">
+ 
+-<title>YOLO26x VA - UL/DL Latency Test</title>
++<title>YOLO26x VA (DGIST dApp) - UL/DL Latency Test</title>
+ 
+ 
+ <style>
+@@ -145,15 +202,29 @@
+     font-family: Arial, sans-serif;
+ }
+ 
++h1 {
++    font-size: 20px;
++    margin: 6px 0;
++}
++
++#vaConfig, #vaTarget {
++    font-size: 12px;
++    margin: 2px 0;
++    color: #444;
++}
++
++/* DGIST: the controls sit above the video, so the video can take the full width (hsw sizing; a 4K portrait camera is tall - scroll) */
+ #videoContainer {
+     position: relative;
+-    width: 100%;
+-    max-width: 720px;
++    display: inline-block;
++    max-width: 100%;
+ }
+ 
+ #camera {
+     display: block;
+-    width: 100%;
++    max-width: 100%;
++    max-height: 75vh;
++    width: auto;
+     height: auto;
+     background: black;
+ }
+@@ -192,15 +263,8 @@
+ <body>
+ 
+ 
+-<h1>
+-    Real-Time Video
+-    <br>
+-    Analytics Service
+-</h1>
++<h1>Real-Time Video Analytics Service (DGIST dApp)</h1>
+ 
+-<p>
+-<strong>Target:</strong> 1080p / 10 FPS / JPEG Quality 0.90
+-</p>
+ 
+ 
+ <!-- =================================================
+@@ -225,10 +289,6 @@
+         style="display:none;">
+ </canvas>
+ 
+-
+-<br><br>
+-
+-
+ <!-- =================================================
+      Control
+      ================================================= -->
+@@ -244,7 +304,7 @@
+ <br><br>
+ 
+ <button onclick="startVA()">
+-    Start Streaming
++    Start VA (streaming)
+ </button>
+ 
+ <label>VA phone:
+@@ -252,7 +312,7 @@
+ </label>
+ 
+ <button onclick="stopVA()">
+-    Stop Streaming
++    Stop VA
+ </button>
+ 
+ <br><br>
+@@ -276,6 +336,13 @@
+ <strong id="frameYoloStatus">-</strong>
+ </p>
+ 
++<p id="vaConfig">backend __VA_BACKEND__ | model __VA_MODEL__ | QoS __QOS_DEADLINE_MS__ ms | __TARGET_FPS__ req/s per UE | __CAMERA_WIDTH__ x __CAMERA_HEIGHT__ JPEG q__JPEG_QUALITY__</p>
++<p id="vaTarget">
++<strong>Target:</strong> __CAMERA_WIDTH__x__CAMERA_HEIGHT__ / __TARGET_FPS__ FPS per UE / JPEG Quality __JPEG_QUALITY__ / QoS __QOS_DEADLINE_MS__ ms / model __VA_MODEL__ via dApp
++</p>
++
++
++
+ <hr>
+ 
+ 
+@@ -381,6 +448,16 @@
+ <h2>VA Service Latency</h2>
+ 
+ <p>
++QoS (E2E within __QOS_DEADLINE_MS__ ms):
++<strong id="qosStatus">-</strong>
++</p>
++
++<p>
++dApp reply (backend model status | SM | wait dec inf srv):
++<strong id="dappInfo">-</strong>
++</p>
++
++<p>
+ VA Service E2E Latency:
+ <strong id="e2eLatency">-</strong>
+ </p>
+@@ -432,14 +509,32 @@
+ // Configuration
+ // =====================================================
+ 
+-const CAMERA_WIDTH = 1920;
+-const CAMERA_HEIGHT = 1080;
++// filled by the server from _dgist/.env (VA_*): 4K capture, 5 req/s per UE, QoS 200 ms, model 26x by default
++const CAMERA_WIDTH = __CAMERA_WIDTH__;
++const CAMERA_HEIGHT = __CAMERA_HEIGHT__;
+ 
+-const TARGET_FPS = 10;
++const TARGET_FPS = __TARGET_FPS__;
+ const targetInterval = 1000 / TARGET_FPS;
+-const MAX_INFLIGHT = 4;
++const MAX_INFLIGHT = __MAX_INFLIGHT__;
++
++const JPEG_QUALITY = __JPEG_QUALITY__;
+ 
+-const JPEG_QUALITY = 0.90;
++const QOS_DEADLINE_MS = __QOS_DEADLINE_MS__;
++const VA_BACKEND = "__VA_BACKEND__";
++const VA_MODEL = "__VA_MODEL__";
++
++// DGIST diagnostics: the phone reports JS errors, camera settings and button presses to the server log (POST /client_log)
++function clientLog(kind, detail) {
++    try {
++        fetch("/client_log", {method: "POST", headers: {"Content-Type": "application/json"}, keepalive: true,
++               body: JSON.stringify({kind: kind, detail: String(detail).slice(0, 500), secure: window.isSecureContext,
++                                     ua: navigator.userAgent.slice(0, 120), t: Date.now()})}).catch(() => {});
++    } catch (e) {}
++}
++window.addEventListener("error", e => clientLog("js_error", e.message + " @" + e.filename + ":" + e.lineno));
++window.addEventListener("unhandledrejection", e => clientLog("promise_rejection", e.reason && (e.reason.message || e.reason)));
++clientLog("page", "loaded; mediaDevices=" + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
++          + " TelemetryClient=" + (typeof TelemetryClient) + " camera " + CAMERA_WIDTH + "x" + CAMERA_HEIGHT + " " + TARGET_FPS + " fps");
+ 
+ const CLOCK_SYNC_SAMPLES = 30;
+ const CLOCK_SYNC_BEST_SAMPLES = 5;
+@@ -459,6 +554,19 @@
+ let frameSequence = 0;
+ let latestDisplayedFrameId = 0;
+ let droppedFrames = 0;
++let qosMetCount = 0;
++let qosMissCount = 0;
++// DGIST rate diagnostics: why the achieved fps differs from TARGET_FPS (reported to the server every 5 s as [CLIENT ...] rate:)
++let skipBusy = 0, skipInflight = 0, encMsSum = 0, encMsMax = 0, encN = 0, sentN = 0, lastRateReport = 0;
++function rateReport() {
++    const now = performance.now();
++    if (lastRateReport === 0) { lastRateReport = now; return; }
++    if (now - lastRateReport < 5000) return;
++    const sec = (now - lastRateReport) / 1000.0;
++    clientLog("rate", "target " + TARGET_FPS + " fps | sent " + (sentN / sec).toFixed(2) + " fps | JPEG encode mean " + (encN ? (encMsSum / encN).toFixed(0) : "-") + " ms max " + encMsMax.toFixed(0)
++        + " ms | ticks skipped: capture busy " + skipBusy + ", inflight>=" + MAX_INFLIGHT + " " + skipInflight + " | inflight now " + inFlight);
++    skipBusy = 0; skipInflight = 0; encMsSum = 0; encMsMax = 0; encN = 0; sentN = 0; lastRateReport = now;
++}
+ let runToken = 0;
+ 
+ // Per-frame YOLO switch: upload always stays enabled while VA is running.
+@@ -809,6 +917,8 @@
+ 
+ 
+         await video.play();
++        try { const st = stream.getVideoTracks()[0].getSettings();
++              clientLog("camera", st.width + "x" + st.height + " @" + st.frameRate + " fps facing " + st.facingMode + ", video element " + video.videoWidth + "x" + video.videoHeight); } catch (e) {}
+ 
+ 
+         document.getElementById(
+@@ -842,6 +952,7 @@
+             "Camera Error";
+ 
+ 
++        clientLog("camera_error", error.name + ": " + error.message);
+         alert(
+             "Cannot access camera: "
+             + error.message
+@@ -900,6 +1011,7 @@
+ // =====================================================
+ 
+ async function startVA() {
++    clientLog("start_va", "pressed: camera=" + (stream !== null) + " running=" + running + " session=" + (telemetryClient !== null) + " ue=" + document.getElementById('ueSelector').value);
+ 
+     if (startingVA || telemetryClient !== null) {
+         alert('Stop the previous session before starting a new one.');
+@@ -949,6 +1061,7 @@
+             "Clock Sync Error";
+ 
+ 
++        clientLog("clock_sync_failed", error && (error.message || error));
+         alert(
+             "Clock synchronization failed."
+         );
+@@ -967,6 +1080,7 @@
+     } catch (error) {
+         telemetryClient = null;
+         startingVA = false;
++        clientLog("ue_identification_failed", error.message);
+         alert('UE identification failed: ' + error.message);
+         return;
+     }
+@@ -977,6 +1091,9 @@
+     frameSequence = 0;
+     latestDisplayedFrameId = 0;
+     droppedFrames = 0;
++    qosMetCount = 0;
++    qosMissCount = 0;
++    skipBusy = 0; skipInflight = 0; encMsSum = 0; encMsMax = 0; encN = 0; sentN = 0; lastRateReport = 0;
+     inFlight = 0;
+     captureBusy = false;
+     runToken++;
+@@ -1411,8 +1528,10 @@
+ 
+ async function sendLoop() {
+     if (!running) return;
++    rateReport();
+     if (captureBusy || inFlight >= MAX_INFLIGHT) {
+         droppedFrames++;
++        if (captureBusy) skipBusy++; else skipInflight++;
+         return;
+     }
+     captureBusy = true;
+@@ -1475,6 +1594,7 @@
+     // Convert Frame to JPEG
+     // =====================================================
+ 
++    const encStart = performance.now();
+     const blob =
+         await new Promise(
+             resolve => {
+@@ -1487,6 +1607,7 @@
+ 
+             }
+         );
++    const encMs = performance.now() - encStart; encN++; encMsSum += encMs; if (encMs > encMsMax) encMsMax = encMs;
+ 
+ 
+     if (blob === null) {
+@@ -1510,7 +1631,7 @@
+         return;
+     }
+     const currentFrameId = ++frameSequence;
+-    inFlight++;
++    inFlight++; sentN++;
+     captureBusy = false;
+ 
+     // =================================================
+@@ -1814,6 +1935,12 @@
+             e2eLatency
+             - breakdownSum;
+ 
++        // DGIST: QoS verdict of this frame = the VA E2E stayed within the deadline (and, with YOLO on, the dApp answered success)
++        const dapp = data.dapp || {};
++        const qosDeadline = (data.qos_deadline_ms !== undefined && data.qos_deadline_ms !== null) ? data.qos_deadline_ms : QOS_DEADLINE_MS;
++        const qosMet = data.yolo_enabled ? (dapp.status === "success" && e2eLatency <= qosDeadline) : (e2eLatency <= qosDeadline);
++        if (qosMet) qosMetCount++; else qosMissCount++;
++
+ 
+         if (thisRun !== runToken && !running) {
+             // Still record responses for the stopped session until log saving.
+@@ -1950,8 +2077,18 @@
+                 ),
+ 
+             gpu_util_percent: data.gpu_util_percent,
+-            gpu_memory_used_gb: data.gpu_memory_used_gb
+-
++            gpu_memory_used_gb: data.gpu_memory_used_gb,
++            qos_deadline_ms: qosDeadline,
++            qos_met: qosMet,
++            dapp_status: dapp.status ?? null,
++            dapp_reason: dapp.reason ?? null,
++            dapp_model: dapp.model ?? null,
++            dapp_sm: dapp.sm ?? null,
++            dapp_wait_ms: dapp.wait_ms ?? null,
++            dapp_decode_ms: dapp.decode_ms ?? null,
++            dapp_infer_ms: dapp.infer_ms ?? null,
++            dapp_latency_ms: dapp.latency_ms ?? null,
++            detections: data.detections.length
+         });
+ 
+ 
+@@ -2061,6 +2198,16 @@
+             networkLatency.toFixed(2)
+             + " ms";
+ 
++        document.getElementById("qosStatus").innerText =
++            (qosMet ? "met" : "MISSED") + " | met " + qosMetCount + " / missed " + qosMissCount
++            + " (" + (100.0 * qosMetCount / Math.max(1, qosMetCount + qosMissCount)).toFixed(1) + " %)";
++        const fmt = (v, d) => (v === undefined || v === null) ? "-" : Number(v).toFixed(d);
++        document.getElementById("dappInfo").innerText = data.yolo_enabled
++            ? ((dapp.backend || VA_BACKEND) + " " + (dapp.model || VA_MODEL) + " " + (dapp.status || "-") + (dapp.reason ? "/" + dapp.reason : "")
++               + " | SM " + fmt(dapp.sm, 0) + " | wait " + fmt(dapp.wait_ms, 1) + " dec " + fmt(dapp.decode_ms, 1)
++               + " inf " + fmt(dapp.infer_ms, 1) + " srv " + fmt(dapp.latency_ms, 1) + " ms | det " + data.detections.length)
++            : "YOLO OFF";
++
+ 
+ 
+         // =================================================
+@@ -2151,6 +2298,7 @@
+ 
+     } catch (error) {
+         console.error("Frame upload/inference error:", error);
++        clientLog("frame_error", error.name + ": " + error.message);
+         void frameTelemetry.failure(currentFrameId);
+         droppedFrames++;
+         if (running && thisRun === runToken) {
+@@ -2169,7 +2317,7 @@
+ </body>
+ 
+ </html>
+-"""
++""")
+ 
+ 
+ # =====================================================
+@@ -2213,229 +2361,72 @@
+     ue_id: str = Form(...),
+     session_token: str = Form(...),
+ ):
++    """one camera frame: JPEG in -> RUN to the dApp agent (model VA_MODEL, qos.deadline_ms VA_DEADLINE_MS) -> its reply out.
++    Timestamps t1..t4 keep the hsw meaning: AI time = ai_start..ai_end = the whole RUN round trip to the agent (queue wait +
++    GPU decode + inference + socket), Server Other = everything else in this process."""
+     try:
+         telemetry.check(ue_id, session_token)
+     except ValueError as exc:
+         raise HTTPException(status_code=409, detail=str(exc)) from exc
+ 
+-    # =================================================
+-    # t1
+-    #
+-    # FastAPI handler starts after the uploaded
+-    # multipart request has arrived at the server.
+-    # =====================================================
+-
+-    server_receive_ms = (
+-        time.time_ns()
+-        / 1_000_000.0
+-    )
+-
+-
+-    # =================================================
+-    # Read Uploaded JPEG
+-    # =====================================================
+-
++    # t1: the complete multipart request has arrived
++    server_receive_ms = time.time_ns() / 1_000_000.0
+     image_data = await file.read()
+ 
++    # JPEG header only (width/height) - the 4K frame is NOT decoded on the CPU here: the dApp decodes it on the GPU (nvjpeg)
++    # inside the L1 process. (local backend: the decode happens inside backend.infer and counts as AI time.)
++    try:
++        with Image.open(io.BytesIO(image_data)) as im:
++            image_width, image_height = im.size
++    except Exception as exc:
++        raise HTTPException(status_code=400, detail=f"not a decodable image: {exc}") from exc
+ 
+-    # =================================================
+-    # Convert JPEG to RGB Image
+-    #
+-    # This time is NOT included in AI inference time.
+-    # It is included in Server Other Time.
+-    # =====================================================
+-
+-    image = Image.open(
+-        io.BytesIO(image_data)
+-    ).convert("RGB")
+-
+-
+-    # =================================================
+-    # t2
+-    #
+-    # AI Processing Start
+-    # =====================================================
+-
+-    ai_start_ms = (
+-        time.time_ns()
+-        / 1_000_000.0
+-    )
+-
++    # t2: AI start
++    ai_start_ms = time.time_ns() / 1_000_000.0
+ 
+-    # Snapshot of GPU-wide metrics associated with this frame.
+-    # NVML GPU Util is a recent sampling-window value, not per-frame usage.
++    # Snapshot of GPU-wide metrics associated with this frame (NVML util = recent sampling window, not per-frame usage).
+     gpu_util_percent, gpu_memory_used_gb = read_gpu_metrics()
+ 
+-    # =================================================
+-    # YOLO26-X Inference
+-    # =====================================================
+-
+     if enable_yolo:
+-        # Original YOLO26-X inference and bounding-box extraction.
+-        def run_prediction():
+-            with model_lock:
+-                return model.predict(source=image, device=DEVICE, verbose=False)
+-
+-        results = await run_in_threadpool(run_prediction)
+-
+-
+-        # =================================================
+-        # t3
+-        #
+-        # AI Processing End
+-        # =====================================================
+-
+-        ai_end_ms = (
+-            time.time_ns()
+-            / 1_000_000.0
+-        )
+-
+-
+-        processing_ms = (
+-            ai_end_ms
+-            - ai_start_ms
+-        )
+-
+-
+-        # =================================================
+-        # Detection Results
+-        # =====================================================
+-
+-        result = results[0]
+-
+-        detections = []
+-
+-
+-        for box in result.boxes:
+-
+-            # =============================================
+-            # Class
+-            # =============================================
+-
+-            class_id = int(
+-                box.cls[0]
+-            )
+-
+-
+-            class_name = result.names[
+-                class_id
+-            ]
+-
+-
+-            # =============================================
+-            # Confidence
+-            # =============================================
+-
+-            confidence = float(
+-                box.conf[0]
+-            )
+-
+-
+-            # =============================================
+-            # Bounding Box
+-            # =============================================
+-
+-            x1, y1, x2, y2 = (
+-                box.xyxy[0].tolist()
+-            )
+-
+-
+-            detections.append(
+-                {
+-                    "class":
+-                        class_name,
+-
+-                    "confidence":
+-                        round(
+-                            confidence,
+-                            3
+-                        ),
+-
+-                    "x1":
+-                        round(
+-                            float(x1),
+-                            2
+-                        ),
+-
+-                    "y1":
+-                        round(
+-                            float(y1),
+-                            2
+-                        ),
+-
+-                    "x2":
+-                        round(
+-                            float(x2),
+-                            2
+-                        ),
+-
+-                    "y2":
+-                        round(
+-                            float(y2),
+-                            2
+-                        )
+-                }
+-            )
+-
+-
+-
++        res = await run_in_threadpool(backend.infer, image_data, ue_id)
++        # t3: AI end (the agent's reply is in)
++        ai_end_ms = time.time_ns() / 1_000_000.0
++        processing_ms = ai_end_ms - ai_start_ms
++        detections = res["detections"]
++        dapp = res["dapp"]
++        if VA_VERBOSE:
++            print(f"[VA] {ue_id} {dapp.get('status')}{('/' + str(dapp.get('reason'))) if dapp.get('reason') else ''} {dapp.get('model')} "
++                  f"sm {dapp.get('sm')} wait {dapp.get('wait_ms')} dec {dapp.get('decode_ms')} inf {dapp.get('infer_ms')} "
++                  f"srv {dapp.get('latency_ms')} ai {processing_ms:.1f} ms det {len(detections)} {image_width}x{image_height} "
++                  f"{len(image_data) / 1024:.0f} KB", flush=True)
+     else:
+-        # No YOLO GPU kernels are submitted in this branch.
+-        # JPEG upload and decode still occur exactly as in the ON path.
+-        # AI latency is explicitly zero; decode/response work is Server Other.
++        # No inference request in this branch: upload + header read only, AI time explicitly zero.
+         ai_end_ms = ai_start_ms
+         processing_ms = 0.0
+         detections = []
++        dapp = None
+ 
+-
+-    # =================================================
+-    # t4
+-    #
+-    # GH200 has finished preparing application data
+-    # for the response.
+-    # =====================================================
+-
+-    server_send_ms = (
+-        time.time_ns()
+-        / 1_000_000.0
+-    )
+-
+-
+-    # =================================================
+-    # Response to iPhone
+-    # =====================================================
++    # t4: application data for the response is ready
++    server_send_ms = time.time_ns() / 1_000_000.0
+ 
+     return {
+-
+-        "processing_ms":
+-            processing_ms,
+-
+-        "yolo_enabled":
+-            enable_yolo,
+-
+-        "server_receive_ms":
+-            server_receive_ms,
+-
+-        "ai_start_ms":
+-            ai_start_ms,
+-
+-        "ai_end_ms":
+-            ai_end_ms,
+-
+-        "server_send_ms":
+-            server_send_ms,
+-
+-        "image_width":
+-            image.width,
+-
+-        "image_height":
+-            image.height,
+-
+-        "detections":
+-            detections,
+-
++        "processing_ms": processing_ms,
++        "yolo_enabled": enable_yolo,
++        "server_receive_ms": server_receive_ms,
++        "ai_start_ms": ai_start_ms,
++        "ai_end_ms": ai_end_ms,
++        "server_send_ms": server_send_ms,
++        "image_width": image_width,
++        "image_height": image_height,
++        "detections": detections,
+         "gpu_util_percent": gpu_util_percent,
+-        "gpu_memory_used_gb": gpu_memory_used_gb
++        "gpu_memory_used_gb": gpu_memory_used_gb,
++        # DGIST additions
++        "backend": VA_BACKEND,
++        "model": VA_MODEL,
++        "qos_deadline_ms": VA_DEADLINE_MS,
++        "ue_id": ue_id,
++        "dapp": dapp,
+     }
+ 
+ 
+@@ -2533,7 +2524,19 @@
+                 "clock_offset_ms",
+                 "sync_rtt_ms",
+                 "gpu_util_percent",
+-                "gpu_memory_used_gb"
++                "gpu_memory_used_gb",
++
++                "qos_deadline_ms",
++                "qos_met",
++                "dapp_status",
++                "dapp_reason",
++                "dapp_model",
++                "dapp_sm",
++                "dapp_wait_ms",
++                "dapp_decode_ms",
++                "dapp_infer_ms",
++                "dapp_latency_ms",
++                "detections"
+             ]
+         )
+ 
+@@ -2573,7 +2576,19 @@
+                     record.clock_offset_ms,
+                     record.sync_rtt_ms,
+                     record.gpu_util_percent,
+-                    record.gpu_memory_used_gb
++                    record.gpu_memory_used_gb,
++
++                    record.qos_deadline_ms,
++                    None if record.qos_met is None else int(record.qos_met),
++                    record.dapp_status,
++                    record.dapp_reason,
++                    record.dapp_model,
++                    record.dapp_sm,
++                    record.dapp_wait_ms,
++                    record.dapp_decode_ms,
++                    record.dapp_infer_ms,
++                    record.dapp_latency_ms,
++                    record.detections
+                 ]
+             )
+ 
+@@ -2608,7 +2623,35 @@
+     }
+ 
+ from bg_yolo import router as bg_router, configure_background
+-configure_background(model, model_lock, read_gpu_metrics, LOG_DIR, DEVICE)
++configure_background(backend, read_gpu_metrics, LOG_DIR)
+ app.include_router(bg_router)
+ 
+ 
++# =====================================================
++# Status (va.sh status): configuration, backend / agent state, active UE sessions
++# =====================================================
++
++@app.post("/client_log")
++async def client_log(body: dict, request: Request):
++    """diagnostics from the phone page (JS errors, camera settings, button presses) -> uvicorn log"""
++    host = request.client.host if request.client else "?"
++    print(f"[CLIENT {host}] {body.get('kind')}: {body.get('detail')} | secure={body.get('secure')} | {body.get('ua')}", flush=True)
++    return {"ok": True}
++
++
++@app.get("/va/status")
++async def va_status():
++    ue = {}
++    with telemetry.lock:
++        for u, row in telemetry.rows.items():
++            ue[u] = {k: row.get(k) for k in ("active", "status", "latency_ms", "frame_id", "failures")}
++    return {
++        "service": "va",
++        "config": {"backend": VA_BACKEND, "model": VA_MODEL, "deadline_ms": VA_DEADLINE_MS, "target_fps": TARGET_FPS,
++                   "max_inflight": MAX_INFLIGHT, "camera": [CAMERA_WIDTH, CAMERA_HEIGHT], "jpeg_quality": JPEG_QUALITY,
++                   "agent": VA_AGENT, "log_dir": str(LOG_DIR), "telemetry_dir": str(telemetry.directory)},
++        "backend": backend.status(),
++        "ue": ue,
++    }
++
++
+--- upstream_hsw/bg_yolo.py	2026-10-19 22:33:21.911653423 +0900
++++ bg_yolo.py	2026-11-05 17:45:43.098017333 +0900
+@@ -1,47 +1,64 @@
+ # =====================================================
+-# BACKGROUND VIRTUAL VA UE (same model and model_lock)
+-# No extra CUDA model/context or UE UL traffic.
++# BACKGROUND VIRTUAL VA UE (hsw bg_yolo.py, DGIST edition 2026-11-05)
++#
++# A "virtual UE" that sends the same inference requests the phone sends, without radio traffic: the configured backend
++# (dApp agent RUN, or the local model) receives one JPEG at the requested rate. Used to add YOLO load next to the real UEs.
++# Control is localhost-only: POST /background/prepare | /background/start {"fps": N} | /background/stop, GET /background/status,
++# or the command-line part at the end of this file:  python3 bg_yolo.py start --fps 5 | stop | status
+ # =====================================================
+ import os
+ import csv
+ import time
+ import threading
++import warnings
+ from pathlib import Path
+ from datetime import datetime
+-from PIL import Image
++warnings.filterwarnings("ignore", message=r"(?s).*on_event is deprecated")   # FastAPI 0.141 still accepts @router.on_event (hsw code); the message starts with a newline
+ from fastapi import APIRouter, Request, HTTPException
+ from pydantic import BaseModel, Field
+ 
+ router = APIRouter()
+-_model = None
+-_model_lock = None
++_backend = None
+ _read_gpu_metrics = None
+ _log_dir = None
+-_device = None
+ 
+-def configure_background(model, model_lock, read_gpu_metrics, log_dir, device):
+-    global _model, _model_lock, _read_gpu_metrics, _log_dir, _device
+-    _model = model
+-    _model_lock = model_lock
++
++def configure_background(backend, read_gpu_metrics, log_dir):
++    global _backend, _read_gpu_metrics, _log_dir
++    _backend = backend
+     _read_gpu_metrics = read_gpu_metrics
+-    _log_dir = log_dir
+-    _device = device
++    _log_dir = Path(log_dir)
++
++
++def _default_bg_image():
++    here = Path(__file__).resolve().parent
++    for c in (os.environ.get("BG_IMAGE_PATH"),
++              here / "test_frames" / "uhd_3840x2160_q90.jpg",                                   # the 4K frame va.sh test uses
++              here.parent / "aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/models/img4k/img4k_0.jpg",
++              here / "bg_test_image.jpg"):
++        if c and Path(c).is_file():
++            return Path(c)
++    return here / "bg_test_image.jpg"
+ 
+-BG_IMAGE_PATH = Path(os.environ.get("BG_IMAGE_PATH", "bg_test_image.jpg"))
++
++BG_IMAGE_PATH = _default_bg_image()
+ BG_MAX_FPS = 15.0
+ _bg_guard = threading.RLock()
+ _bg_stop = threading.Event()
+ _bg_thread = None
+ _bg_running = False
+-_bg_image = None
++_bg_jpeg = None
++_bg_size = (0, 0)
+ _bg_error = None
+-_bg_target_fps = 10.0
++_bg_target_fps = 5.0
+ _bg_completed = 0
++_bg_failed = 0
+ _bg_started_utc = None
+ _bg_log_path = None
+ 
++
+ class BackgroundStart(BaseModel):
+-    fps: float = Field(default=10.0, ge=0.1, le=BG_MAX_FPS)
++    fps: float = Field(default=5.0, ge=0.1, le=BG_MAX_FPS)
+ 
+ 
+ def _bg_local_only(request: Request):
+@@ -51,11 +68,11 @@
+ 
+ 
+ def _bg_worker():
+-    global _bg_error, _bg_running, _bg_completed, _bg_log_path
++    global _bg_error, _bg_running, _bg_completed, _bg_failed, _bg_log_path
+     try:
+         with _bg_guard:
+-            image = _bg_image
+-        if image is None:
++            jpeg = _bg_jpeg
++        if jpeg is None:
+             raise RuntimeError("Background image not prepared")
+         filename = "bg_virtual_ue_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".log"
+         log_path = _log_dir / filename
+@@ -63,32 +80,29 @@
+             _bg_log_path = str(log_path)
+         with log_path.open("w", newline="", encoding="utf-8") as f:
+             writer = csv.writer(f)
+-            writer.writerow(["timestamp", "target_fps", "lock_wait_ms", "predict_ms", "ai_total_ms", "gpu_util_percent", "gpu_memory_used_gb", "completed"])
++            writer.writerow(["timestamp", "target_fps", "backend", "status", "reason", "model", "sm", "wait_ms", "decode_ms",
++                             "infer_ms", "server_latency_ms", "ai_total_ms", "detections", "gpu_util_percent", "gpu_memory_used_gb",
++                             "completed", "failed"])
+             while not _bg_stop.is_set():
+                 cycle_start = time.monotonic()
+                 with _bg_guard:
+                     fps = _bg_target_fps
+-                # Match the actual VA request's shared model_lock and predict call.
+-                with _model_lock:
+-                    acquired = time.monotonic()
+-                    if _bg_stop.is_set():
+-                        break
+-                    results = _model.predict(source=image, device=_device, verbose=False)
+-                    finished = time.monotonic()
+-                del results
++                res = _backend.infer(jpeg, "bg")            # the same call the phone's frames take
++                finished = time.monotonic()
++                d = res["dapp"]
+                 util, memory = _read_gpu_metrics()
+                 with _bg_guard:
+-                    _bg_completed += 1
+-                    completed = _bg_completed
+-                writer.writerow([
+-                    datetime.now().astimezone().isoformat(), fps,
+-                    round((acquired-cycle_start)*1000, 3),
+-                    round((finished-acquired)*1000, 3),
+-                    round((finished-cycle_start)*1000, 3),
+-                    util, memory, completed
+-                ])
++                    if d.get("status") == "success":
++                        _bg_completed += 1
++                    else:
++                        _bg_failed += 1
++                    completed, failed = _bg_completed, _bg_failed
++                writer.writerow([datetime.now().astimezone().isoformat(), fps, d.get("backend"), d.get("status"), d.get("reason"),
++                                 d.get("model"), d.get("sm"), d.get("wait_ms"), d.get("decode_ms"), d.get("infer_ms"),
++                                 d.get("latency_ms"), round((finished - cycle_start) * 1000, 3), len(res["detections"]),
++                                 util, memory, completed, failed])
+                 f.flush()
+-                _bg_stop.wait(max(0.0, 1.0/fps - (time.monotonic()-cycle_start)))
++                _bg_stop.wait(max(0.0, 1.0 / fps - (time.monotonic() - cycle_start)))
+     except Exception as exc:
+         with _bg_guard:
+             _bg_error = repr(exc)
+@@ -100,8 +114,8 @@
+ 
+ @router.post("/background/prepare")
+ async def background_prepare(request: Request):
+-    """Load local image only; reuse the existing VA model and CUDA context."""
+-    global _bg_image, _bg_error
++    """Load the background JPEG (re-encoded to JPEG if it is another format); no model is loaded here."""
++    global _bg_jpeg, _bg_size, _bg_error
+     _bg_local_only(request)
+     if not BG_IMAGE_PATH.is_file():
+         raise HTTPException(status_code=400, detail=f"Missing background image: {BG_IMAGE_PATH}")
+@@ -109,36 +123,43 @@
+         if _bg_running or (_bg_thread is not None and _bg_thread.is_alive()):
+             raise HTTPException(status_code=409, detail="Stop background before preparing")
+     try:
+-        with Image.open(BG_IMAGE_PATH) as source:
+-            image = source.convert("RGB")
++        import io
++        from PIL import Image
++        data = BG_IMAGE_PATH.read_bytes()
++        with Image.open(io.BytesIO(data)) as im:
++            size = im.size
++            if im.format != "JPEG":
++                buf = io.BytesIO()
++                im.convert("RGB").save(buf, format="JPEG", quality=90)
++                data = buf.getvalue()
+         with _bg_guard:
+-            _bg_image = image
+-            _bg_error = None
+-        return {"prepared": True, "image_width": image.width, "image_height": image.height,
+-                "model_shared": True}
++            _bg_jpeg, _bg_size, _bg_error = data, size, None
++        return {"prepared": True, "image": str(BG_IMAGE_PATH), "image_width": size[0], "image_height": size[1],
++                "bytes": len(data), "backend": _backend.name}
+     except Exception as exc:
+         raise HTTPException(status_code=500, detail=str(exc))
+ 
+ 
+ @router.post("/background/start")
+ async def background_start(config: BackgroundStart, request: Request):
+-    global _bg_thread, _bg_running, _bg_error, _bg_target_fps, _bg_completed, _bg_started_utc, _bg_log_path
++    global _bg_thread, _bg_running, _bg_error, _bg_target_fps, _bg_completed, _bg_failed, _bg_started_utc, _bg_log_path
+     _bg_local_only(request)
+     with _bg_guard:
+         if _bg_running or (_bg_thread is not None and _bg_thread.is_alive()):
+             raise HTTPException(status_code=409, detail="Background already running or stopping")
+-        if _bg_image is None:
++        if _bg_jpeg is None:
+             raise HTTPException(status_code=409, detail="Call POST /background/prepare first")
+         _bg_stop.clear()
+         _bg_error = None
+         _bg_target_fps = config.fps
+         _bg_completed = 0
++        _bg_failed = 0
+         _bg_log_path = None
+         _bg_started_utc = datetime.now().astimezone().isoformat()
+         _bg_running = True
+         _bg_thread = threading.Thread(target=_bg_worker, daemon=True, name="bg-virtual-ue")
+         _bg_thread.start()
+-    return {"status": "starting", "target_fps": config.fps, "model_shared": True}
++    return {"status": "starting", "target_fps": config.fps, "backend": _backend.name, "image": str(BG_IMAGE_PATH)}
+ 
+ 
+ @router.post("/background/stop")
+@@ -146,17 +167,18 @@
+     _bg_local_only(request)
+     _bg_stop.set()
+     with _bg_guard:
+-        return {"status": "stopping" if _bg_running else "stopped", "completed": _bg_completed}
++        return {"status": "stopping" if _bg_running else "stopped", "completed": _bg_completed, "failed": _bg_failed}
+ 
+ 
+ @router.get("/background/status")
+ async def background_status(request: Request):
+     _bg_local_only(request)
+     with _bg_guard:
+-        return {"running": _bg_running, "stopping": _bg_running and _bg_stop.is_set(),
+-                "prepared": _bg_image is not None, "model_shared": True,
+-                "target_fps": _bg_target_fps, "completed": _bg_completed,
+-                "started_utc": _bg_started_utc, "log_path": _bg_log_path, "error": _bg_error}
++        return {"running": _bg_running, "stopping": _bg_running and _bg_stop.is_set(), "prepared": _bg_jpeg is not None,
++                "backend": _backend.name if _backend else None, "image": str(BG_IMAGE_PATH),
++                "image_width": _bg_size[0], "image_height": _bg_size[1], "target_fps": _bg_target_fps,
++                "completed": _bg_completed, "failed": _bg_failed, "started_utc": _bg_started_utc,
++                "log_path": _bg_log_path, "error": _bg_error}
+ 
+ 
+ @router.on_event("shutdown")
+@@ -168,18 +190,19 @@
+ 
+ 
+ # =====================================================
+-# Command-line controller (does NOT run YOLO in this process)
++# Command-line controller (talks to the running service; does NOT run YOLO in this process)
++#   python3 bg_yolo.py prepare | start [--fps 5] | stop | status      (VA_PORT, default 8000)
+ # =====================================================
+-#!/usr/bin/env python3
+ import argparse, json, ssl, sys
+-from urllib.request import Request, urlopen
++from urllib.request import Request as _Req, urlopen
+ from urllib.error import HTTPError, URLError
+-URL = "https://localhost:8000"
++URL = "https://localhost:" + os.environ.get("VA_PORT", "8000")
+ CTX = ssl._create_unverified_context()  # localhost self-signed certificate only
+ 
++
+ def call(method, path, payload=None):
+     data = json.dumps(payload).encode() if payload is not None else (b"" if method == "POST" else None)
+-    req = Request(URL + path, data=data, method=method)
++    req = _Req(URL + path, data=data, method=method)
+     if payload is not None:
+         req.add_header("Content-Type", "application/json")
+     try:
+@@ -192,12 +215,13 @@
+         print(f"Cannot connect to VA server: {exc}", file=sys.stderr)
+         sys.exit(1)
+ 
++
+ def main():
+-    parser = argparse.ArgumentParser(description="Control BG YOLO inside the VA server")
++    parser = argparse.ArgumentParser(description="Control the background virtual UE inside the VA server")
+     sub = parser.add_subparsers(dest="command", required=True)
+     sub.add_parser("prepare")
+     start = sub.add_parser("start")
+-    start.add_argument("--fps", type=float, default=10)
++    start.add_argument("--fps", type=float, default=5)
+     sub.add_parser("stop")
+     sub.add_parser("status")
+     args = parser.parse_args()
+@@ -215,7 +239,5 @@
+     print(json.dumps(result, ensure_ascii=False, indent=2))
+ 
+ 
+-
+ if __name__ == "__main__":
+     main()
+-

@@ -1,0 +1,1 @@
+Historical evidence applies to the prior actor only. See manifest.json and NEW_MODEL_VERIFICATION.txt for the current actor.

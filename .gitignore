@@ -1,0 +1,33 @@
+# dgist-ai-ran: what is generated on the host is never tracked (SETUP.md lists how each item is regenerated).
+# (git ignore files take no inline comments: one pattern per line)
+
+# run-time output
+runs/
+log/
+*.log
+*.pid
+__pycache__/
+*.pyc
+.env.bak*
+
+# fetched / built trees: ./oai/fetch_oai.sh recreates openairinterface5g (upstream OAI + FlexRIC + the lab changes kept in oai/);
+# flexric_sm/ = E2 service-model libraries copied out of the FlexRIC build (ric.sh build / install-sm)
+openairinterface5g/
+flexric_sm/
+
+# Python virtual environments (scripts/setup_venvs.sh)
+va_service/yolo_env/
+xapp_ppo/*/.venv/
+.venv/
+
+# YOLO weights, ONNX, TensorRT engines (scripts/build_yolo_engines.sh); the PPO actors xapp_ppo/*/actor.pt ARE tracked
+*.engine
+*.onnx
+va_service/*.pt
+xapp_ppo/*/logs/
+
+# private keys / certificates (scripts/make_certs.sh; Open5GS ships its own under /etc/open5gs)
+va_service/certs/
+nonva_service/certs/
+core/etc/tls/*.key
+core/etc/hnet/

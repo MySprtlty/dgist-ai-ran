@@ -1,0 +1,39 @@
+{
+  "timestamp_ms": 0.0,
+  "window_ms": 100.0,
+  "ues": {
+    "yolo_1": {
+      "ul_buffer_bytes": 0.0,
+      "ul_snr_db": 21.0,
+      "ul_tp_mbps": 0.0,
+      "ul_prb_avg": 0.0
+    },
+    "yolo_2": {
+      "ul_buffer_bytes": 0.0,
+      "ul_snr_db": 21.0,
+      "ul_tp_mbps": 0.0,
+      "ul_prb_avg": 0.0
+    },
+    "live_1": {
+      "ul_buffer_bytes": 0.0,
+      "ul_snr_db": 21.0,
+      "ul_tp_mbps": 0.0,
+      "ul_prb_avg": 0.0
+    },
+    "live_2": {
+      "ul_buffer_bytes": 0.0,
+      "ul_snr_db": 21.0,
+      "ul_tp_mbps": 0.0,
+      "ul_prb_avg": 0.0
+    }
+  },
+  "service_prbs": {
+    "yolo": 137,
+    "live": 136
+  },
+  "compute": {
+    "model_id": "26x",
+    "allocated_sm": 80,
+    "timestamp_ms": 0.0
+  }
+}

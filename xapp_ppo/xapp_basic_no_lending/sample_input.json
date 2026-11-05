@@ -1,0 +1,20 @@
+{
+  "timestamp_ms": 0.0,
+  "window_ms": 100,
+  "ues": {
+    "yolo_1": {
+      "ul_buffer_bytes": 0.0,
+      "ul_snr_db": 15.366085065690955,
+      "ul_tp_mbps": 0.0
+    },
+    "live_1": {
+      "ul_buffer_bytes": 0.0,
+      "ul_snr_db": 15.454421108441199,
+      "ul_tp_mbps": 0.0
+    }
+  },
+  "service_prbs": {
+    "yolo": 39,
+    "live": 39
+  }
+}

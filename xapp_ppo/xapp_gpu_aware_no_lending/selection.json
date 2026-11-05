@@ -1,0 +1,6 @@
+{
+  "run": "ppo_gpu_aware_training_kit\\runs\\gpu19_seed401",
+  "status": "GPU-aware experimental candidate; RF validation pending",
+  "actor_sha256": "6fceb351f965d150d4110528f137d86330b5f8319297912bd2cfbee918a842ad",
+  "baseline_unchanged_sha256": "8916201e736738ac3ba38273c2b018901a00685c97ee7b03e6e759fa613e9df7"
+}

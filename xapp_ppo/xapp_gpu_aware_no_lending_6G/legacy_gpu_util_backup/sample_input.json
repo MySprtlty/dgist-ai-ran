@@ -1,0 +1,35 @@
+{
+  "timestamp_ms": 1000,
+  "window_ms": 100,
+  "ues": {
+    "yolo_1": {
+      "ul_buffer_bytes": 100000,
+      "ul_snr_db": 20,
+      "ul_tp_mbps": 32,
+      "ul_prb_avg": 90
+    },
+    "yolo_2": {
+      "ul_buffer_bytes": 100000,
+      "ul_snr_db": 20,
+      "ul_tp_mbps": 32,
+      "ul_prb_avg": 90
+    },
+    "live_1": {
+      "ul_buffer_bytes": 10000,
+      "ul_snr_db": 21,
+      "ul_tp_mbps": 12,
+      "ul_prb_avg": 35
+    },
+    "live_2": {
+      "ul_buffer_bytes": 10000,
+      "ul_snr_db": 21,
+      "ul_tp_mbps": 12,
+      "ul_prb_avg": 35
+    }
+  },
+  "service_prbs": {
+    "yolo": 200,
+    "live": 73
+  },
+  "gpu_util_percent": 69.2
+}

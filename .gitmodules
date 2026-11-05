@@ -1,0 +1,8 @@
+[submodule "aerial-cuda-accelerated-ran"]
+	path = aerial-cuda-accelerated-ran
+	url = https://github.com/MySprtlty/aerial-cuda-accelerated-ran.git
+	branch = hybrid
+	ignore = dirty
+[submodule "open5gs"]
+	path = open5gs
+	url = https://github.com/open5gs/open5gs.git

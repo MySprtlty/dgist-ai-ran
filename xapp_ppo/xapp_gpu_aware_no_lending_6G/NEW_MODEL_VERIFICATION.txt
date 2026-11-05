@@ -1,0 +1,10 @@
+{
+  "valid_model_sm_cases": 40,
+  "invalid_cases": 11,
+  "bridge_contract": "PASS",
+  "cpu_predict_median_ms": 0.1689,
+  "cpu_predict_p95_ms": 0.1962,
+  "scope": "local CPU only; not Linux socket or E2/RF integration",
+  "train_export_parity_cases": 400,
+  "protected_unchanged": true
+}

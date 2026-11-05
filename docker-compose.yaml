@@ -1,0 +1,80 @@
+# _dgist: the two labs' 1-cell COTS-UE stack on one GH200
+#   l1  = DGIST cuphycontroller (CUDA green contexts, per-channel SM sizer, in-process YOLO dApp tenant, xApp agent)  -> container dgist-l1
+#   gnb = hsw OAI gNB (MAC scheduler UL count-quota + E2 agent changes, DGIST empty-UCI fix)                           -> container dgist-gnb
+#   Open5GS runs natively on the host (scripts/core.sh). Driven by ./dgist.sh; every setting is in .env.
+# Order: compose starts the gNB only when the L1 is healthy (= 'L1 is ready' + dApp tenant engines loaded + agent port open).
+name: dgist
+
+services:
+  l1:
+    container_name: dgist-l1
+    image: ${AERIAL_IMAGE}
+    init: true
+    privileged: true
+    network_mode: host
+    ipc: host
+    userns_mode: host
+    shm_size: 4096m
+    ulimits:
+      memlock: -1
+    user: root
+    stdin_open: true
+    tty: true
+    env_file: .env
+    environment:
+      - cuBB_SDK=/opt/nvidia/cuBB
+      - RUN_NAME=${RUN_NAME:-manual}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    devices:
+      - /dev/gdrdrv:/dev/gdrdrv
+    volumes:
+      - ./aerial-cuda-accelerated-ran:/opt/nvidia/cuBB
+      - ./config:/opt/dgist/config:ro
+      - ./scripts:/opt/dgist/scripts:ro
+      - ./runs:/opt/dgist/runs
+      - /dev/hugepages:/dev/hugepages
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+    command: ["bash", "/opt/dgist/scripts/l1_entrypoint.sh"]
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/dgist_tenant_ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 60s
+
+  gnb:
+    container_name: dgist-gnb
+    image: ${OAI_IMAGE}
+    cpuset: "${OAI_CPUSET}"
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
+    ipc: host
+    network_mode: host
+    stdin_open: true
+    tty: true
+    environment:
+      USE_ADDITIONAL_OPTIONS: --log_config.global_log_options level,nocolor,utc_time
+    volumes:
+      - ./config/gnb.conf:/opt/oai-gnb/etc/gnb.conf:ro
+      - ${FLEXRIC_SM_DIR:-/usr/local/lib/flexric}:/usr/local/lib/flexric:ro   # E2 service models = the build the RIC/xApps load (ric.sh install-sm)
+    depends_on:
+      l1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -c softmodem"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

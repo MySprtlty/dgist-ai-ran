@@ -1,0 +1,20 @@
+diff --git a/openair3/NGAP/ngap_gNB_handlers.c b/openair3/NGAP/ngap_gNB_handlers.c
+index 95c2dd45a7..db5a79f039 100644
+--- a/openair3/NGAP/ngap_gNB_handlers.c
++++ b/openair3/NGAP/ngap_gNB_handlers.c
+@@ -985,7 +985,14 @@ static int ngap_gNB_handle_pdusession_setup_request(sctp_assoc_t assoc_id, uint3
+     // S-NSSAI
+     msg->pdusession[i].nssai = decode_ngap_nssai(&item_p->s_NSSAI);
+ 
+-    msg->pdusession[i].nas_pdu = create_byte_array(item_p->pDUSessionNAS_PDU->size, item_p->pDUSessionNAS_PDU->buf);
++    /* DGIST 2026-11-05: the NAS-PDU of a PDUSessionResourceSetupItemSUReq is OPTIONAL (TS 38.413): the AMF omits it when it
++     * re-activates existing PDU sessions after a Service Request (e.g. the phones kept their sessions while the gNB restarted).
++     * Without this guard the gNB dereferenced NULL here and segfaulted on every such setup. The RRC side already handles an
++     * empty nas_pdu (rrc_gNB.c: 'if (session->nas_pdu.len > 0)'). */
++    if (item_p->pDUSessionNAS_PDU != NULL)
++      msg->pdusession[i].nas_pdu = create_byte_array(item_p->pDUSessionNAS_PDU->size, item_p->pDUSessionNAS_PDU->buf);
++    else
++      msg->pdusession[i].nas_pdu = (byte_array_t){0};
+     bool ret = decodePDUSessionResourceSetup(&msg->pdusession[i].pdusessionTransfer, item_p->pDUSessionResourceSetupRequestTransfer);
+     if (!ret) {
+       NGAP_ERROR("Failed to decode pDUSessionResourceSetupRequestTransfer in NG Setup Request\n");

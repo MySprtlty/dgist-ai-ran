@@ -1,0 +1,90 @@
+#
+# NVIPC와 tini를 가져오기 위한 이미지
+#
+# 여기에는 NVIPC가 이미 설치되어 있어야 합니다.
+#
+FROM oai-build-dev:latest AS build-deps
+
+
+#
+# 최종 실행 이미지
+#
+FROM ubuntu:noble AS oai-gnb-aerial-hsw
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe
+
+RUN apt-get update && \
+    apt-get upgrade --yes && \
+    apt-get install --yes \
+        software-properties-common \
+        procps \
+        libsctp1 \
+        tzdata \
+        libblas3 \
+        libconfig9 \
+        openssl \
+        net-tools \
+        iperf \
+        iproute2 \
+        iputils-ping \
+        gdb \
+        moreutils \
+        libusb-1.0-0 \
+        libyaml-cpp-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+#
+# OAI 실행파일
+#
+# 호스트에서 ./build_oai로 이미 생성된 파일을 직접 복사합니다.
+#
+WORKDIR /opt/oai-gnb/bin
+
+COPY cmake_targets/ran_build/build/nr-softmodem ./
+
+COPY docker/scripts/gnb_entrypoint.sh ./entrypoint.sh
+
+RUN chmod +x \
+    /opt/oai-gnb/bin/nr-softmodem \
+    /opt/oai-gnb/bin/entrypoint.sh
+
+#
+# OAI parameter shared libraries
+#
+COPY cmake_targets/ran_build/build/libparams_libconfig.so \
+     cmake_targets/ran_build/build/libparams_yaml.so \
+     /usr/local/lib/
+
+#
+# NVIPC shared libraries
+#
+# NVIPC는 oai-build-dev:latest 이미지에 설치되어 있다고 가정합니다.
+#
+COPY --from=build-deps \
+    /usr/local/lib/libfmtlog-shared.so \
+    /usr/local/lib/libnvlog.so \
+    /usr/local/lib/libnvipc.so \
+    /usr/local/lib/
+
+#
+# tini
+#
+COPY --from=build-deps /tini /tini
+
+RUN chmod +x /tini && \
+    ldconfig && \
+    echo "---- ldd on nr-softmodem ----" && \
+    ldd /opt/oai-gnb/bin/nr-softmodem && \
+    echo "---- ldd on shared libraries ----" && \
+    ldd \
+        /usr/local/lib/libparams_libconfig.so \
+        /usr/local/lib/libparams_yaml.so \
+        /usr/local/lib/libfmtlog-shared.so \
+        /usr/local/lib/libnvlog.so \
+        /usr/local/lib/libnvipc.so
+
+WORKDIR /opt/oai-gnb
+
+ENTRYPOINT ["/tini", "-v", "--", "/opt/oai-gnb/bin/entrypoint.sh"]
+CMD ["/opt/oai-gnb/bin/nr-softmodem"]

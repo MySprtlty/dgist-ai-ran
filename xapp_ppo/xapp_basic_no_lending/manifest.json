@@ -1,0 +1,118 @@
+{
+  "schema": "ppo18-ul-4ue-273-radio-prb-v1",
+  "features": [
+    "yolo_1.ul_buffer_bytes",
+    "yolo_1.ul_snr_db",
+    "yolo_1.ul_tp_mbps",
+    "yolo_1.ul_prb_avg",
+    "yolo_2.ul_buffer_bytes",
+    "yolo_2.ul_snr_db",
+    "yolo_2.ul_tp_mbps",
+    "yolo_2.ul_prb_avg",
+    "live_1.ul_buffer_bytes",
+    "live_1.ul_snr_db",
+    "live_1.ul_tp_mbps",
+    "live_1.ul_prb_avg",
+    "live_2.ul_buffer_bytes",
+    "live_2.ul_snr_db",
+    "live_2.ul_tp_mbps",
+    "live_2.ul_prb_avg",
+    "service_prbs.yolo",
+    "service_prbs.live"
+  ],
+  "normalization": {
+    "ul_buffer_bytes": 250000.0,
+    "ul_snr_db": 20.0,
+    "ul_tp_mbps": 20.0,
+    "ul_prb_avg": 100.0
+  },
+  "control_interval_ms": 100,
+  "total_ul_prbs": 273,
+  "min_slice_prbs": 5,
+  "ue_services": {
+    "yolo_1": "yolo",
+    "yolo_2": "yolo",
+    "live_1": "live",
+    "live_2": "live"
+  },
+  "wire_protocol": "PPO4R",
+  "prb_definition": "(new+retx PRBs)/(window_ms*6/10); 273 PRBs, DDDDDDSUUU",
+  "simulation_config": {
+    "total_prbs": 273,
+    "minimum": 5,
+    "control_ms": 100,
+    "borrow_unused_prbs": false,
+    "target_mbps": [
+      32,
+      32,
+      12,
+      12
+    ],
+    "latency_ms": [
+      200,
+      200,
+      250,
+      250
+    ],
+    "environment": "controlled common FIFO empirical residuals SNR21, episode GPU level65/85 balanced; both models share fit-anchor capacity variation",
+    "common_reward": {
+      "va_deadline_ms": 200,
+      "nv_deadline_ms": 250,
+      "va_miss_weight": 40,
+      "nv_miss_weight": 4,
+      "va_tp_weight": 1,
+      "nv_tp_weight": 2,
+      "reservation_weight": 16,
+      "movement_weight": 0.1,
+      "subdeadline_latency_reward": false,
+      "missed_definition": "new deadline violations + skipped offered frame opportunities / nominal arrivals",
+      "capacity": "same correlated fit segment rate vector for both policies; constant within run",
+      "limitation": "mechanism candidate; empirical effective rate is not identified physical capacity"
+    }
+  },
+  "actor_sha256": "e9ef2ad93359f0a8425fb4a5abd1b7a1607a89f92a2cc6fe41a80fac10ec5a31",
+  "training": {
+    "algorithm": "PPO followed by policy distillation",
+    "ppo": {
+      "episodes": 600,
+      "steps": 100,
+      "seed": 241,
+      "lr": 0.0002,
+      "teacher": false,
+      "reward": {
+        "va_deadline_ms": 200,
+        "nv_deadline_ms": 250,
+        "va_miss_weight": 40,
+        "nv_miss_weight": 4,
+        "va_tp_weight": 1,
+        "nv_tp_weight": 2,
+        "reservation_weight": 16,
+        "movement_weight": 0.1,
+        "subdeadline_latency_reward": false,
+        "missed_definition": "new deadline violations + skipped offered frame opportunities / nominal arrivals",
+        "capacity": "same correlated fit segment rate vector for both policies; constant within run",
+        "limitation": "mechanism candidate; empirical effective rate is not identified physical capacity"
+      },
+      "initial": "same deployed Basic actor for both; fresh common critic; GPU column zero",
+      "environment": "controlled common FIFO empirical residuals SNR21, episode GPU level65/85 balanced; both models share fit-anchor capacity variation",
+      "scope": "mechanism diagnostic curriculum; not RF calibrated or deployment candidate"
+    },
+    "distillation": {
+      "epochs": 60,
+      "learning_rate": 0.0001,
+      "seed": 241,
+      "teacher": "own common PPO policy minus 3 PRBs",
+      "loss": "mean squared allocation error in PRB units"
+    },
+    "gpu_observed": false,
+    "source_actor": "analysis\\distill_minus3_20261026\\input18_distilled.pt",
+    "additional_ppo_candidate_selected": false
+  },
+  "limitations": [
+    "New model not yet evaluated on testbed.",
+    "Validation: 12 evaluation seeds; one training seed; four active UEs, fixed GPU65/85.",
+    "Empirical simulator is not an exact RF reproduction; solo/idle performance not validated."
+  ],
+  "model_version": "common_pair_20261026_distilled",
+  "deployment_status": "simulation_verified_pending_testbed"
+}

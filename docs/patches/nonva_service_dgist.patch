@@ -1,0 +1,148 @@
+--- upstream_hsw/app.py	2026-10-27 22:37:37.227166964 +0900
++++ app.py	2026-11-05 18:34:30.018056369 +0900
+@@ -1,3 +1,12 @@
++"""Non-VA Real-Time Video Streaming Service (hsw video_stream_service), DGIST copy 2026-11-05
++
++Unchanged behaviour: the phone uploads camera frames (/upload_frame), the server keeps the latest one per UE and relays it as MJPEG
++to /viewer/<ue> (/video_feed); UL latency per frame -> CSV at /stop_session; telemetry "nonva" for the hsw PPO xApp. No inference.
++DGIST changes: the capture settings come from the environment with the hsw values as defaults (NONVA_WIDTH 1280, NONVA_HEIGHT 720,
++NONVA_FPS 20, NONVA_JPEG_QUALITY 0.80, NONVA_VIEWER_FPS 20), the page JS constants are filled by the server, the CSV directory is
++<_dgist>/runs/nonva_service_log (NONVA_LOG_DIR), service_common/ lives next to this file, GET /nonva/status added. Run: nonva.sh start
++(uvicorn app:app --host 0.0.0.0 --port 8001 --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt). Original: upstream_hsw/app.py
++"""
+ from fastapi import (
+     FastAPI,
+     File,
+@@ -19,19 +28,21 @@
+ import time
+ import os
+ import logging
++import warnings
++warnings.filterwarnings("ignore", message=r"(?s).*on_event is deprecated")   # FastAPI 0.141 still accepts @app.on_event (hsw code)
+ 
+ 
+ # =====================================================
+ # Configuration
+ # =====================================================
+ 
+-TARGET_WIDTH = 1280
+-TARGET_HEIGHT = 720
++TARGET_WIDTH = int(os.environ.get("NONVA_WIDTH") or 1280)        # hsw: 1280x720, 20 fps, JPEG 0.80 (phone capture + upload)
++TARGET_HEIGHT = int(os.environ.get("NONVA_HEIGHT") or 720)
+ 
+-TARGET_FPS = 20
+-JPEG_QUALITY = 0.80
++TARGET_FPS = float(os.environ.get("NONVA_FPS") or 20)
++JPEG_QUALITY = float(os.environ.get("NONVA_JPEG_QUALITY") or 0.80)
+ 
+-VIEWER_FPS = 20
++VIEWER_FPS = float(os.environ.get("NONVA_VIEWER_FPS") or 20)             # MJPEG relay rate to the /viewer page
+ VIEWER_INTERVAL = 1.0 / VIEWER_FPS
+ 
+ CLOCK_SYNC_SAMPLES = 30
+@@ -46,7 +57,7 @@
+     title="Non-VA Real-Time Video Streaming Service"
+ )
+ import sys
+-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++sys.path.insert(0, str(Path(__file__).resolve().parent))   # ./service_common (hsw module, unchanged)
+ from service_common.service_telemetry import attach_telemetry
+ telemetry = attach_telemetry(app, 'nonva')
+ 
+@@ -106,7 +117,7 @@
+ # Log Directory
+ # =====================================================
+ 
+-LOG_DIR = Path(__file__).resolve().parent.parent / "log" / "non_va_service_log"
++LOG_DIR = Path(os.environ.get("NONVA_LOG_DIR") or (Path(__file__).resolve().parent.parent / "runs" / "nonva_service_log"))
+ LOG_DIR.mkdir(parents=True, exist_ok=True)
+ 
+ 
+@@ -167,13 +178,21 @@
+ # iPhone Sender Page
+ # =====================================================
+ 
++def _page(s):
++    """fill the configuration placeholders of the sender page (NONVA_* environment, hsw defaults)"""
++    for k, v in (("__NONVA_WIDTH__", TARGET_WIDTH), ("__NONVA_HEIGHT__", TARGET_HEIGHT), ("__NONVA_FPS__", f"{TARGET_FPS:g}"),
++                 ("__NONVA_JPEG_QUALITY__", f"{JPEG_QUALITY:g}")):
++        s = s.replace(k, str(v))
++    return s
++
++
+ @app.get(
+     "/",
+     response_class=HTMLResponse
+ )
+ async def sender_page():
+ 
+-    return """
++    return _page("""
+ <!DOCTYPE html>
+ 
+ <html>
+@@ -228,7 +247,7 @@
+ 
+ <p>
+ <strong>Target:</strong>
+-720p / 20 FPS / JPEG Quality 0.80
++__NONVA_WIDTH__x__NONVA_HEIGHT__ / __NONVA_FPS__ FPS / JPEG Quality __NONVA_JPEG_QUALITY__ (non-VA: upload + live viewer, no inference)
+ </p>
+ 
+ 
+@@ -331,19 +350,19 @@
+ // Configuration
+ // =====================================================
+ 
+-const CAMERA_WIDTH = 1280;
++const CAMERA_WIDTH = __NONVA_WIDTH__;
+ 
+-const CAMERA_HEIGHT = 720;
++const CAMERA_HEIGHT = __NONVA_HEIGHT__;
+ 
+ 
+-const TARGET_FPS = 20;
++const TARGET_FPS = __NONVA_FPS__;
+ 
+ 
+ const TARGET_INTERVAL =
+     1000 / TARGET_FPS;
+ 
+ 
+-const JPEG_QUALITY = 0.80;
++const JPEG_QUALITY = __NONVA_JPEG_QUALITY__;
+ 
+ 
+ const MAX_INFLIGHT = 4;
+@@ -1333,7 +1352,7 @@
+ </body>
+ 
+ </html>
+-"""
++""")
+ 
+ 
+ # =====================================================
+@@ -1915,3 +1934,22 @@
+     }
+ 
+ 
++# =====================================================
++# Status (nonva.sh status): configuration, UE sessions, telemetry rows
++# =====================================================
++
++@app.get("/nonva/status")
++async def nonva_status():
++    ue = {}
++    with telemetry.lock:
++        for u, row in telemetry.rows.items():
++            ue[u] = {k: row.get(k) for k in ("active", "status", "latency_ms", "frame_id", "failures")}
++    return {
++        "service": "nonva",
++        "config": {"width": TARGET_WIDTH, "height": TARGET_HEIGHT, "fps": TARGET_FPS, "jpeg_quality": JPEG_QUALITY,
++                   "viewer_fps": VIEWER_FPS, "log_dir": str(LOG_DIR), "telemetry_dir": str(telemetry.directory)},
++        "sessions": {sid: {"active": s.active, "frames": len(s.records), "latest_frame_id": s.latest_frame_id,
++                           "latest_frame_kb": round(s.latest_frame_size / 1024.0, 1), "latest_ul_latency_ms": s.latest_ul_latency_ms}
++                     for sid, s in sessions.items()},
++        "ue": ue,
++    }

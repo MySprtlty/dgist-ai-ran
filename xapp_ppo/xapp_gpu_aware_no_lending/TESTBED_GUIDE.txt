@@ -1,0 +1,66 @@
+GPU-aware PPO: separate 19-input bundle
+
+COPY THIS WHOLE FOLDER to:
+/home/nvidia/hsw/25_3_hsw/xapp_gpu_aware_no_lending/
+
+Do NOT replace xapp_basic_no_lending. Keep v5 unchanged.
+Do NOT run the two quota controllers simultaneously.
+No OAI/Aerial/C xApp changes, rebuilds, Docker images or service changes needed.
+Existing xapp_slice_ppo_ctrl must support PPO_BUNDLE (current source does).
+
+RUNTIME FILES:
+actor.pt                 trained19-input weights
+manifest.json            schema, normalization, checksum and limitations
+runtime.py               19-input CPU inference
+ppo_socket_server.py     unchanged PPO4 wire; joins latency and GPU locally
+latency_reader.py        same four service telemetry files/mapping as v5
+gpu_reader.py            NVML device sampler,100ms poll,500ms maximum cache age
+requirements.txt         torch/numpy/nvidia-ml-py
+verify.py                offline checks; NO E2 commands and NO real GPU query
+sample_input.json        offline example
+
+ONE-TIME:
+Use the existing Python environment, or create a separate one if preferred.
+Install the one extra NVML binding in the Python used by the xApp:
+/home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending/.venv/bin/python -m pip install nvidia-ml-py
+
+CHECK BEFORE E2 CONTROL:
+cd /home/nvidia/hsw/25_3_hsw/xapp_gpu_aware_no_lending
+/home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending/.venv/bin/python verify.py
+PPO_GPU_DEVICE=0 /home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending/.venv/bin/python gpu_reader.py
+
+NVML must show the same physical GPU as YOLO/Aerial. Default is index0.
+PPO_GPU_DEVICE also accepts a GPU UUID. GPU data missing/stale => HOLD,
+never a fabricated0% utilization. NVML's hardware averaging interval is not
+necessarily100ms. Memory is logged in GiB only; no automatic92GB policy.
+
+START (replace RNTIs with CURRENT values; no angle brackets):
+cd /home/nvidia/hsw/25_3_hsw/openairinterface5g/openair2/E2AP/flexric/build/examples/xApp/c/slice
+PPO_BUNDLE=/home/nvidia/hsw/25_3_hsw/xapp_gpu_aware_no_lending \
+PPO_PYTHON=/home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending/.venv/bin/python \
+PPO_GPU_DEVICE=0 \
+VA_RNTIS=VA_UE1_RNTI,VA_UE2_RNTI \
+NONVA_RNTIS=NONVA_UE1_RNTI,NONVA_UE2_RNTI \
+./xapp_slice_ppo_ctrl
+
+UE1/UE2 UI order must match each comma-separated RNTI order.
+Keep both service servers running even while service sessions are idle.
+The Python process samples GPU and runs the policy on CPU automatically.
+Look for startup: inputs=19 and the GPU-aware bundle path.
+Ctrl+C normally removes quotas. Confirm "Quotas removed"; a forced exit
+does not prove cleanup and can leave the last MAC policy in place.
+
+LOGS:
+/home/nvidia/hsw/25_3_hsw/log/ppo_input_log/ppo_gpu_inputs_*.log
+Contains GPU sample age/device/VRAM metadata and the19-input observation.
+/home/nvidia/hsw/25_3_hsw/log/ppo_output_log/ppo_output_*.log
+C xApp output path unchanged; the startup bundle path identifies the model.
+
+TO RETURN TO BASIC V5:
+Stop GPU-aware xApp and confirm policy deletion.
+Run the same command with PPO_BUNDLE=/home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending.
+
+Experimental candidate, not a guarantee of improved QoS.
+Use the same BG code/fps, service settings and timed scenario for comparisons.
+The environment models measured AI-processing delay INCLUDING model-lock wait.
+It does not simulate Aerial failures, heartbeat stalls, TCP, HARQ or VRAM limits.

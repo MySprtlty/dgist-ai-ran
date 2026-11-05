@@ -1,0 +1,2 @@
+"""Shared service latency telemetry."""
+

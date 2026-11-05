@@ -1,0 +1,101 @@
+{
+  "schema": "ppo20-radio18-modelscalar1-sm1-ensemble-v1",
+  "input_dim": 20,
+  "model_ids": [
+    "26n",
+    "26s",
+    "26m",
+    "26l",
+    "26x"
+  ],
+  "model_code_scale": 4,
+  "sm_scale": 80,
+  "total_ul_prbs": 273,
+  "min_slice_prbs": 5,
+  "borrow_unused_prbs": false,
+  "control_interval_ms": 100,
+  "ensemble_size": 3,
+  "seeds": [
+    351,
+    352,
+    353
+  ],
+  "actor_sha256": "bf8ef45b1337814f2163d4f271c394e3e6f99a7f67779e01555940b2d7ffb0ba",
+  "selected_training": "v24",
+  "actor_architecture": "each:20->128Tanh->128Tanh->264categorical logits; mean softmax over3actors; argmax+5VA,273-VA NonVA",
+  "input_normalization": "radio v/(scale+abs(v)); service budgets/273; model_index/4; SM/80; peractor fixed training normalization buffers then clip[-10,10]",
+  "compute_contract": "atomic model_id,allocated_sm,timestamp_ms; timestamp metadata is not NN input; single service-level model condition",
+  "compute_max_age_ms": 2000,
+  "radio_max_age_ms": 200,
+  "simulation_only": true,
+  "rf_validated": false,
+  "source_checkpoints": [
+    "C:\\25_3_hsw\\training_6g_sm_allocation\\runs\\sm_direct20_v24\\seed_351_dim_20\\actor_u30.pt",
+    "C:\\25_3_hsw\\training_6g_sm_allocation\\runs\\sm_direct20_v24\\seed_352_dim_20\\actor_u30.pt",
+    "C:\\25_3_hsw\\training_6g_sm_allocation\\runs\\sm_direct20_v24\\seed_353_dim_20\\actor_u30.pt"
+  ],
+  "training_note": "v24 direct20 PPO300episodes; v26 attempted but not selected by predefined validation rule",
+  "evaluation": {
+    "Basic18": {
+      "q": 198.58533333333332,
+      "va": {
+        "e2e": 186.3047424670167,
+        "ul": 145.2061190938016,
+        "satisfaction": 76.95511796757799,
+        "used": 185.68170370370368,
+        "skipped": 6.999999999999999
+      },
+      "nv": {
+        "e2e": 205.36586431206132,
+        "ul": 205.36586431206132,
+        "satisfaction": 87.09892839219593,
+        "used": 74.35617407407409,
+        "skipped": 215.35000000000005
+      },
+      "n": 60,
+      "nv_below85": 15,
+      "min_nv": 78.93593919652552
+    },
+    "PF": {
+      "q": null,
+      "va": {
+        "e2e": 272.6372887664687,
+        "ul": 231.53950582040517,
+        "satisfaction": 42.35659142335715,
+        "used": 174.56360277777773,
+        "skipped": 39.349999999999994
+      },
+      "nv": {
+        "e2e": 32.0731838743125,
+        "ul": 32.0731838743125,
+        "satisfaction": 98.2400048461267,
+        "used": 90.58678703703703,
+        "skipped": 6.416666666666667
+      },
+      "n": 60,
+      "nv_below85": 0,
+      "min_nv": 97.6470588235294
+    },
+    "SM20": {
+      "q": 198.70711111111112,
+      "va": {
+        "e2e": 185.76280953350366,
+        "ul": 144.66430805113515,
+        "satisfaction": 77.67171499426684,
+        "used": 185.6781055555555,
+        "skipped": 7.016666666666667
+      },
+      "nv": {
+        "e2e": 205.36716198372463,
+        "ul": 205.36716198372463,
+        "satisfaction": 86.88658395396966,
+        "used": 74.26770925925926,
+        "skipped": 216.6499999999999
+      },
+      "n": 60,
+      "nv_below85": 22,
+      "min_nv": 77.80195865070729
+    }
+  },
+  "selection": "choose highest SM20 VA among pairs where BOTH mean NV>=85; if none retain v24; all3seeds averaged probabilities"
+}

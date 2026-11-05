@@ -1,0 +1,23 @@
+﻿GPU-aware radio19 실험용 모델
+
+테스트베드 경로: /home/nvidia/hsw/25_3_hsw/xapp_gpu_aware_no_lending/
+필수 교체: actor.pt, manifest.json, runtime.py, ppo_socket_server.py, gpu_reader.py
+검증용 교체: verify.py, sample_input.json, requirements.txt
+구형 latency_reader.py는 더 이상 사용하지 않음.
+
+검증:
+/home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending/.venv/bin/python /home/nvidia/hsw/25_3_hsw/xapp_gpu_aware_no_lending/verify.py
+/home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending/.venv/bin/python /home/nvidia/hsw/25_3_hsw/xapp_gpu_aware_no_lending/gpu_reader.py
+
+기존 slice 실행 디렉터리에서 현재 RNTI로 변경:
+PPO_RADIO_INPUT=1 \
+PPO_BUNDLE=/home/nvidia/hsw/25_3_hsw/xapp_gpu_aware_no_lending \
+PPO_PYTHON=/home/nvidia/hsw/25_3_hsw/xapp_basic_no_lending/.venv/bin/python \
+VA_RNTIS=VA1_RNTI,VA2_RNTI NONVA_RNTIS=NONVA1_RNTI,NONVA2_RNTI \
+./xapp_slice_ppo_ctrl
+
+기존 PPO4R 지원 xApp 사용. 이번 변경으로 OAI 이미지나 C 재빌드 불필요.
+기본 PPO와 제어 xApp 동시 실행 금지. 기존 제어 정책 삭제 후 실행.
+입력: 무선 18개 + GPU Util. E2E latency 입력 없음.
+GPU 읽기 실패 또는 오래된 값이면 HOLD.
+시뮬레이터 실측 재현 검증 미통과: 실제 QoS 개선은 테스트베드 검증 필요.

@@ -1,0 +1,2127 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b4f7b84..5df3a3d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -148,6 +148,7 @@ OPTION(BUILD_DOCS "Build cuBB documentation" ON)
+ OPTION(BUILD_NVIPC_ONLY "Build libnvipc.so only" OFF)
+ OPTION(SCF_FAPI_10_04 "Set flag SCF_FAPI_10_04" OFF)
+ OPTION(ENABLE_L2_SLT_RSP "Enable L2 Slot Response" ON)
++OPTION(ENABLE_DAPP_HOOK "Enable dApp FAPI hook shared-memory ring" ON)
+ OPTION(SCF_FAPI_10_04_SRS "Set flag SCF_FAPI_10_04_SRS for 10.04 SRS Only" OFF)
+ OPTION(CMAKE_CUDA_ARCHITECTURES "Set CUDA Architectures" OFF)
+ # Having BUILD_SHARED_LIBS set to OFF resulted in significant increase in cuPHY build directory in cuBB builds
+@@ -205,6 +206,10 @@ if(ENABLE_L2_SLT_RSP)
+     add_definitions(-DENABLE_L2_SLT_RSP)
+ endif()
+ 
++# ENABLE_DAPP_HOOK is deliberately NOT a global add_definitions(): the macro is
++# attached to the dapp_hook interface target so only the two libraries that
++# carry hook code are rebuilt when it changes.
++
+ if(ENABLE_BLOCKING_LOGGER)
+     add_definitions(-DFMTLOG_BLOCK)
+ endif()
+@@ -288,6 +293,7 @@ add_subdirectory(cuPHY-CP/gt_common_libs)
+ add_subdirectory(cuPHY-CP/cuphyoam)
+ add_subdirectory(cuPHY-CP/ru-emulator)
+ add_subdirectory(cuPHY-CP/aerial-fh-driver)
++add_subdirectory(cuPHY-CP/dapp_hook)
+ add_subdirectory(cuPHY-CP/cuphydriver)
+ add_subdirectory(cuPHY-CP/data_lake)
+ add_subdirectory(cuPHY-CP/cuphyl2adapter)
+diff --git a/cuPHY-CP/cuphycontroller/examples/CMakeLists.txt b/cuPHY-CP/cuphycontroller/examples/CMakeLists.txt
+index 8ac03cf..82cb7d0 100644
+--- a/cuPHY-CP/cuphycontroller/examples/CMakeLists.txt
++++ b/cuPHY-CP/cuphycontroller/examples/CMakeLists.txt
+@@ -38,6 +38,10 @@ target_compile_options(${TARGET_SCF} PRIVATE ${AERIAL_ARCH_TUNE_FLAGS})
+ target_link_directories(${TARGET_SCF} PRIVATE "${CUDA_TOOLKIT_ROOT_DIR}/lib64")
+ 
+ target_link_libraries(${TARGET_SCF} yaml cuphydriver scf_5g_fapi nvphy nvlog cuphyoamlib mimalloc app_config aerial_sdk_version app_utils CUDA::cudart)
++if(TARGET dapp_tenant)
++    target_link_libraries(${TARGET_SCF} dapp_tenant)
++    target_compile_definitions(${TARGET_SCF} PRIVATE ENABLE_DAPP_TENANT)
++endif()
+ 
+ if (AERIAL_METRICS)
+     target_link_libraries(${TARGET_SCF} aerial_metrics)
+diff --git a/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf.cpp b/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf.cpp
+index 72dfcd3..20ca044 100644
+--- a/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf.cpp
++++ b/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf.cpp
+@@ -21,6 +21,9 @@
+ #include "cuphydriver.hpp"
+ #include "nv_phy_group.hpp"
+ #include "scf_5g_fapi.hpp"
++#ifdef ENABLE_DAPP_TENANT
++#include "dapp_tenant.hpp"
++#endif
+ #include "nv_phy_driver_proxy.hpp"
+ #include "cuphyoam.hpp"
+ #include <cuda_profiler_api.h>
+@@ -521,6 +524,16 @@ int main(int argc,char* argv[]) {
+         grp->start();
+         NVLOGC_FMT(TAG, "cuPHYController configured for {} cells", parser_cfg.get_cuphydriver_cell_group_num());
+         NVLOGC_FMT(TAG, "====> cuPHYController initialized, L1 is ready!");
++#ifdef ENABLE_DAPP_TENANT
++        {
++            // dApp (2026-11-01): the YOLO tenant thread in this process (DAPP_TENANT=1, see cuPHY-CP/dapp_hook/tenant)
++            std::string tenant_err;
++            if(nv::dapp::tenant::start(tenant_err))
++                NVLOGC_FMT(TAG, "dApp tenant started in process");
++            else if(!tenant_err.empty())
++                NVLOGC_FMT(TAG, "dApp tenant NOT started: {}", tenant_err);
++        }
++#endif
+ 
+         TI_GENERIC_ADD("End Main");
+         TI_GENERIC_ALL_NVLOGC(TAG_STARTUP_TIMES);
+@@ -540,6 +553,9 @@ int main(int argc,char* argv[]) {
+             nvlog_fmtlog_thread_init("phy_main");
+             grp->join();
+         }
++#ifdef ENABLE_DAPP_TENANT
++        nv::dapp::tenant::stop();
++#endif
+         CuphyOAM *oam = CuphyOAM::getInstance();
+         oam->shutdown();
+         oam->wait_shutdown();
+diff --git a/cuPHY-CP/cuphydriver/include/context.hpp b/cuPHY-CP/cuphydriver/include/context.hpp
+index a3e545d..d7adc5a 100644
+--- a/cuPHY-CP/cuphydriver/include/context.hpp
++++ b/cuPHY-CP/cuphydriver/include/context.hpp
+@@ -336,6 +336,12 @@ public:
+     uint16_t            getForcedNumCsi2Bits(void) const;
+     uint32_t            getPuschMaxNumLdpcHetConfigs(void) const;
+     uint8_t             getPuschAggrPerCtx(void) const;
++    const std::vector<int>& getPuschProfileSm() const { return puschProfileSm; }   ///< dApp profiles: actual PUSCH partition SM counts (ascending; empty = none)
++    const std::vector<int>& getPdschProfileSm() const { return pdschProfileSm; }   ///< dApp profiles: actual PDSCH partition SM counts
++    int getUlOrderSm() const { return ulOrderSm; }        ///< dApp (2026-11-02): actual SM count of the UL order green context (0 = unknown)
++    int getUlOrderMode() const { return ulOrderMode; }    ///< 0 = remainder of the PUSCH complement (common case), 1 = exceptional split of the full device (prefix)
++    int getUlCtrlPucchSm() const { return ulCtrlPucchSm; } ///< dApp (2026-11-02): actual SM counts of the PUCCH / PRACH green contexts (0 = unknown)
++    int getUlCtrlPrachSm() const { return ulCtrlPrachSm; }
+     uint8_t             getPrachAggrPerCtx(void) const;
+     uint8_t             getPucchAggrPerCtx(void) const;
+     uint8_t             getSrsAggrPerCtx(void) const;
+@@ -661,6 +667,23 @@ private:
+     Mutex                                  aggr_lock_cell_phy_srs;
+     std::vector<std::unique_ptr<PhyUlBfwAggr>> aggr_ulbfw_items;
+     std::vector<std::unique_ptr<PhyPuschAggr>> aggr_pusch_items;
++    // dApp per-slot profiles (2026-11-01, env DAPP_PUSCH_PROFILES / DAPP_PDSCH_PROFILES, green contexts only): profile p of
++    // a channel = green context + stream set + its own pool of pipeline objects (aggr_<ch>_items[p * per_ctx ..]); the
++    // largest profile is the context the yaml value would have created (puschMpsCtx / pdschMpsCtx, its streams are the
++    // driver-wide aggr_stream_*). getNext{Pusch,Pdsch}Aggr() pick the pool of the profile requested for the slot through
++    // cuphydriver_dapp_set_profile() (cuphydriver_api.hpp). Empty vectors = regular single-context behaviour.
++    std::vector<int>                       dapp_pusch_profiles;   // requested SM counts, ascending
++    std::vector<int>                       dapp_pdsch_profiles;
++    std::vector<MpsCtx*>                   puschProfileCtx;       // ascending SM counts; back() == puschMpsCtx
++    std::vector<int>                       puschProfileSm;        // actual partition SM counts
++    std::vector<std::array<cudaStream_t, 4>> puschProfileStreams;
++    std::vector<int>                       aggr_last_pusch_prof;
++    std::vector<MpsCtx*>                   pdschProfileCtx;       // ascending; back() == pdschMpsCtx; front() is the DL ctx (compression, cell DL streams)
++    std::vector<int>                       pdschProfileSm;
++    int                                    ulOrderSm = 0, ulOrderMode = 0;   // dApp (2026-11-02): exported through cuphydriver_dapp_profile_sms(2, ...)
++    int                                    ulCtrlPucchSm = 0, ulCtrlPrachSm = 0;   // dApp (2026-11-02): exported through cuphydriver_dapp_profile_sms(3, ...)
++    std::vector<cudaStream_t>              pdschProfileStreams;
++    std::vector<int>                       aggr_last_pdsch_prof;
+     std::vector<std::unique_ptr<PhyPucchAggr>> aggr_pucch_items;
+     std::vector<std::unique_ptr<PhyPrachAggr>> aggr_prach_items;
+     std::vector<std::unique_ptr<PhySrsAggr>> aggr_srs_items;
+diff --git a/cuPHY-CP/cuphydriver/include/cuphydriver_api.hpp b/cuPHY-CP/cuphydriver/include/cuphydriver_api.hpp
+index 9356a36..f2804fd 100644
+--- a/cuPHY-CP/cuphydriver/include/cuphydriver_api.hpp
++++ b/cuPHY-CP/cuphydriver/include/cuphydriver_api.hpp
+@@ -729,6 +729,23 @@ int get_num_dlc_tasks(int num_workers,bool commViaCpu, uint8_t mMIMO_enable);
+  */
+ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_command* sc);
+ 
++// ---------------------------------------------------------------------------------------------------------------------
++// dApp per-slot GPU profiles (2026-11-01). With use_green_contexts 1 and the environment variables
++// DAPP_PUSCH_PROFILES="40,56,72,96" / DAPP_PDSCH_PROFILES="40,56" (SM counts, any order) cuphydriver keeps one green
++// context, one stream set and one pipeline-object pool per listed SM count ("profile"); the largest profile replaces the
++// yaml mps_sm_pusch / mps_sm_pdsch value. The L2 adapter hook sizes every slot from its FAPI content and calls
++// cuphydriver_dapp_set_profile() before l1_enqueue_phy_work(); getNextPuschAggr()/getNextPdschAggr() then take an object
++// from that profile's pool (falling back to larger profiles, then smaller ones, rather than dropping the slot) and record
++// the profile actually used. channel: 0 = PUSCH, 1 = PDSCH. Profile indices are ascending SM counts; 0xFF / -1 = default.
++// ---------------------------------------------------------------------------------------------------------------------
++void     cuphydriver_dapp_set_profile(uint16_t sfn, uint16_t slot, uint8_t pusch_idx, uint8_t pdsch_idx);
++int      cuphydriver_dapp_get_profile(uint16_t sfn, uint16_t slot, int channel);   // requested, -1 if none
++void     cuphydriver_dapp_note_used(uint16_t sfn, uint16_t slot, int channel, int profile);
++int      cuphydriver_dapp_get_used(uint16_t sfn, uint16_t slot, int channel);      // actually used, -1 if unknown
++int      cuphydriver_dapp_profile_sms(int channel, int* sm_counts, int max_count); // actual partition SM counts, ascending; returns count (0: no profiles). channel 2: {UL order SM count, mode 0 = remainder of the PUSCH complement / 1 = prefix of the device}; channel 3: {PUCCH, PRACH} SM counts
++uint64_t cuphydriver_dapp_profile_count(int channel, int profile);                 // slots served by this profile
++uint64_t cuphydriver_dapp_fallback_count(int channel);                             // slots served by a profile other than the requested one
++
+ /******************************************************************/ /**
+  * @brief Set the output callback for UL and DL
+  *
+diff --git a/cuPHY-CP/cuphydriver/include/phypusch_aggr.hpp b/cuPHY-CP/cuphydriver/include/phypusch_aggr.hpp
+index bcb2e94..0fb84ae 100644
+--- a/cuPHY-CP/cuphydriver/include/phypusch_aggr.hpp
++++ b/cuPHY-CP/cuphydriver/include/phypusch_aggr.hpp
+@@ -60,6 +60,10 @@ public:
+      */
+     ~PhyPuschAggr();
+ 
++    // dApp profiles (2026-11-01): the stream set this object was created with (its green context's streams); the UL task
++    // functions use it instead of the driver-wide aggr_stream_pusch so that a profile's pipeline runs on its own partition.
++    cudaStream_t*    getStreams() const { return s_channels; }
++
+     ////////////////////////////////////////////////////////////
+     /// Module generic
+     ////////////////////////////////////////////////////////////
+@@ -429,6 +433,7 @@ protected:
+     
+     ///< cuPHY PUSCH reception handle (created via cuphyCreatePuschRx())
+     cuphyPuschRxHndl_t                 puschRxHndl;
++    cudaStream_t*                      s_channels = nullptr;   ///< dApp profiles: stream set of this object's green context
+     
+     ///< Tensor parameter for DFT frequency domain weights (standard size)
+     cuphyTensorPrm_t                   tPrmWFreq;
+diff --git a/cuPHY-CP/cuphydriver/src/common/context.cpp b/cuPHY-CP/cuphydriver/src/common/context.cpp
+index 8dbaa85..c34e3a2 100644
+--- a/cuPHY-CP/cuphydriver/src/common/context.cpp
++++ b/cuPHY-CP/cuphydriver/src/common/context.cpp
+@@ -143,6 +143,32 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+     mps_sm_ul_order     = ctx_cfg.mps_sm_ul_order;
+     mps_sm_srs          = ctx_cfg.mps_sm_srs;
+     mps_sm_pdsch        = ctx_cfg.mps_sm_pdsch;
++    // dApp profiles (2026-11-01): DAPP_PUSCH_PROFILES="40,56,72,96" / DAPP_PDSCH_PROFILES="40,56" (SM counts). The largest
++    // value replaces the yaml mps_sm_pusch / mps_sm_pdsch (the regular green split below creates that context); the
++    // smaller ones become additional green contexts with their own stream sets and pipeline-object pools.
++    {
++        auto parse_list = [](const char* name) {
++            std::vector<int> v; const char* s = std::getenv(name);
++            if(s == nullptr) return v;
++            std::string t;
++            for(const char* p = s;; ++p) {
++                if(*p == ',' || *p == ' ' || *p == '\0') { if(!t.empty()) { v.push_back(std::atoi(t.c_str())); t.clear(); } if(*p == '\0') break; }
++                else t += *p;
++            }
++            std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end());
++            v.erase(std::remove_if(v.begin(), v.end(), [](int x) { return x <= 0; }), v.end());
++            return v;
++        };
++        dapp_pusch_profiles = parse_list("DAPP_PUSCH_PROFILES");
++        dapp_pdsch_profiles = parse_list("DAPP_PDSCH_PROFILES");
++        if(use_green_contexts == 0 && (!dapp_pusch_profiles.empty() || !dapp_pdsch_profiles.empty())) {
++            NVLOGC_FMT(TAG, "dApp profiles ignored: use_green_contexts is 0");
++            dapp_pusch_profiles.clear(); dapp_pdsch_profiles.clear();
++        }
++        auto list_str = [](const std::vector<int>& v) { std::string o; for(int x : v) { if(!o.empty()) o += ","; o += std::to_string(x); } return o; };
++        if(!dapp_pusch_profiles.empty()) { NVLOGC_FMT(TAG, "dApp PUSCH profiles [{}]: yaml mps_sm_pusch {} replaced by the largest", list_str(dapp_pusch_profiles), mps_sm_pusch); mps_sm_pusch = dapp_pusch_profiles.back(); }
++        if(!dapp_pdsch_profiles.empty()) { NVLOGC_FMT(TAG, "dApp PDSCH profiles [{}]: yaml mps_sm_pdsch {} replaced by the largest", list_str(dapp_pdsch_profiles), mps_sm_pdsch); mps_sm_pdsch = dapp_pdsch_profiles.back(); }
++    }
+     mps_sm_pdcch        = ctx_cfg.mps_sm_pdcch;
+     mps_sm_pbch         = ctx_cfg.mps_sm_pdcch;
+     mps_sm_dl_ctrl      = mps_sm_pdcch + mps_sm_pbch;
+@@ -490,6 +516,26 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+ 		mpsCtxList.push_back(puschMpsCtx);
+ 		NVLOGC_FMT(TAG, "PUSCH green context with SM count of {}.", devResources[resource_index_pusch_split+1].sm.smCount);
+ 
++		// dApp profiles (2026-11-01): the smaller PUSCH partitions, each the remainder of its own split of the full device
++		// (same rounding as above), so every profile is a subset of the next larger one (verified: tools/gc_bench/gc_nest.cu).
++		puschProfileCtx.clear(); puschProfileSm.clear();
++		if(!dapp_pusch_profiles.empty())
++		{
++		    for(size_t j = 0; j + 1 < dapp_pusch_profiles.size(); j++)
++		    {
++		        int prof_cnt = gpuMaxSmCount - dapp_pusch_profiles[j];
++		        if((prof_cnt > SM_granularity) && (prof_cnt % SM_granularity != 0)) prof_cnt -= prof_cnt % SM_granularity;
++		        CUdevResource prof_res = {}, prof_rem = {}; unsigned int prof_groups = 1;
++		        CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&prof_res, &prof_groups, &initial_device_GPU_resources, &prof_rem, use_flags, prof_cnt));
++		        MpsCtx* prof_ctx = new MpsCtx((phydriver_handle)this, gpu_device, &prof_rem);
++		        mpsCtxList.push_back(prof_ctx);
++		        puschProfileCtx.push_back(prof_ctx); puschProfileSm.push_back(prof_rem.sm.smCount);
++		        NVLOGC_FMT(TAG, "PUSCH profile {} green context with SM count of {} (requested {}).", j, prof_rem.sm.smCount, dapp_pusch_profiles[j]);
++		    }
++		    puschProfileCtx.push_back(puschMpsCtx); puschProfileSm.push_back(devResources[resource_index_pusch_split+1].sm.smCount);
++		    NVLOGC_FMT(TAG, "PUSCH profile {} = the yaml green context with SM count of {}.", puschProfileCtx.size() - 1, puschProfileSm.back());
++		}
++
+                 // Do another split of the initial GPU resources; will then resplit the remaining split for PUCCH and PRACH
+                 unsigned int resource_index_prep_for_ul_ctrl_split = 2;  //index into devResources
+                 actual_split_groups[resource_index_prep_for_ul_ctrl_split] = 1;
+@@ -520,6 +566,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+ 		prachMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pucch_split + 1]);
+ 		mpsCtxList.push_back(prachMpsCtx);
+ 		NVLOGC_FMT(TAG, "PRACH green context with SM count of {}.", devResources[resource_index_pucch_split+1].sm.smCount);
++		ulCtrlPucchSm = devResources[resource_index_pucch_split].sm.smCount; ulCtrlPrachSm = devResources[resource_index_pucch_split+1].sm.smCount;   // dApp export (2026-11-02)
+ 
+ 		// PDSCH
+ 		unsigned int resource_index_pdsch_split = 6;  //index into devResources
+@@ -542,6 +589,28 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+ 		dlMpsCtx = pdschMpsCtx;
+ 		NVLOGC_FMT(TAG, "PDSCH green context with SM count of {}.", devResources[resource_index_pdsch_split].sm.smCount);
+ 
++		// dApp profiles (2026-11-01): the smaller PDSCH partitions = results of their own splits of the full device (nested
++		// prefixes, verified with tools/gc_bench/gc_nest.cu). The DL context (cell DL streams, compression, buffer memsets)
++		// becomes the smallest profile so that it never reaches outside the partition of the profile in use.
++		pdschProfileCtx.clear(); pdschProfileSm.clear();
++		if(!dapp_pdsch_profiles.empty())
++		{
++		    for(size_t j = 0; j + 1 < dapp_pdsch_profiles.size(); j++)
++		    {
++		        int prof_cnt = dapp_pdsch_profiles[j];
++		        if(prof_cnt % SM_granularity != 0) prof_cnt += SM_granularity - prof_cnt % SM_granularity;
++		        CUdevResource prof_res = {}, prof_rem = {}; unsigned int prof_groups = 1;
++		        CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&prof_res, &prof_groups, &initial_device_GPU_resources, &prof_rem, use_flags, prof_cnt));
++		        MpsCtx* prof_ctx = new MpsCtx((phydriver_handle)this, gpu_device, &prof_res);
++		        mpsCtxList.push_back(prof_ctx);
++		        pdschProfileCtx.push_back(prof_ctx); pdschProfileSm.push_back(prof_res.sm.smCount);
++		        NVLOGC_FMT(TAG, "PDSCH profile {} green context with SM count of {} (requested {}).", j, prof_res.sm.smCount, dapp_pdsch_profiles[j]);
++		    }
++		    pdschProfileCtx.push_back(pdschMpsCtx); pdschProfileSm.push_back(devResources[resource_index_pdsch_split].sm.smCount);
++		    dlMpsCtx = pdschProfileCtx.front();
++		    NVLOGC_FMT(TAG, "PDSCH profile {} = the yaml green context with SM count of {}; DL context = profile 0 ({} SMs).", pdschProfileCtx.size() - 1, pdschProfileSm.back(), pdschProfileSm.front());
++		}
++
+                 // Do another split of the initial GPU resources to get Dl Ctrl resource
+ 		// Do getMpsSmDlCtrl() instead of separate for PDCCH and SSB and CSI-RS?
+ 		unsigned int resource_index_dl_ctrl_split = 8;  //index into devResources
+@@ -590,6 +659,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+ 			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split]);
+ 			mpsCtxList.push_back(ulMpsCtx);
+ 			NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split].sm.smCount);
++			ulOrderSm = devResources[resource_index_ul_order_split].sm.smCount; ulOrderMode = 1;   // dApp export (2026-11-02)
+                 }
+                 else
+ 		{
+@@ -605,6 +675,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+ 			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split+1]);
+ 			mpsCtxList.push_back(ulMpsCtx);
+ 			NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split+1].sm.smCount);
++			ulOrderSm = devResources[resource_index_ul_order_split+1].sm.smCount; ulOrderMode = 0;   // dApp export (2026-11-02): the tenant keeps this slice empty
+                 }
+ #endif
+ 
+@@ -748,8 +819,47 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+         }
+         aggr_last_pusch = 0;
+ 
+-        for(int i = 0; i < getPuschAggrPerCtx(); i++)
+-            aggr_pusch_items.push_back(std::unique_ptr<PhyPuschAggr>(new PhyPuschAggr((phydriver_handle)this, gpu_device, aggr_stream_pusch, puschMpsCtx)));
++        if(puschProfileCtx.size() > 1)
++        {
++            // dApp profiles: one stream set and one object pool per profile (the largest reuses aggr_stream_pusch above)
++            puschProfileStreams.assign(puschProfileCtx.size(), std::array<cudaStream_t, 4>{});
++            aggr_last_pusch_prof.assign(puschProfileCtx.size(), 0);
++            for(size_t p = 0; p < puschProfileCtx.size(); p++)
++            {
++                puschProfileCtx[p]->setCtx();
++                if(p + 1 == puschProfileCtx.size())
++                {
++                    for(int k = 0; k < 4; k++) puschProfileStreams[p][k] = aggr_stream_pusch[k];
++                }
++                else
++                {
++                    CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&puschProfileStreams[p][PHASE1_SPLIT_STREAM1], cudaStreamNonBlocking, -2));
++                    warmupStream(puschProfileStreams[p][PHASE1_SPLIT_STREAM1]);
++                    CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&puschProfileStreams[p][PHASE2_SPLIT_STREAM1], cudaStreamNonBlocking, -2));
++                    warmupStream(puschProfileStreams[p][PHASE2_SPLIT_STREAM1]);
++                    if(splitUlCudaStreamsEnabled())
++                    {
++                        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&puschProfileStreams[p][PHASE1_SPLIT_STREAM2], cudaStreamNonBlocking, 0));
++                        warmupStream(puschProfileStreams[p][PHASE1_SPLIT_STREAM2]);
++                        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&puschProfileStreams[p][PHASE2_SPLIT_STREAM2], cudaStreamNonBlocking, 0));
++                        warmupStream(puschProfileStreams[p][PHASE2_SPLIT_STREAM2]);
++                    }
++                    else
++                    {
++                        puschProfileStreams[p][PHASE1_SPLIT_STREAM2] = puschProfileStreams[p][PHASE1_SPLIT_STREAM1];
++                        puschProfileStreams[p][PHASE2_SPLIT_STREAM2] = puschProfileStreams[p][PHASE2_SPLIT_STREAM1];
++                    }
++                }
++                for(int i = 0; i < getPuschAggrPerCtx(); i++)
++                    aggr_pusch_items.push_back(std::unique_ptr<PhyPuschAggr>(new PhyPuschAggr((phydriver_handle)this, gpu_device, puschProfileStreams[p].data(), puschProfileCtx[p])));
++                NVLOGC_FMT(TAG, "PUSCH profile {} ({} SMs): {} pipeline objects", p, puschProfileSm[p], getPuschAggrPerCtx());
++            }
++        }
++        else
++        {
++            for(int i = 0; i < getPuschAggrPerCtx(); i++)
++                aggr_pusch_items.push_back(std::unique_ptr<PhyPuschAggr>(new PhyPuschAggr((phydriver_handle)this, gpu_device, aggr_stream_pusch, puschMpsCtx)));
++        }
+ 
+ 
+         if(this->mMIMO_enable)
+@@ -807,8 +917,27 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
+         CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pdsch, cudaStreamNonBlocking, -4));
+         CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&H2D_TB_CPY_stream, cudaStreamNonBlocking, -4));
+         aggr_last_pdsch = 0;
+-        for(int i = 0; i < PHY_PDSCH_AGGR_X_CTX; i++)
+-            aggr_pdsch_items.push_back(std::unique_ptr<PhyPdschAggr>(new PhyPdschAggr((phydriver_handle)this, gpu_device, aggr_stream_pdsch, pdschMpsCtx)));
++        if(pdschProfileCtx.size() > 1)
++        {
++            // dApp profiles: one stream and one object pool per profile (the largest reuses aggr_stream_pdsch above)
++            pdschProfileStreams.assign(pdschProfileCtx.size(), nullptr);
++            aggr_last_pdsch_prof.assign(pdschProfileCtx.size(), 0);
++            for(size_t p = 0; p < pdschProfileCtx.size(); p++)
++            {
++                pdschProfileCtx[p]->setCtx();
++                if(p + 1 == pdschProfileCtx.size()) pdschProfileStreams[p] = aggr_stream_pdsch;
++                else CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&pdschProfileStreams[p], cudaStreamNonBlocking, -4));
++                for(int i = 0; i < PHY_PDSCH_AGGR_X_CTX; i++)
++                    aggr_pdsch_items.push_back(std::unique_ptr<PhyPdschAggr>(new PhyPdschAggr((phydriver_handle)this, gpu_device, pdschProfileStreams[p], pdschProfileCtx[p])));
++                NVLOGC_FMT(TAG, "PDSCH profile {} ({} SMs): {} pipeline objects", p, pdschProfileSm[p], PHY_PDSCH_AGGR_X_CTX);
++            }
++            pdschMpsCtx->setCtx();
++        }
++        else
++        {
++            for(int i = 0; i < PHY_PDSCH_AGGR_X_CTX; i++)
++                aggr_pdsch_items.push_back(std::unique_ptr<PhyPdschAggr>(new PhyPdschAggr((phydriver_handle)this, gpu_device, aggr_stream_pdsch, pdschMpsCtx)));
++        }
+ 
+         // Allocate helper buffers used to memset DL cells' output buffers
+         h_dl_buffers_addr = cuphy::make_unique_pinned<CleanupDlBufInfo>(PDSCH_MAX_CELLS_PER_CELL_GROUP * DL_HELPER_MEMSET_BUFFERS_PER_CTX);
+@@ -1813,7 +1942,7 @@ int PhyDriverCtx::setCellPhyByMplane(struct cell_phy_info& cell_pinfo)
+     }
+     // Cannot add in the loops below wip_accum_mf.addMF(aggr_<channel>_items[i]->mf) because that will add number of aggr objects * number of cells rather than only aggr object times
+ 
+-    for(int i = 0; i < getPuschAggrPerCtx(); i++)
++    for(size_t i = 0; i < aggr_pusch_items.size(); i++)   // dApp profiles: every profile's pool
+     {
+         aggr_pusch_items[i]->createPhyObj();
+         aggr_pusch_items[i]->updateMemoryTracker(); // update total GPU
+@@ -1867,7 +1996,7 @@ int PhyDriverCtx::setCellPhyByMplane(struct cell_phy_info& cell_pinfo)
+         }
+     }
+ 
+-    for(int i = 0; i < PHY_PDSCH_AGGR_X_CTX; i++)
++    for(size_t i = 0; i < aggr_pdsch_items.size(); i++)   // dApp profiles: every profile's pool
+     {
+         aggr_pdsch_items[i]->createPhyObj();
+         aggr_pdsch_items[i]->updateMemoryTracker();
+@@ -2373,6 +2502,45 @@ PhyPuschAggr* PhyDriverCtx::getNextPuschAggr(slot_params_aggr* aggr_slot_params)
+ 
+     aggr_lock_cell_phy_pusch.lock();
+ 
++    if(puschProfileCtx.size() > 1 && aggr_pusch_items.size() >= puschProfileCtx.size() * pusch_aggr_x_ctx)
++    {
++        // dApp profiles (2026-11-01): the pool of the profile requested for this slot, then the larger profiles, then the
++        // smaller ones (a slot is never dropped for lack of an object; a smaller partition risks the deadline, nothing else).
++        const int nprof = static_cast<int>(puschProfileCtx.size());
++        int want = nprof - 1;
++        if(aggr_slot_params != nullptr && aggr_slot_params->si != nullptr)
++        {
++            const int req = cuphydriver_dapp_get_profile(aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, 0);
++            if(req >= 0 && req < nprof) want = req;
++        }
++        int used = -1;
++        for(int step = 0; step < nprof && tmp == nullptr; step++)
++        {
++            const int p = (want + step < nprof) ? want + step : want - (step - (nprof - want)) - 1;
++            if(p < 0 || p >= nprof) continue;
++            int& last = aggr_last_pusch_prof[p];
++            for(int k = 0; k < pusch_aggr_x_ctx; k++)
++            {
++                const int i = p * pusch_aggr_x_ctx + last;
++                last = (last + 1) % pusch_aggr_x_ctx;
++                if(aggr_pusch_items[i]->reserveCellGroup() == 0) { tmp = aggr_pusch_items[i].get(); used = p; break; }
++            }
++        }
++        if(tmp != nullptr && aggr_slot_params != nullptr && aggr_slot_params->si != nullptr)
++        {
++            cuphydriver_dapp_note_used(aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, 0, used);
++            if(used != want) NVLOGW_FMT(TAG, "SFN {}.{} dApp PUSCH profile {} requested, {} used (pool busy)", aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, want, used);
++        }
++        aggr_lock_cell_phy_pusch.unlock();
++        if(tmp)
++        {
++            tmp->setDynAggrParams(aggr_slot_params);
++            if(tmp->getDynParams() == nullptr)
++                tmp->release();
++        }
++        return tmp;
++    }
++
+     while(
+         aggr_pusch_items[aggr_last_pusch]->reserveCellGroup() != 0 &&
+         cnt < pusch_aggr_x_ctx)
+@@ -2635,6 +2803,44 @@ PhyPdschAggr* PhyDriverCtx::getNextPdschAggr(slot_params_aggr* aggr_slot_params)
+ 
+     aggr_lock_cell_phy_pdsch.lock();
+ 
++    if(pdschProfileCtx.size() > 1 && aggr_pdsch_items.size() >= pdschProfileCtx.size() * PHY_PDSCH_AGGR_X_CTX)
++    {
++        // dApp profiles (2026-11-01): see getNextPuschAggr()
++        const int nprof = static_cast<int>(pdschProfileCtx.size());
++        int want = nprof - 1;
++        if(aggr_slot_params != nullptr && aggr_slot_params->si != nullptr)
++        {
++            const int req = cuphydriver_dapp_get_profile(aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, 1);
++            if(req >= 0 && req < nprof) want = req;
++        }
++        int used = -1;
++        for(int step = 0; step < nprof && tmp == nullptr; step++)
++        {
++            const int p = (want + step < nprof) ? want + step : want - (step - (nprof - want)) - 1;
++            if(p < 0 || p >= nprof) continue;
++            int& last = aggr_last_pdsch_prof[p];
++            for(int k = 0; k < static_cast<int>(PHY_PDSCH_AGGR_X_CTX); k++)
++            {
++                const int i = p * static_cast<int>(PHY_PDSCH_AGGR_X_CTX) + last;
++                last = (last + 1) % static_cast<int>(PHY_PDSCH_AGGR_X_CTX);
++                if(aggr_pdsch_items[i]->reserveCellGroup() == 0) { tmp = aggr_pdsch_items[i].get(); used = p; break; }
++            }
++        }
++        if(tmp != nullptr && aggr_slot_params != nullptr && aggr_slot_params->si != nullptr)
++        {
++            cuphydriver_dapp_note_used(aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, 1, used);
++            if(used != want) NVLOGW_FMT(TAG, "SFN {}.{} dApp PDSCH profile {} requested, {} used (pool busy)", aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, want, used);
++        }
++        aggr_lock_cell_phy_pdsch.unlock();
++        if(tmp)
++        {
++            tmp->setDynAggrParams(aggr_slot_params);
++            if(tmp->getDynParams() == nullptr)
++                tmp->release();
++        }
++        return tmp;
++    }
++
+     while(
+         aggr_pdsch_items[aggr_last_pdsch]->reserveCellGroup() != 0 &&
+         cnt < PHY_PDSCH_AGGR_X_CTX)
+@@ -3564,7 +3770,7 @@ uint8_t PhyDriverCtx:: getUlInputBufferPerCellSrs() const {
+ 
+ bool PhyDriverCtx::getAggrObjFreeStatus() {
+ 
+-    for(int i = 0; i < getPuschAggrPerCtx(); i++)
++    for(size_t i = 0; i < aggr_pusch_items.size(); i++)
+     {
+         if(aggr_pusch_items[i]->isActive()) {
+             NVLOGI_FMT(TAG, "L1 Recovery : PUSCH[{}] not free", i);
+@@ -3616,7 +3822,7 @@ bool PhyDriverCtx::getAggrObjFreeStatus() {
+         }
+     }
+ 
+-    for(int i = 0; i < PHY_PDSCH_AGGR_X_CTX; i++)
++    for(size_t i = 0; i < aggr_pdsch_items.size(); i++)
+     {
+         if(aggr_pdsch_items[i]->isActive()){
+             NVLOGI_FMT(TAG, "L1 Recovery : PDSCH[{}] not free", i);
+diff --git a/cuPHY-CP/cuphydriver/src/common/cuphydriver_api.cpp b/cuPHY-CP/cuphydriver/src/common/cuphydriver_api.cpp
+index de7af37..25a7b87 100644
+--- a/cuPHY-CP/cuphydriver/src/common/cuphydriver_api.cpp
++++ b/cuPHY-CP/cuphydriver/src/common/cuphydriver_api.cpp
+@@ -31,6 +31,78 @@
+ #include "cell.hpp"
+ #include "slot_map_ul.hpp"
+ #include "slot_map_dl.hpp"
++#include <atomic>
++
++// ---- dApp per-slot profile table (2026-11-01), see cuphydriver_api.hpp ------------------------------------------------
++namespace {
++struct DappProfEntry { std::atomic<uint32_t> key{0xFFFFFFFFu}; uint8_t want[2]{0xFF, 0xFF}; uint8_t used[2]{0xFF, 0xFF}; };
++DappProfEntry          g_dapp_prof[64];
++std::atomic<uint64_t>  g_dapp_prof_count[2][16];
++std::atomic<uint64_t>  g_dapp_fallback[2];
++inline uint32_t dapp_key(uint16_t sfn, uint16_t slot) { return (static_cast<uint32_t>(sfn) << 16) | slot; }
++inline DappProfEntry& dapp_entry(uint16_t sfn, uint16_t slot) { return g_dapp_prof[((static_cast<uint32_t>(sfn) << 5) | (slot & 31u)) & 63u]; }
++}
++void cuphydriver_dapp_set_profile(uint16_t sfn, uint16_t slot, uint8_t pusch_idx, uint8_t pdsch_idx)
++{
++    DappProfEntry& e = dapp_entry(sfn, slot);
++    e.key.store(0xFFFFFFFFu, std::memory_order_release);
++    e.want[0] = pusch_idx; e.want[1] = pdsch_idx; e.used[0] = 0xFF; e.used[1] = 0xFF;
++    e.key.store(dapp_key(sfn, slot), std::memory_order_release);
++}
++int cuphydriver_dapp_get_profile(uint16_t sfn, uint16_t slot, int channel)
++{
++    DappProfEntry& e = dapp_entry(sfn, slot);
++    if(e.key.load(std::memory_order_acquire) != dapp_key(sfn, slot) || channel < 0 || channel > 1) return -1;
++    return e.want[channel] == 0xFF ? -1 : e.want[channel];
++}
++void cuphydriver_dapp_note_used(uint16_t sfn, uint16_t slot, int channel, int profile)
++{
++    if(channel < 0 || channel > 1 || profile < 0 || profile >= 16) return;
++    DappProfEntry& e = dapp_entry(sfn, slot);
++    if(e.key.load(std::memory_order_acquire) == dapp_key(sfn, slot)) e.used[channel] = static_cast<uint8_t>(profile);
++    else { e.key.store(0xFFFFFFFFu, std::memory_order_release); e.want[0] = e.want[1] = 0xFF; e.used[0] = e.used[1] = 0xFF; e.used[channel] = static_cast<uint8_t>(profile); e.key.store(dapp_key(sfn, slot), std::memory_order_release); }
++    g_dapp_prof_count[channel][profile].fetch_add(1, std::memory_order_relaxed);
++    const int want = e.want[channel];
++    if(want != 0xFF && want != profile) g_dapp_fallback[channel].fetch_add(1, std::memory_order_relaxed);
++}
++int cuphydriver_dapp_get_used(uint16_t sfn, uint16_t slot, int channel)
++{
++    DappProfEntry& e = dapp_entry(sfn, slot);
++    if(e.key.load(std::memory_order_acquire) != dapp_key(sfn, slot) || channel < 0 || channel > 1) return -1;
++    return e.used[channel] == 0xFF ? -1 : e.used[channel];
++}
++int cuphydriver_dapp_profile_sms(int channel, int* sm_counts, int max_count)
++{
++    if(l1_pdh == nullptr || sm_counts == nullptr) return 0;
++    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(l1_pdh).get();
++    if(channel == 2)   // 2026-11-02: UL order green context {SM count, mode}; the tenant keeps that slice out of its partitions
++    {
++        int n = 0;
++        if(n < max_count) sm_counts[n++] = pdctx->getUlOrderSm();
++        if(n < max_count) sm_counts[n++] = pdctx->getUlOrderMode();
++        return n;
++    }
++    if(channel == 3)   // {PUCCH, PRACH} actual SM counts (the top-of-device UL control slice)
++    {
++        int n = 0;
++        if(n < max_count) sm_counts[n++] = pdctx->getUlCtrlPucchSm();
++        if(n < max_count) sm_counts[n++] = pdctx->getUlCtrlPrachSm();
++        return n;
++    }
++    const std::vector<int>& v = (channel == 0) ? pdctx->getPuschProfileSm() : pdctx->getPdschProfileSm();
++    int n = 0;
++    for(size_t i = 0; i < v.size() && n < max_count; i++) sm_counts[n++] = v[i];
++    return n;
++}
++uint64_t cuphydriver_dapp_profile_count(int channel, int profile)
++{
++    if(channel < 0 || channel > 1 || profile < 0 || profile >= 16) return 0;
++    return g_dapp_prof_count[channel][profile].load(std::memory_order_relaxed);
++}
++uint64_t cuphydriver_dapp_fallback_count(int channel)
++{
++    return (channel < 0 || channel > 1) ? 0 : g_dapp_fallback[channel].load(std::memory_order_relaxed);
++}
+ #include "worker.hpp"
+ #include "gpudevice.hpp"
+ #include "time.hpp"
+diff --git a/cuPHY-CP/cuphydriver/src/uplink/phyprach_aggr.cpp b/cuPHY-CP/cuphydriver/src/uplink/phyprach_aggr.cpp
+index b49ce84..2ed70ad 100644
+--- a/cuPHY-CP/cuphydriver/src/uplink/phyprach_aggr.cpp
++++ b/cuPHY-CP/cuphydriver/src/uplink/phyprach_aggr.cpp
+@@ -26,6 +26,7 @@
+ #include "exceptions.hpp"
+ #include "cuda_events.hpp"
+ #include <unordered_map>
++#include <cstdlib>
+ 
+ static void print_prach_static_params(const cuphyPrachStatPrms_t * prach_stat_params)
+ {
+@@ -401,7 +402,6 @@ int PhyPrachAggr::setup(
+     t_ns          t1    = Time::nowNs();
+ 
+     slot_command_api::oran_slot_ind oran_ind     = getOranAggrSlotIndication();
+-    
+     setCtx();
+ 
+     slot_command_api::prach_params* pparms = getDynParams();
+@@ -419,6 +419,18 @@ int PhyPrachAggr::setup(
+ 
+     pDynParams.pOccaPrms = pparms->rach.data();
+     pDynParams.nOccaProc = pparms->nOccasion;
++    // Real-RU port (2026-10-29): the L1 build that serves the Benetel RU + COTS UE (/home/nvidia/hsw/25_3_hsw, built 2026-08-02) carries an
++    // unconditional local change here: force_thr0 = 20.0 for every PRACH occasion (cuphy_api.h: 0 = cuPHY's computed detection threshold,
++    // > 0 = use this value). Same effect here, but only when CUPHY_PRACH_FORCE_THR0 is set in the environment (value = threshold), so the
++    // lab build behaves as upstream when the variable is absent. See cuPHY-CP/dapp_hook/sweep/hybrid/baseline/phyprach_aggr_nvidia.diff.
++    static const float prach_force_thr0 = []() { const char* s = std::getenv("CUPHY_PRACH_FORCE_THR0"); return s ? std::strtof(s, nullptr) : 0.0f; }();
++    if(prach_force_thr0 > 0.0f)
++    {
++        for(uint32_t i = 0; i < pDynParams.nOccaProc; ++i)
++        {
++            pDynParams.pOccaPrms[i].force_thr0 = prach_force_thr0;
++        }
++    }
+     //print_prach_dynamic_params(pDynParams.pOccaPrms, pDynParams.nOccaProc);
+ 
+     // Buffer-to-cell mapping: Reconciles two different orderings
+@@ -432,6 +444,17 @@ int PhyPrachAggr::setup(
+     for(const Cell* cell : aggr_cell_list) 
+     {
+         const int phy_cell_id = cell->getPhyId();
++        // Hybrid fix (2026-10-30): SlotMapUl::addCell allocates rach_occasion (= the cell's static occasion count) stage-3 buffers
++        // only for cells that carry PRACH in this slot and none for the others (cuphydriver_api.cpp: rach_occasion = 0 when the
++        // cell has no PRACH PDU). A cell that is in the slot for PUSCH/PUCCH only (COTS-UE cell while the emulator cells
++        // have PRACH) must therefore not consume a buffer range here, otherwise every later cell is shifted by one range
++        // and the last occasion indexes past ulbuf_st3_v (segfault / stale buffer -> UL stall, runs ue8-ue20).
++        bool has_prach_this_slot = false;
++        for(int k = 0; k < pDynParams.nOccaProc; k++)
++        {
++            if(pparms->phy_cell_index_list[k] == phy_cell_id) { has_prach_this_slot = true; break; }
++        }
++        if(!has_prach_this_slot) continue;
+         const size_t num_occasions = cell->getPrachOccaSize();
+         
+         if(num_occasions > 0) 
+@@ -443,6 +466,12 @@ int PhyPrachAggr::setup(
+         }
+     }
+ 
++    if(static_cast<size_t>(buffer_idx) != ulbuf_st3_v.size())
++    {
++        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: PRACH buffer map ({} buffers over {} cells) does not match the {} stage-3 buffers of this slot, skipping PRACH", __FUNCTION__, buffer_idx, (int)cell_buffer_info_size, ulbuf_st3_v.size());
++        return -1;
++    }
++
+     // Reorder PRACH PDUs (L2 order) and map to corresponding buffers
+     int previous_cell_id = -1;
+     int occasion_counter = 0;
+diff --git a/cuPHY-CP/cuphydriver/src/uplink/phypusch_aggr.cpp b/cuPHY-CP/cuphydriver/src/uplink/phypusch_aggr.cpp
+index 5da8e6e..afdaba3 100644
+--- a/cuPHY-CP/cuphydriver/src/uplink/phypusch_aggr.cpp
++++ b/cuPHY-CP/cuphydriver/src/uplink/phypusch_aggr.cpp
+@@ -39,6 +39,7 @@ PhyPuschAggr::PhyPuschAggr(
+     PhyChannel(_pdh, _gDev, 0, _s_channels[0], _mpsCtx)
+ {
+     PhyDriverCtx * pdctx = StaticConversion<PhyDriverCtx>(_pdh).get();
++    s_channels = _s_channels;
+ 
+     mf.init(_pdh, std::string("PhyPuschAggr"), sizeof(PhyPuschAggr));
+     cuphyMf.init(_pdh, std::string("cuphyPuschRx"), 0);
+diff --git a/cuPHY-CP/cuphydriver/src/uplink/task_function_ul_aggr.cpp b/cuPHY-CP/cuphydriver/src/uplink/task_function_ul_aggr.cpp
+index b08d09f..ee20932 100644
+--- a/cuPHY-CP/cuphydriver/src/uplink/task_function_ul_aggr.cpp
++++ b/cuPHY-CP/cuphydriver/src/uplink/task_function_ul_aggr.cpp
+@@ -204,7 +204,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
+     #endif
+ 
+     //Determine PUSCH Phase1, PUSCH Phase1, and PUCCH stream
+-    cudaStream_t* pusch_streams = pdctx->getUlOrderStreamsPusch();
++    cudaStream_t* pusch_streams = (pusch != nullptr && pusch->getStreams() != nullptr) ? pusch->getStreams() : pdctx->getUlOrderStreamsPusch(); // dApp profiles: the object's partition
+     cudaStream_t* pucch_streams = pdctx->getUlOrderStreamsPucch();
+     cudaStream_t phase1_stream;
+     cudaStream_t phase2_stream;
+@@ -572,7 +572,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
+         return 0;
+     }
+ 
+-    cudaStream_t* streams = pdctx->getUlOrderStreamsPusch();
++    cudaStream_t* streams = (pusch != nullptr && pusch->getStreams() != nullptr) ? pusch->getStreams() : pdctx->getUlOrderStreamsPusch(); // dApp profiles
+     cudaStream_t phase1_stream;
+     cudaStream_t phase2_stream;
+ 
+@@ -1066,6 +1066,13 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
+     {
+         try
+         {
++            if(slot_map->aggr_cell_list.empty() || slot_map->aggr_ulbuf_st3.empty())
++            {
++                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "HYBRID_DBG prach task Map {} SFN {}.{}: slot map already released (cells {} ulbufs {}), skipping", slot_map->getId(), sfn, slot, slot_map->aggr_cell_list.size(), slot_map->aggr_ulbuf_st3.size());
++                slot_map->addChannelEndTask();
++                slot_map->addSlotEndTask();
++                return 0;
++            }
+             TI_ADD("Cuda Setup");
+             if(prach->setup(slot_map->aggr_cell_list, slot_map->aggr_ulbuf_st3, stream))
+             {
+@@ -1081,8 +1088,11 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
+             if(!oentity->getOrderLaunchedStatus()){
+                 if(oentity->waitOrderLaunched(1*NS_X_MS))
+                 {
+-                    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: waitOrderLaunched returned error for Map {}",__func__,slot_map->getId());
+-                    goto error_next;
++                    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: waitOrderLaunched returned error for Map {} (HYBRID_DBG: soft-skip instead of exit)",__func__,slot_map->getId());
++                    prach->setRunStatus(CH_RUN_DONE_ERROR);
++                    slot_map->addChannelEndTask();
++                    slot_map->addSlotEndTask();
++                    return 0;
+                 }
+             }
+             TI_ADD("Wait To Start GPU");
+@@ -1621,7 +1631,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
+                         goto error_next;
+                     }
+ 
+-                    cudaStream_t* streams = pdctx->getUlOrderStreamsPusch();
++                    cudaStream_t* streams = (pusch != nullptr && pusch->getStreams() != nullptr) ? pusch->getStreams() : pdctx->getUlOrderStreamsPusch(); // dApp profiles
+                     cudaStream_t phase2_stream;
+                     if(pdctx->splitUlCudaStreamsEnabled()) //Revisit for TDD pattern, Assume DDDSUUDDDD pattern
+                     {
+diff --git a/cuPHY-CP/cuphyl2adapter/lib/nvPHY/CMakeLists.txt b/cuPHY-CP/cuphyl2adapter/lib/nvPHY/CMakeLists.txt
+index 3aaf003..9a65a28 100644
+--- a/cuPHY-CP/cuphyl2adapter/lib/nvPHY/CMakeLists.txt
++++ b/cuPHY-CP/cuphyl2adapter/lib/nvPHY/CMakeLists.txt
+@@ -89,6 +89,10 @@ target_include_directories(nvphy PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES
+ target_include_directories(nvphy PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/cuphydriver/include/>)
+ target_link_libraries(nvphy PRIVATE gRPC::grpc++ gRPC::grpc++_reflection)
+ target_link_libraries(nvphy PUBLIC nvphy_generic cuphydriver)
++if(ENABLE_DAPP_HOOK)
++    target_link_libraries(nvphy PUBLIC dapp_hook)
++    target_compile_definitions(nvphy PUBLIC ENABLE_DAPP_HOOK)
++endif()
+ 
+ install(TARGETS nvphy DESTINATION ${PROJECT_NAME}/lib)
+ 
+diff --git a/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_config_option.hpp b/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_config_option.hpp
+index 0eabff5..8da8896 100644
+--- a/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_config_option.hpp
++++ b/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_config_option.hpp
+@@ -36,6 +36,14 @@ namespace nv {
+         int staticSsbSlotNum;
+         int staticPucchSlotNum;
+         bool duplicateConfigAllCells;
++        // Hybrid L1 (2026-10-29): the static*SlotNum / staticSsb* overrides are test-vector helpers (F08 vectors are generated for slot 0) and apply
++        // to every cell. 'staticSlotCellMask' (L2 adapter yaml, bit c = L1 cell c; default all cells = upstream behaviour) limits them to the
++        // emulator cells so that a real-UE cell in the same cell group keeps its real slot numbers / dynamic SFN.
++        uint64_t staticSlotCellMask;
++        bool staticSlotCellMaskSet;
++        bool staticCell(int cell) const { return cell >= 0 && cell < 64 && ((staticSlotCellMask >> cell) & 1ULL); }
++        int staticSlot(int static_value, int cell) const { return staticCell(cell) ? static_value : -1; }
++        bool staticSfnForCell(int cell) const { return staticSlotCellMaskSet && staticCell(cell); }   // mask given: static-slot cells also keep the static SSB SFN
+         explicit phy_config_option():
+         precoding_enabled(false),
+         bf_enabled(false),
+@@ -48,7 +56,9 @@ namespace nv {
+         staticSsbSFN(-1),
+         staticSsbSlotNum(-1),
+         staticPucchSlotNum(-1),
+-        duplicateConfigAllCells(false)
++        duplicateConfigAllCells(false),
++        staticSlotCellMask(~0ULL),
++        staticSlotCellMaskSet(false)
+         {}
+ 
+         phy_config_option(phy_config_option&& other):
+@@ -63,7 +73,9 @@ namespace nv {
+         staticSsbSFN(std::move(other.staticSsbSFN)),
+         staticSsbSlotNum(std::move(other.staticSsbSlotNum)),
+         staticPucchSlotNum(std::move(other.staticPucchSlotNum)),
+-        duplicateConfigAllCells(std::move(other.duplicateConfigAllCells))
++        duplicateConfigAllCells(std::move(other.duplicateConfigAllCells)),
++        staticSlotCellMask(other.staticSlotCellMask),
++        staticSlotCellMaskSet(other.staticSlotCellMaskSet)
+         {}
+ 
+         phy_config_option(phy_config_option&) = delete;
+diff --git a/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_module.cpp b/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_module.cpp
+index bc194b5..d07ba1d 100644
+--- a/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_module.cpp
++++ b/cuPHY-CP/cuphyl2adapter/lib/nvPHY/nv_phy_module.cpp
+@@ -29,6 +29,11 @@
+ #define TAG_TICK_TIMES (NVLOG_TAG_BASE_L2_ADAPTER + 12) // "L2A.TICK_TIMES"
+ 
+ #include "cuphyoam.hpp"
++#ifdef ENABLE_DAPP_HOOK
++#include "dapp_hook/dapp_ring.hpp"
++#include "dapp_hook/dapp_async.hpp"
++#include "dapp_hook/dapp_sizer.hpp"
++#endif
+ 
+ #include <unistd.h> // usleep(), temporary!
+ #include <chrono>
+@@ -315,6 +320,12 @@ PHY_module::PHY_module(yaml::node node_config) :
+         config_options_.staticPucchSlotNum = node_config["staticPucchSlotNum"].as<int>();
+     }
+ 
++    if (node_config.has_key("staticSlotCellMask")) {   // hybrid L1: static*SlotNum / staticSsb* apply only to the cells in this mask (decimal, bit c = cell c)
++        config_options_.staticSlotCellMask = node_config["staticSlotCellMask"].as<uint64_t>();
++        config_options_.staticSlotCellMaskSet = true;
++        NVLOGC_FMT(TAG, "staticSlotCellMask=0x{:X}: static slot numbers / static SSB SFN apply to these cells only", config_options_.staticSlotCellMask);
++    }
++
+     if (node_config.has_key("lbrm"))
+     {
+         if(node_config["lbrm"].as<unsigned int>() > 0)
+@@ -415,6 +426,87 @@ PHY_module::PHY_module(yaml::node node_config) :
+         fapi_config_check_mask_ = 0;
+     }
+ 
++#ifdef ENABLE_DAPP_HOOK
++    // dApp hook: export FAPI TTI requests to a shared-memory ring so an
++    // external process (GPU scheduler, analytics) can consume them.
++    // Disabled unless the l2_adapter yaml carries a "dapp_hook" block.
++    if (node_config.has_key("dapp_hook") && nv::dapp::producer() == nullptr)
++    {
++        yaml::node dcfg   = node_config["dapp_hook"];
++        const bool enable = dcfg.has_key("enable") ? (dcfg["enable"].as<uint32_t>() != 0) : false;
++        if (enable)
++        {
++            nv::dapp::Producer::Config pcfg;
++            pcfg.name          = dcfg.has_key("shm_name") ? dcfg["shm_name"].as<std::string>()
++                                                         : std::string(DAPP_RING_DEFAULT_NAME);
++            pcfg.ring_len      = dcfg.has_key("ring_len") ? dcfg["ring_len"].as<uint32_t>() : DAPP_RING_DEFAULT_LEN;
++            pcfg.do_mlock      = dcfg.has_key("mlock") ? (dcfg["mlock"].as<uint32_t>() != 0) : true;
++            pcfg.slot_advance  = tick_updater_.slot_advance_;
++            pcfg.mu            = tick_updater_.mu_highest_;
++            pcfg.num_cells     = total_cell_num;
++            pcfg.producer_name = "cuphycontroller";
++
++            nv::dapp::g_export_ul   = dcfg.has_key("export_ul") ? (dcfg["export_ul"].as<uint32_t>() != 0) : true;
++            nv::dapp::g_export_dl   = dcfg.has_key("export_dl") ? (dcfg["export_dl"].as<uint32_t>() != 0) : false;
++            nv::dapp::g_export_pdus = dcfg.has_key("export_pdus") ? (dcfg["export_pdus"].as<uint32_t>() != 0) : true;
++
++            std::string derr;
++            if (nv::dapp::install_producer(pcfg, derr))
++            {
++                NVLOGC_FMT(TAG, "dApp hook enabled: shm={} ring_len={} bytes={} mlock={} export_ul={} export_dl={} export_pdus={} slot_advance={} mu={} cells={}",
++                           pcfg.name, pcfg.ring_len, nv::dapp::producer()->bytes(), nv::dapp::producer()->mlocked(),
++                           nv::dapp::g_export_ul, nv::dapp::g_export_dl, nv::dapp::g_export_pdus,
++                           pcfg.slot_advance, pcfg.mu, pcfg.num_cells);
++
++                // Asynchronous export (default): the PDU walk and every ring write
++                // run on a dedicated thread pinned to export_cpu; the msg_processing
++                // thread only queues one descriptor per TTI request. That thread
++                // polls at real-time priority, so it must have a core of its own:
++                // without export_cpu (or with async_export: 0) the export is inline.
++                // in-process SM sizer (2026-11-01, dapp_sizer.hpp): enabled by DAPP_SIZER_MODEL in the environment
++                {
++                    std::string serr;
++                    if (nv::dapp::sizer_init(serr))
++                        NVLOGC_FMT(TAG, "dApp sizer enabled: model {} (PUSCH {}, PDSCH {}), max wait {} us", nv::dapp::g_sizer_model.path,
++                                   nv::dapp::g_sizer_model.pusch.completion ? "completion" : "duration", nv::dapp::g_sizer_model.pdsch.completion ? "completion" : "duration",
++                                   nv::dapp::g_sizer_wait_max_ns / 1000.0);
++                    else
++                        NVLOGC_FMT(TAG, "dApp sizer disabled: {}", serr);
++                }
++                const bool async_export = dcfg.has_key("async_export") ? (dcfg["async_export"].as<uint32_t>() != 0) : true;
++                const int  export_cpu   = dcfg.has_key("export_cpu") ? dcfg["export_cpu"].as<int>() : -1;
++                if (async_export && export_cpu < 0)
++                {
++                    NVLOGW_FMT(TAG, "dApp hook: async_export needs export_cpu (a dedicated isolated core); exporting inline on the msg_processing thread");
++                }
++                else if (async_export)
++                {
++#ifdef ENABLE_SCHED_FIFO_ALL_RT
++                    const int export_prio = dcfg.has_key("export_prio") ? dcfg["export_prio"].as<int>() : 90;
++#else
++                    const int export_prio = 0;
++#endif
++                    std::string aerr;
++                    if (nv::dapp::install_async_exporter(export_cpu, export_prio, aerr))
++                    {
++                        NVLOGC_FMT(TAG, "dApp hook async export enabled: export_cpu={} export_prio={} queue={} max_held={}{}{}",
++                                   export_cpu, export_prio, nv::dapp::AsyncExporter::kQueueLen, nv::dapp::AsyncExporter::kMaxHeld,
++                                   aerr.empty() ? "" : " warning: ", aerr);
++                    }
++                    else
++                    {
++                        NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT, "dApp hook async export could not be enabled, exporting inline: {}", aerr);
++                    }
++                }
++            }
++            else
++            {
++                NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT, "dApp hook could not be enabled, continuing without it: {}", derr);
++            }
++        }
++    }
++#endif
++
+     dtx_thresholds_.fill(1.0);
+     if (node_config.has_key("pucch_dtx_thresholds")) {
+         auto dtx_root{node_config["pucch_dtx_thresholds"]};
+@@ -572,14 +664,43 @@ void PHY_module::start()
+     }
+ }
+ 
++#ifdef ENABLE_DAPP_HOOK
++////////////////////////////////////////////////////////////////////////
++// dApp hook, asynchronous export: a TTI request handed to the export thread
++// keeps its nvIPC buffer until that thread has written the records. The
++// release still happens here, on the msg_processing thread.
++static inline bool dapp_defer_release(phy_mac_msg_desc& desc)
++{
++    nv::dapp::AsyncExporter* ax = nv::dapp::async_exporter();
++    return (ax != nullptr) && ax->take_claim(desc.msg_buf, static_cast<const nv_ipc_msg_t*>(&desc), sizeof(nv_ipc_msg_t));
++}
++
++static inline void dapp_release_exported(phy_mac_transport_wrapper& transport)
++{
++    nv::dapp::AsyncExporter* ax = nv::dapp::async_exporter();
++    if (ax == nullptr) { return; }
++    phy_mac_msg_desc desc;
++    while (ax->pop_releasable(static_cast<nv_ipc_msg_t*>(&desc), sizeof(nv_ipc_msg_t)))
++    {
++        transport.rx_release(desc);
++    }
++}
++#endif
++
+ ////////////////////////////////////////////////////////////////////////
+ // PHY_module::recv_msg()
+ #ifdef ENABLE_L2_SLT_RSP
+ bool PHY_module::recv_msg()
+ {
+     phy_mac_msg_desc smsg;
++#ifdef ENABLE_DAPP_HOOK
++    dapp_release_exported(transport_wrapper());
++#endif
+     while(transport_wrapper().rx_recv(smsg) >= 0)
+     {
++#ifdef ENABLE_DAPP_HOOK
++        dapp_release_exported(transport_wrapper());
++#endif
+         if(simulated_cpu_stall_checkpoint(L2A_MSG_THREAD,-1))
+             NVLOGI_FMT(TAG, "Simulate CPU Stall on L2A msg thread");
+ 
+@@ -605,6 +726,9 @@ bool PHY_module::recv_msg()
+         if(phy_refs_[smsg.cell_id].get().on_msg(smsg))
+         {
+             // Release the NVIPC buffers if FAPI message handle finished in on_msg()
++#ifdef ENABLE_DAPP_HOOK
++            if(!dapp_defer_release(smsg))
++#endif
+             transport_wrapper().rx_release(smsg);
+         }
+ 
+@@ -628,6 +752,9 @@ bool PHY_module::recv_msg()
+                 if(phy_refs_[desc.cell_id].get().on_msg(desc))
+                 {
+                     // The IPC message handle finished, release the buffers explicitly
++#ifdef ENABLE_DAPP_HOOK
++                    if(!dapp_defer_release(desc))
++#endif
+                     transport_wrapper().rx_release(desc);
+                 }
+             }
+@@ -659,6 +786,9 @@ bool PHY_module::recv_msg()
+                 if(phy_refs_[smsg.cell_id].get().on_msg(smsg))
+                 {
+                     // The IPC message handle finished, release the buffers explicitly
++#ifdef ENABLE_DAPP_HOOK
++                    if(!dapp_defer_release(smsg))
++#endif
+                     transport_wrapper().rx_release(smsg);
+                 }
+             } else {
+@@ -680,9 +810,15 @@ bool PHY_module::recv_msg()
+         {
+             for (uint i = 0; i < num_msgs; i++) {
+                 auto& desc = slot_msgs_received[i];
++#ifdef ENABLE_DAPP_HOOK
++                dapp_release_exported(transport_wrapper());
++#endif
+                 if(phy_refs_[desc.cell_id].get().on_msg(desc))
+                 {
+                     // The IPC message handle finished, release the buffers explicitly
++#ifdef ENABLE_DAPP_HOOK
++                    if(!dapp_defer_release(desc))
++#endif
+                     transport_wrapper().rx_release(desc);
+                 }
+             }
+@@ -1090,6 +1226,9 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
+                 ss_curr.u16.sfn, ss_curr.u16.slot, __func__, phy_list_size, cells_size, latency);
+ 
+         int ret = -1;
++#ifdef ENABLE_DAPP_HOOK
++        bool dapp_enqueued = false;
++#endif
+         int to_clean = 0;
+         bool clean_srs_ind_buffers = false;
+ 
+@@ -1097,8 +1236,19 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
+         if ((check_time_threshold(now,ss_curr.u16.slot,slot_end_rcvd)) && (phy_list_size <= cells_size) && !(partial_cmd))
+         {
+             auto start_process_command_time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
++#ifdef ENABLE_DAPP_HOOK
++            // in-process SM sizer: choose this slot's PUSCH / PDSCH green-context profiles before cuphydriver picks its pipeline objects
++            if (nv::dapp::g_sizer_enabled)
++            {
++                const int64_t dapp_t0_ns = slot_cmd.tick_original.count() + static_cast<int64_t>(tick_updater_.slot_advance_) * static_cast<int64_t>(nv::mu_to_ns(tick_updater_.mu_highest_));
++                nv::dapp::sizer_plan(slot_cmd.cell_groups.slot.slot_3gpp.sfn_, slot_cmd.cell_groups.slot.slot_3gpp.slot_, dapp_t0_ns);
++            }
++#endif
+             ret = PHYDriverProxy::getInstance().l1_enqueue_phy_work(slot_cmd);
+             to_clean = 1;
++#ifdef ENABLE_DAPP_HOOK
++            dapp_enqueued = true;
++#endif
+             auto end_process_command_time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
+             auto diff = end_process_command_time - start_process_command_time;
+             NVLOGI_FMT(TAG, "SFN {}.{} {}: l1_enqueue_phy_work after status = {} slot cmd size ={}  phy_refs : size = {} l1_enqueue_phy_work start: {} l1_enqueue_phy_work duration: {} ns UL {} DL {}",
+@@ -1147,6 +1297,105 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
+             PHYDriverProxy::getInstance().l1_resetBatchedMemcpyBatches(); //used to guard against case when the slot is dropped and PDSCH H2D copies are batched with preponing (prepone_h2d_copy=1) enabled and without separate copy thread (enable_h2d_copy_thread in cuphycontroller yaml = 0)
+         }
+ 
++#ifdef ENABLE_DAPP_HOOK
++        // dApp hook: one record per slot telling the external scheduler whether
++        // this slot's work actually reached cuphydriver, and how much of the
++        // L2+L2A budget it consumed.
++        if (nv::dapp::Producer* dapp_ring = nv::dapp::producer())
++        {
++            const uint16_t dapp_sfn  = slot_cmd.cell_groups.slot.slot_3gpp.sfn_;
++            const uint16_t dapp_slot = slot_cmd.cell_groups.slot.slot_3gpp.slot_;
++            nv::dapp::AsyncExporter*       dapp_async = nv::dapp::async_exporter();
++            nv::dapp::AsyncExporter::Item* ditem      = nullptr;
++            dapp_rec_t*                    drec       = nullptr;
++            if (dapp_async != nullptr)
++            {
++                // async_export: the export thread writes the record, after the
++                // TTI records of this slot (same queue, so the order is kept)
++                ditem = dapp_async->reserve(false);
++            }
++            else
++            {
++                drec = dapp_ring->begin(DAPP_REC_SLOT_END, dapp_sfn, dapp_slot, 0xFFFF);
++            }
++            if (ditem != nullptr || drec != nullptr)
++            {
++                dapp_slot_end_t  dlocal{};
++                dapp_slot_end_t& d    = (drec != nullptr) ? drec->u.slot_end : dlocal;
++                d.enqueued            = dapp_enqueued ? 1u : 0u;
++                d.slot_end_rcvd       = slot_end_rcvd ? 1u : 0u;
++                d.is_ul               = is_ul_slot_ ? 1u : 0u;
++                d.is_dl               = is_dl_slot_ ? 1u : 0u;
++                d.is_csirs            = is_csirs_slot_ ? 1u : 0u;
++                d.enqueue_ret         = ret;
++                // cells that sent a UL/DL TTI request for this slot (tracked by the
++                // TTI hooks); phy_list_size only counts the PDSCH cells and the
++                // per-cell channel_array_size stays 0 in cell-group mode.
++                // In async mode the export thread fills it (it owns that state).
++                d.num_cells           = (drec != nullptr) ? dapp_ring->take_cells(dapp_sfn, dapp_slot) : 0u;
++                d.cmd_size            = static_cast<uint32_t>(cells_size);
++                d.tick_original_ns    = slot_cmd.tick_original.count();
++                d.t0_ns               = slot_cmd.tick_original.count() +
++                                        static_cast<int64_t>(tick_updater_.slot_advance_) *
++                                            static_cast<int64_t>(nv::mu_to_ns(tick_updater_.mu_highest_));
++                d.l1_slot_ind_tick_ns = l1_slot_ind_tick_[ss_curr.u16.slot % 10].count();
++                d.l2a_latency_ns      = (now - l1_slot_ind_tick_[ss_curr.u16.slot % 10]).count();
++                d.l2a_start_ns        = l2a_start_tick_.count();
++                d.l2a_end_ns          = l2a_end_tick_.count();
++                if (drec != nullptr)
++                {
++                    dapp_ring->commit(drec);
++                    dapp_ring->count_slot_end();
++                    if (!dapp_enqueued) { dapp_ring->count_slot_dropped(); }
++                    dapp_ring->heartbeat();
++                }
++                else
++                {
++                    ditem->fn            = nv::dapp::async_slot_end_handler;
++                    ditem->ts_rx_ns      = nv::dapp::now_ns();
++                    ditem->ts_l2_send_ns = 0;
++                    ditem->fapi_msg      = nullptr;
++                    ditem->kind          = nv::dapp::AsyncExporter::KIND_SLOT_END;
++                    ditem->cell_id       = 0xFFFF;
++                    ditem->sfn           = dapp_sfn;
++                    ditem->slot          = dapp_slot;
++                    ditem->slot_dropped  = dapp_enqueued ? 0u : 1u;
++                    ditem->slot_end      = dlocal;
++                    dapp_async->publish(ditem, nullptr);
++                }
++            }
++            if (dapp_async != nullptr)
++            {
++                // one console line every ~10 s: export health without touching the ring ABI
++                static uint32_t dapp_async_log_cnt = 0;
++                if (++dapp_async_log_cnt >= 20000)
++                {
++                    dapp_async_log_cnt = 0;
++                    const nv::dapp::AsyncExporter::Stats st = dapp_async->stats();
++                    NVLOGC_FMT(TAG, "dApp async export: submitted={} done={} dropped={} orphans={} max_depth={} max_held={} write_delay_us avg={:.1f} max={:.1f} n={}",
++                               st.submitted, st.done, st.dropped, st.orphans, st.max_depth, st.max_held,
++                               st.delay_n ? static_cast<double>(st.delay_sum_ns) / static_cast<double>(st.delay_n) / 1e3 : 0.0,
++                               static_cast<double>(st.delay_max_ns) / 1e3, st.delay_n);
++                    if (nv::dapp::g_sizer_enabled)
++                    {
++                        // in-process SM sizer: decisions per profile (sizer-requested / cuphydriver-used) since start
++                        const nv::dapp::SizerStats& ss = nv::dapp::g_sizer_stats;
++                        std::string pu, pd;
++                        for (int i = 0; i < nv::dapp::g_sizer_profiles.n_pusch; i++)
++                            pu += fmt::format("{}{}:{}/{}", i ? " " : "", nv::dapp::g_sizer_profiles.pusch_sm[i], ss.pusch_prof[i].load(), cuphydriver_dapp_profile_count(0, i));
++                        for (int i = 0; i < nv::dapp::g_sizer_profiles.n_pdsch; i++)
++                            pd += fmt::format("{}{}:{}/{}", i ? " " : "", nv::dapp::g_sizer_profiles.pdsch_sm[i], ss.pdsch_prof[i].load(), cuphydriver_dapp_profile_count(1, i));
++                        NVLOGC_FMT(TAG, "dApp sizer: plans={} incomplete={} wait_max_us={:.1f} plan_max_us={:.1f} plan_avg_us={:.2f} | PUSCH slots={} infeasible={} prof[{}] fallback={} | PDSCH slots={} infeasible={} prof[{}] fallback={}",
++                                   ss.plans.load(), ss.incomplete.load(), ss.wait_max_ns.load() / 1e3, ss.plan_max_ns.load() / 1e3,
++                                   ss.plans.load() ? static_cast<double>(ss.plan_sum_ns.load()) / static_cast<double>(ss.plans.load()) / 1e3 : 0.0,
++                                   ss.pusch_slots.load(), ss.pusch_infeasible.load(), pu, cuphydriver_dapp_fallback_count(0),
++                                   ss.pdsch_slots.load(), ss.pdsch_infeasible.load(), pd, cuphydriver_dapp_fallback_count(1));
++                    }
++                }
++            }
++        }
++#endif
++
+         if (to_clean == 1) {
+             // Clean up slot command and FAPI message
+             for (int i = 0 ; i < phy_list_size; i++)
+diff --git a/cuPHY-CP/ru-emulator/ru_emulator/utils.hpp b/cuPHY-CP/ru-emulator/ru_emulator/utils.hpp
+index 9e9d775..c2bb672 100644
+--- a/cuPHY-CP/ru-emulator/ru_emulator/utils.hpp
++++ b/cuPHY-CP/ru-emulator/ru_emulator/utils.hpp
+@@ -26,6 +26,9 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <stdio.h>
++#include <time.h>
++#include <stdlib.h>
++#include <stdint.h>
+ #include <atomic>
+ 
+ #include <signal.h>
+@@ -1303,9 +1306,47 @@ inline void increment_fss(struct fssId& fss, int max_slot_id)
+  * @param[in] launch_pattern_slot_size Total launch pattern slots
+  * @return Launch pattern slot index
+  */
++// --- night-3 test option (2026-10-18), default OFF = the original mapping below, unchanged -----------------------------
++// RU_LP_BLOCK_REPEAT=<N> (with RU_LP_BLOCK_FRAMES, default 4; the file must stay within MAX_LAUNCH_PATTERN_SLOTS = 80 slots because
++// many per-slot arrays here and in aerial-fh-driver/packet_stats.hpp are sized by it): slow load alternation without a long pattern file. The file's
++// frames form blocks of RU_LP_BLOCK_FRAMES frames; block k is replayed for N consecutive real blocks (N x 40 ms), then block
++// k+1, wrapping. The real frame counter is extended beyond the 8-bit ORAN frameId with CLOCK_REALTIME (frame 0 of SFN 0 at
++// t = 3.64 s mod 10.24 s, the L1 / testMAC convention), nearest-match adjusted to the packet's frameId; testMAC implements
++// the same mapping (TESTMAC_LP_BLOCK_REPEAT) so both sides pick the same vectors for every slot.
++inline int lp_block_repeat()
++{
++    static const int v = [] { const char* e = getenv("RU_LP_BLOCK_REPEAT"); return e ? atoi(e) : 0; }();
++    return v;
++}
++inline int lp_block_frames()
++{
++    static const int v = [] { const char* e = getenv("RU_LP_BLOCK_FRAMES"); const int n = e ? atoi(e) : 4; return n > 0 ? n : 4; }();
++    return v;
++}
++inline int64_t lp_extended_frame(int frame_id, int modulus)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    const int64_t t_ns   = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++    const int64_t f_wall = (t_ns - 3640000000LL) / 10000000LL;          // 10 ms frames since the SFN-0 epoch
++    int64_t d = ((int64_t)frame_id - f_wall) % modulus;
++    if(d < 0) d += modulus;
++    if(d > modulus / 2) d -= modulus;
++    return f_wall + d;
++}
++
+ inline int fss_to_launch_pattern_slot(const struct fssId& fss, int launch_pattern_slot_size)
+ {
+-    return fss.frameId % (launch_pattern_slot_size / (ORAN_MAX_SLOT_X_SUBFRAME_ID)) * (ORAN_MAX_SLOT_X_SUBFRAME_ID) + fss.subframeId * (ORAN_MAX_SLOT_ID) + fss.slotId;
++    const int rep = lp_block_repeat();
++    if(rep <= 0)
++        return fss.frameId % (launch_pattern_slot_size / (ORAN_MAX_SLOT_X_SUBFRAME_ID)) * (ORAN_MAX_SLOT_X_SUBFRAME_ID) + fss.subframeId * (ORAN_MAX_SLOT_ID) + fss.slotId;
++    const int     blk      = lp_block_frames();
++    const int     n_frames = launch_pattern_slot_size / (ORAN_MAX_SLOT_X_SUBFRAME_ID);
++    const int     n_blocks = (n_frames / blk) > 0 ? (n_frames / blk) : 1;
++    const int64_t ext      = lp_extended_frame(fss.frameId, 256);
++    const int64_t seg      = (ext / ((int64_t)blk * rep)) % n_blocks;
++    const int     fib      = (int)(ext % blk);
++    return (int)(seg * blk + fib) * (ORAN_MAX_SLOT_X_SUBFRAME_ID) + fss.subframeId * (ORAN_MAX_SLOT_ID) + fss.slotId;
+ }
+ 
+ //!< Map from test vector name to dataset
+diff --git a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/CMakeLists.txt b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/CMakeLists.txt
+index a230dee..fc127ed 100644
+--- a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/CMakeLists.txt
++++ b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/CMakeLists.txt
+@@ -31,12 +31,17 @@ set(SOURCES scf_5g_fapi.cpp
+             scf_5g_slot_commands_pdcch.cpp
+             scf_5g_slot_commands_pdsch_mod_comp.cpp
+             scf_5g_slot_commands_pdsch_csirs.cpp
++            scf_5g_fapi_dapp_export.cpp
+             )
+ 
+ add_library(scf_5g_fapi STATIC ${SOURCES})
+ set_property(TARGET scf_5g_fapi PROPERTY POSITION_INDEPENDENT_CODE ON)
+ target_include_directories(scf_5g_fapi PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+ target_link_libraries(scf_5g_fapi PRIVATE cuphy_hdf5 cuphy_cpp_header_only nvphy nvipc slot_command)
++if(ENABLE_DAPP_HOOK)
++    target_link_libraries(scf_5g_fapi PRIVATE dapp_hook)
++    target_compile_definitions(scf_5g_fapi PRIVATE ENABLE_DAPP_HOOK)
++endif()
+ 
+ # Header-only INTERFACE library for SCF 5G FAPI headers
+ add_library(scf_5g_fapi_h INTERFACE)
+diff --git a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_dapp_export.cpp b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_dapp_export.cpp
+new file mode 100644
+index 0000000..612b5b3
+--- /dev/null
++++ b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_dapp_export.cpp
+@@ -0,0 +1,512 @@
++/*
++ * dApp hook: export UL_TTI.request / DL_TTI.request contents to the
++ * shared-memory ring. See scf_5g_fapi_dapp_export.hpp.
++ *
++ * Runs on the L2 adapter msg_processing thread (inline mode) or on the dApp
++ * export thread (async mode): no allocation, no locking, no syscalls, and
++ * every read of the nvIPC buffer is bounded by msg_len.
++ */
++#ifdef ENABLE_DAPP_HOOK
++
++#include "scf_5g_fapi_dapp_export.hpp"
++#include "dapp_hook/dapp_sizer.hpp"
++
++#include <cstdint>
++#include <cstring>
++
++namespace scf_5g_fapi
++{
++
++namespace
++{
++
++// Bounded iterator over a FAPI PDU list inside an nvIPC message buffer.
++struct pdu_walker
++{
++    const uint8_t* cur;
++    const uint8_t* end; // one past the last valid byte of the nvIPC message buffer
++    bool           truncated = false;
++
++    pdu_walker(const uint8_t* payload, const nv_ipc_msg_t& ipc) :
++        cur(payload),
++        end(static_cast<const uint8_t*>(ipc.msg_buf) + (ipc.msg_len > 0 ? ipc.msg_len : 0))
++    {
++        if (ipc.msg_buf == nullptr || cur == nullptr || cur > end) { end = cur; }
++    }
++
++    // Next generic PDU header, or nullptr when the buffer is exhausted.
++    const scf_fapi_generic_pdu_info_t* next()
++    {
++        if (cur + sizeof(scf_fapi_generic_pdu_info_t) > end)
++        {
++            truncated = (cur != end);
++            return nullptr;
++        }
++        auto*          pdu  = reinterpret_cast<const scf_fapi_generic_pdu_info_t*>(cur);
++        const uint16_t size = pdu->pdu_size;
++        if (size < sizeof(scf_fapi_generic_pdu_info_t) || cur + size > end)
++        {
++            truncated = true;
++            return nullptr;
++        }
++        cur += size;
++        return pdu;
++    }
++
++    static bool fits(const uint8_t* p, size_t n, const uint8_t* limit) { return p + n <= limit; }
++};
++
++inline uint16_t clamp_u16(uint32_t v) { return v > 0xFFFFu ? 0xFFFFu : static_cast<uint16_t>(v); }
++
++} // namespace
++
++void dapp_export_ul_tti(nv::dapp::Producer& ring, uint16_t cell_id, const scf_fapi_ul_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns)
++{
++    const uint16_t sfn        = msg.sfn;
++    const uint16_t slot       = msg.slot;
++    const bool     write_pdus = nv::dapp::export_pdus();
++
++    uint16_t n_pusch = 0, n_pucch = 0, n_prach = 0, n_srs = 0;
++    uint32_t tot_prb = 0, tot_layers = 0, tot_tb = 0, tot_cb = 0, tot_prb_layers = 0;
++    uint32_t tot_pucch_prb = 0, tot_srs_ports = 0;
++
++    pdu_walker     w(msg.payload, ipc);
++    const unsigned num_pdus = msg.num_pdus;
++    for (unsigned i = 0; i < num_pdus; ++i)
++    {
++        const scf_fapi_generic_pdu_info_t* pdu = w.next();
++        if (pdu == nullptr) { break; }
++        const uint8_t* cfg   = pdu->pdu_config;
++        const uint8_t* limit = reinterpret_cast<const uint8_t*>(pdu) + pdu->pdu_size;
++
++        dapp_ul_pdu_t o{};
++        o.pdu_index = static_cast<uint8_t>(i);
++        o.pdu_type  = static_cast<uint8_t>(pdu->pdu_type);
++        o.pdu_size  = pdu->pdu_size;
++
++        switch (pdu->pdu_type)
++        {
++        case UL_TTI_PDU_TYPE_PUSCH:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_pusch_pdu_t), limit)) { break; }
++            const auto& p               = *reinterpret_cast<const scf_fapi_pusch_pdu_t*>(cfg);
++            o.rnti                      = p.rnti;
++            o.handle                    = p.handle;
++            o.bwp_size                  = p.bwp.bwp_size;
++            o.bwp_start                 = p.bwp.bwp_start;
++            o.target_code_rate          = p.target_code_rate;
++            o.qam_mod_order             = p.qam_mod_order;
++            o.mcs_index                 = p.mcs_index;
++            o.mcs_table                 = p.mcs_table;
++            o.transform_precoding       = p.transform_precoding;
++            o.num_layers                = p.num_of_layers;
++            o.ul_dmrs_sym_pos           = p.ul_dmrs_sym_pos;
++            o.dmrs_config_type          = p.dmrs_config_type;
++            o.num_dmrs_cdm_grps_no_data = p.num_dmrs_cdm_groups_no_data;
++            o.rb_start                  = p.rb_start;
++            o.rb_size                   = p.rb_size;
++            o.start_sym                 = p.start_symbol_index;
++            o.num_sym                   = p.num_of_symbols;
++            o.pdu_bitmap                = p.pdu_bitmap;
++
++            const uint8_t* next = p.payload;
++            if (p.pdu_bitmap & 0x1)
++            {
++                if (pdu_walker::fits(next, sizeof(scf_fapi_pusch_data_t), limit))
++                {
++                    const auto& d     = *reinterpret_cast<const scf_fapi_pusch_data_t*>(next);
++                    o.rv_index        = d.rv_index;
++                    o.harq_process_id = d.harq_process_id;
++                    o.ndi             = d.new_data_indicator;
++                    o.tb_size         = d.tb_size;
++                    o.num_cb          = d.num_cb;
++                }
++                next += sizeof(scf_fapi_pusch_data_t);
++            }
++            if (p.pdu_bitmap & 0x2)
++            {
++                if (pdu_walker::fits(next, sizeof(scf_fapi_pusch_uci_t), limit))
++                {
++                    const auto& u       = *reinterpret_cast<const scf_fapi_pusch_uci_t*>(next);
++                    o.harq_ack_bit_len  = u.harq_ack_bit_length;
++                    o.csi_part1_bit_len = u.csi_part_1_bit_length;
++                }
++            }
++            ++n_pusch;
++            tot_prb += o.rb_size;
++            tot_layers += o.num_layers;
++            tot_prb_layers += static_cast<uint32_t>(o.rb_size) * o.num_layers;
++            tot_tb += o.tb_size;
++            tot_cb += o.num_cb;
++            break;
++        }
++        case UL_TTI_PDU_TYPE_PUCCH:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_pucch_pdu_t), limit)) { break; }
++            const auto& p  = *reinterpret_cast<const scf_fapi_pucch_pdu_t*>(cfg);
++            o.rnti         = p.rnti;
++            o.handle       = p.handle;
++            o.bwp_size     = p.bwp.bwp_size;
++            o.bwp_start    = p.bwp.bwp_start;
++            o.format_type  = p.format_type;
++            o.rb_start     = p.prb_start;
++            o.rb_size      = p.prb_size;
++            o.start_sym    = p.start_symbol_index;
++            o.num_sym      = p.num_of_symbols;
++            o.sr_flag      = p.sr_flag;
++            o.bit_len_harq = p.bit_len_harq;
++            o.bit_len_csi1 = p.bit_len_csi_part_1;
++            o.bit_len_csi2 = p.bit_len_csi_part_2;
++            o.num_layers   = 1;
++            ++n_pucch;
++            tot_pucch_prb += o.rb_size;
++            break;
++        }
++        case UL_TTI_PDU_TYPE_PRACH:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_prach_pdu_t), limit)) { break; }
++            const auto& p    = *reinterpret_cast<const scf_fapi_prach_pdu_t*>(cfg);
++            o.prach_format   = p.prach_format;
++            o.num_prach_ocas = p.num_prach_ocas;
++            o.num_ra         = p.num_ra;
++            o.start_sym      = p.prach_start_symbol;
++            ++n_prach;
++            break;
++        }
++        case UL_TTI_PDU_TYPE_SRS:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_srs_pdu_t), limit)) { break; }
++            const auto& p         = *reinterpret_cast<const scf_fapi_srs_pdu_t*>(cfg);
++            o.rnti                = p.rnti;
++            o.handle              = p.handle;
++            o.bwp_size            = p.bwp.bwp_size;
++            o.bwp_start           = p.bwp.bwp_start;
++            o.num_layers          = p.num_ant_ports;
++            o.srs_num_symbols     = p.num_symbols;
++            o.num_sym             = p.num_symbols;
++            o.srs_num_repetitions = p.num_repetitions;
++            o.srs_comb_size       = p.comb_size;
++            o.srs_bandwidth_index = p.bandwidth_index;
++            o.srs_config_index    = p.config_index;
++            o.start_sym           = p.time_start_position;
++            ++n_srs;
++            tot_srs_ports += o.num_layers;
++            break;
++        }
++        default:
++            break;
++        }
++
++        nv::dapp::sizer_add_ul(sfn, slot, o);   // in-process SM sizer (dapp_sizer.hpp)
++        if (write_pdus)
++        {
++            dapp_rec_t* r = ring.begin(DAPP_REC_UL_PDU, sfn, slot, cell_id);
++            r->u.ul_pdu   = o;
++            ring.commit(r);
++        }
++    }
++
++    dapp_rec_t*    r     = ring.begin(DAPP_REC_UL_TTI, sfn, slot, cell_id);
++    dapp_ul_tti_t& s     = r->u.ul_tti;
++    s.num_pdus           = msg.num_pdus;
++    s.rach_present       = msg.rach_present;
++    s.num_ulsch          = msg.num_ulsch;
++    s.num_ulcch          = msg.num_ulcch;
++    s.ngroup             = msg.ngroup;
++    s.pdu_truncated      = w.truncated ? 1u : 0u;
++    s.msg_len            = ipc.msg_len;
++    s.body_len           = msg.msg_hdr.length;
++    s.ts_l2_send_ns      = ts_l2_send_ns;
++    s.n_pusch            = n_pusch;
++    s.n_pucch            = n_pucch;
++    s.n_prach            = n_prach;
++    s.n_srs              = n_srs;
++    s.tot_pusch_prb      = tot_prb;
++    s.tot_pusch_layers   = tot_layers;
++    s.tot_pusch_tb_bytes = tot_tb;
++    s.tot_pusch_cb       = tot_cb;
++    s.tot_pusch_prb_layers = tot_prb_layers;
++    s.tot_pucch_prb      = tot_pucch_prb;
++    s.tot_srs_ports      = tot_srs_ports;
++    ring.commit(r);
++    ring.count_ul_tti();
++    ring.note_cell(sfn, slot, cell_id);
++    nv::dapp::sizer_done(sfn, slot, 0);
++    if (w.truncated) { ring.count_pdu_truncated(); }
++}
++
++void dapp_export_dl_tti(nv::dapp::Producer& ring, uint16_t cell_id, const scf_fapi_dl_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns)
++{
++    const uint16_t sfn        = msg.sfn;
++    const uint16_t slot       = msg.slot;
++    const bool     write_pdus = nv::dapp::export_pdus();
++
++    uint16_t n_pdcch = 0, n_pdsch = 0, n_csirs = 0, n_ssb = 0;
++    uint32_t n_dci = 0, tot_prb = 0, tot_layers = 0, tot_tb = 0, tot_prb_layers = 0;
++    uint32_t tot_pdsch_prg_bf = 0, tot_dci_al = 0, tot_dci_bits = 0, tot_pdcch_prg_bf = 0;
++    uint8_t  max_dci_al = 0, max_pdsch_mcs = 0;
++
++    pdu_walker     w(msg.payload, ipc);
++    const unsigned num_pdus = msg.num_pdus;
++    for (unsigned i = 0; i < num_pdus; ++i)
++    {
++        const scf_fapi_generic_pdu_info_t* pdu = w.next();
++        if (pdu == nullptr) { break; }
++        const uint8_t* cfg   = pdu->pdu_config;
++        const uint8_t* limit = reinterpret_cast<const uint8_t*>(pdu) + pdu->pdu_size;
++
++        dapp_dl_pdu_t o{};
++        o.pdu_index = static_cast<uint8_t>(i);
++        o.pdu_type  = static_cast<uint8_t>(pdu->pdu_type);
++        o.pdu_size  = pdu->pdu_size;
++
++        switch (pdu->pdu_type)
++        {
++        case DL_TTI_PDU_TYPE_PDSCH:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_pdsch_pdu_t), limit)) { break; }
++            const auto& p    = *reinterpret_cast<const scf_fapi_pdsch_pdu_t*>(cfg);
++            o.pdu_bitmap     = p.pdu_bitmap;
++            o.rnti           = p.rnti;
++            o.fapi_pdu_index = p.pdu_index;
++            o.bwp_size       = p.bwp.bwp_size;
++            o.bwp_start      = p.bwp.bwp_start;
++            o.num_codewords  = p.num_codewords;
++
++            const uint8_t* cw_ptr = reinterpret_cast<const uint8_t*>(p.codewords);
++            if (p.num_codewords >= 1 && pdu_walker::fits(cw_ptr, sizeof(scf_fapi_pdsch_codeword_t), limit))
++            {
++                const auto& cw     = *reinterpret_cast<const scf_fapi_pdsch_codeword_t*>(cw_ptr);
++                o.target_code_rate = cw.target_code_rate;
++                o.qam_mod_order    = cw.qam_mod_order;
++                o.mcs_index        = cw.mcs_index;
++                o.mcs_table        = cw.mcs_table;
++                o.rv_index         = cw.rv_index;
++                o.tb_size          = cw.tb_size;
++            }
++            if (p.num_codewords >= 2 &&
++                pdu_walker::fits(cw_ptr + sizeof(scf_fapi_pdsch_codeword_t), sizeof(scf_fapi_pdsch_codeword_t), limit))
++            {
++                const auto& cw1 =
++                    *reinterpret_cast<const scf_fapi_pdsch_codeword_t*>(cw_ptr + sizeof(scf_fapi_pdsch_codeword_t));
++                o.tb_size_cw1 = cw1.tb_size;
++            }
++            const uint8_t* end_ptr = cw_ptr + static_cast<size_t>(p.num_codewords) * sizeof(scf_fapi_pdsch_codeword_t);
++            if (pdu_walker::fits(end_ptr, sizeof(scf_fapi_pdsch_pdu_end_t), limit))
++            {
++                const auto& e               = *reinterpret_cast<const scf_fapi_pdsch_pdu_end_t*>(end_ptr);
++                o.num_layers                = e.num_of_layers;
++                o.dl_dmrs_sym_pos           = e.dl_dmrs_sym_pos;
++                o.dmrs_config_type          = e.dmrs_config_type;
++                o.num_dmrs_cdm_grps_no_data = e.num_dmrs_cdm_grps_no_data;
++                o.rb_start                  = e.rb_start;
++                o.rb_size                   = e.rb_size;
++                o.start_sym                 = e.start_sym_index;
++                o.num_sym                   = e.num_symbols;
++
++                // The precoding/beamforming section follows the fixed tail,
++                // after the optional PTRS block when pdu_bitmap bit 0 is set
++                // (same walk as scf_5g_slot_commands_pdsch_csirs.cpp).
++                const uint8_t* bf_ptr = end_ptr + sizeof(scf_fapi_pdsch_pdu_end_t);
++                if (p.pdu_bitmap & 0x1)
++                {
++                    bf_ptr = pdu_walker::fits(bf_ptr, sizeof(scf_fapi_pdsch_ptrs_t), limit)
++                                 ? bf_ptr + sizeof(scf_fapi_pdsch_ptrs_t)
++                                 : nullptr;
++                }
++                if (bf_ptr != nullptr && pdu_walker::fits(bf_ptr, sizeof(scf_fapi_tx_precoding_beamforming_t), limit))
++                {
++                    const auto& bf      = *reinterpret_cast<const scf_fapi_tx_precoding_beamforming_t*>(bf_ptr);
++                    o.num_prgs          = bf.num_prgs;
++                    o.prg_size          = bf.prg_size;
++                    o.dig_bf_interfaces = bf.dig_bf_interfaces;
++                    o.prg_bf_sum        = static_cast<uint32_t>(bf.num_prgs) * bf.dig_bf_interfaces;
++                }
++            }
++            ++n_pdsch;
++            tot_prb += o.rb_size;
++            tot_layers += o.num_layers;
++            tot_prb_layers += static_cast<uint32_t>(o.rb_size) * o.num_layers;
++            tot_tb += o.tb_size + o.tb_size_cw1;
++            tot_pdsch_prg_bf += o.prg_bf_sum;
++            if (o.mcs_index > max_pdsch_mcs) { max_pdsch_mcs = o.mcs_index; }
++            break;
++        }
++        case DL_TTI_PDU_TYPE_PDCCH:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_pdcch_pdu_t), limit)) { break; }
++            const auto& p = *reinterpret_cast<const scf_fapi_pdcch_pdu_t*>(cfg);
++            o.bwp_size    = p.bwp.bwp_size;
++            o.bwp_start   = p.bwp.bwp_start;
++            o.start_sym   = p.start_sym_index;
++            o.num_sym     = p.duration_sym;
++            o.num_dl_dci  = p.num_dl_dci;
++
++            // Each DCI is variable length: header, precoding/beamforming block
++            // sized by its own num_prgs/dig_bf_interfaces, tx power info, then
++            // the payload. Stride formula mirrors scf_5g_slot_commands_pdcch.cpp.
++            uint32_t al_sum = 0, bits_sum = 0, prg_bf = 0;
++            uint8_t  al_max = 0;
++            bool     truncated = false;
++            const uint8_t* dci_ptr = reinterpret_cast<const uint8_t*>(p.dl_dci);
++            for (uint16_t k = 0; k < p.num_dl_dci; ++k)
++            {
++                if (!pdu_walker::fits(dci_ptr, sizeof(scf_fapi_dl_dci_t), limit)) { truncated = true; break; }
++                const auto&    dci = *reinterpret_cast<const scf_fapi_dl_dci_t*>(dci_ptr);
++                const uint8_t* q   = dci_ptr + sizeof(scf_fapi_dl_dci_t);
++                if (!pdu_walker::fits(q, sizeof(scf_fapi_tx_precoding_beamforming_t), limit)) { truncated = true; break; }
++                const auto&  bf      = *reinterpret_cast<const scf_fapi_tx_precoding_beamforming_t*>(q);
++                const size_t bf_size = sizeof(scf_fapi_tx_precoding_beamforming_t) +
++                                       static_cast<size_t>(bf.num_prgs) * sizeof(uint16_t) +
++                                       static_cast<size_t>(bf.num_prgs) * bf.dig_bf_interfaces * sizeof(uint16_t);
++                q += bf_size + sizeof(scf_fapi_pdcch_tx_power_info_t);
++                if (!pdu_walker::fits(q, sizeof(scf_fapi_pdcch_dci_payload_t), limit)) { truncated = true; break; }
++                const auto& pl = *reinterpret_cast<const scf_fapi_pdcch_dci_payload_t*>(q);
++                al_sum   += dci.aggregation_level;
++                bits_sum += pl.payload_size_bits;
++                prg_bf   += static_cast<uint32_t>(bf.num_prgs) * bf.dig_bf_interfaces;
++                if (dci.aggregation_level > al_max) { al_max = dci.aggregation_level; }
++                dci_ptr = q + sizeof(scf_fapi_pdcch_dci_payload_t) + (static_cast<size_t>(pl.payload_size_bits) + 7u) / 8u;
++                if (dci_ptr > limit) { truncated = true; break; } // payload claims more bytes than the PDU holds
++            }
++            o.agg_level_sum        = clamp_u16(al_sum);
++            o.agg_level_max        = al_max;
++            o.dci_payload_bits_sum = clamp_u16(bits_sum);
++            o.prg_bf_sum           = prg_bf;
++            o.dci_truncated        = truncated ? 1u : 0u;
++
++            ++n_pdcch;
++            n_dci += p.num_dl_dci;
++            tot_dci_al += al_sum;
++            tot_dci_bits += bits_sum;
++            tot_pdcch_prg_bf += prg_bf;
++            if (al_max > max_dci_al) { max_dci_al = al_max; }
++            if (truncated) { w.truncated = true; }
++            break;
++        }
++        case DL_TTI_PDU_TYPE_CSI_RS:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_csi_rsi_pdu_t), limit)) { break; }
++            const auto& p = *reinterpret_cast<const scf_fapi_csi_rsi_pdu_t*>(cfg);
++            o.bwp_size    = p.bwp.bwp_size;
++            o.bwp_start   = p.bwp.bwp_start;
++            o.rb_start    = p.start_rb;
++            o.rb_size     = p.num_of_rbs;
++            o.csirs_row   = p.row;
++            o.start_sym   = p.sym_l0;
++            ++n_csirs;
++            break;
++        }
++        case DL_TTI_PDU_TYPE_SSB:
++        {
++            if (!pdu_walker::fits(cfg, sizeof(scf_fapi_ssb_pdu_t), limit)) { break; }
++            const auto& p     = *reinterpret_cast<const scf_fapi_ssb_pdu_t*>(cfg);
++            o.ssb_block_index = p.ssb_block_index;
++            ++n_ssb;
++            break;
++        }
++        default:
++            break;
++        }
++
++        nv::dapp::sizer_add_dl(sfn, slot, o);   // in-process SM sizer (dapp_sizer.hpp)
++        if (write_pdus)
++        {
++            dapp_rec_t* r = ring.begin(DAPP_REC_DL_PDU, sfn, slot, cell_id);
++            r->u.dl_pdu   = o;
++            ring.commit(r);
++        }
++    }
++
++    dapp_rec_t*    r       = ring.begin(DAPP_REC_DL_TTI, sfn, slot, cell_id);
++    dapp_dl_tti_t& s       = r->u.dl_tti;
++    s.num_pdus             = msg.num_pdus;
++    s.ngroup               = msg.ngroup;
++    s.pdu_truncated        = w.truncated ? 1u : 0u;
++    s.msg_len              = ipc.msg_len;
++    s.body_len             = msg.msg_hdr.length;
++    s.ts_l2_send_ns        = ts_l2_send_ns;
++    s.n_pdcch              = n_pdcch;
++    s.n_pdsch              = n_pdsch;
++    s.n_csirs              = n_csirs;
++    s.n_ssb                = n_ssb;
++    s.n_dci                = n_dci;
++    s.tot_pdsch_prb        = tot_prb;
++    s.tot_pdsch_layers     = tot_layers;
++    s.tot_pdsch_tb_bytes   = tot_tb;
++    s.tot_pdsch_prb_layers = tot_prb_layers;
++    s.tot_pdsch_prg_bf     = tot_pdsch_prg_bf;
++    s.tot_dci_agg_level    = tot_dci_al;
++    s.tot_dci_payload_bits = tot_dci_bits;
++    s.max_dci_agg_level    = max_dci_al;
++    s.max_pdsch_mcs        = max_pdsch_mcs;
++    s.tot_pdcch_prg_bf     = tot_pdcch_prg_bf;
++    ring.commit(r);
++    ring.count_dl_tti();
++    ring.note_cell(sfn, slot, cell_id);
++    nv::dapp::sizer_done(sfn, slot, 1);
++    if (w.truncated) { ring.count_pdu_truncated(); }
++}
++
++//----------------------------------------------------------------------------
++// Asynchronous hand-off (L2A thread) and the handlers the export thread runs.
++//----------------------------------------------------------------------------
++namespace
++{
++
++static_assert(sizeof(nv_ipc_msg_t) <= nv::dapp::AsyncExporter::kIpcBytes, "nv_ipc_msg_t does not fit the async descriptor");
++
++void async_ul_handler(nv::dapp::Producer& ring, const nv::dapp::AsyncExporter::Item& it)
++{
++    nv_ipc_msg_t ipc;
++    std::memcpy(&ipc, it.ipc, sizeof(ipc));
++    dapp_export_ul_tti(ring, it.cell_id, *static_cast<const scf_fapi_ul_tti_req_t*>(it.fapi_msg), ipc, it.ts_l2_send_ns);
++}
++
++void async_dl_handler(nv::dapp::Producer& ring, const nv::dapp::AsyncExporter::Item& it)
++{
++    nv_ipc_msg_t ipc;
++    std::memcpy(&ipc, it.ipc, sizeof(ipc));
++    dapp_export_dl_tti(ring, it.cell_id, *static_cast<const scf_fapi_dl_tti_req_t*>(it.fapi_msg), ipc, it.ts_l2_send_ns);
++}
++
++inline bool submit(nv::dapp::AsyncExporter& ax, nv::dapp::AsyncExporter::Handler fn, uint16_t kind, uint16_t cell_id,
++                   uint16_t sfn, uint16_t slot, const void* fapi_msg, const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns)
++{
++    // Without a message buffer there is nothing whose release could be deferred.
++    if (ipc.msg_buf == nullptr) { return false; }
++    nv::dapp::AsyncExporter::Item* it = ax.reserve(true);
++    if (it == nullptr) { return false; }
++    it->fn            = fn;
++    it->ts_rx_ns      = nv::dapp::now_ns();
++    it->ts_l2_send_ns = ts_l2_send_ns;
++    it->fapi_msg      = fapi_msg;
++    it->kind          = kind;
++    it->cell_id       = cell_id;
++    it->sfn           = sfn;
++    it->slot          = slot;
++    it->slot_dropped  = 0;
++    std::memcpy(it->ipc, &ipc, sizeof(ipc));
++    ax.publish(it, ipc.msg_buf);
++    return true;
++}
++
++} // namespace
++
++bool dapp_submit_ul_tti(nv::dapp::AsyncExporter& ax, uint16_t cell_id, const scf_fapi_ul_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns)
++{
++    return submit(ax, async_ul_handler, nv::dapp::AsyncExporter::KIND_UL_TTI, cell_id, msg.sfn, msg.slot, &msg, ipc, ts_l2_send_ns);
++}
++
++bool dapp_submit_dl_tti(nv::dapp::AsyncExporter& ax, uint16_t cell_id, const scf_fapi_dl_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns)
++{
++    return submit(ax, async_dl_handler, nv::dapp::AsyncExporter::KIND_DL_TTI, cell_id, msg.sfn, msg.slot, &msg, ipc, ts_l2_send_ns);
++}
++
++} // namespace scf_5g_fapi
++
++#endif // ENABLE_DAPP_HOOK
+diff --git a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_dapp_export.hpp b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_dapp_export.hpp
+new file mode 100644
+index 0000000..36605db
+--- /dev/null
++++ b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_dapp_export.hpp
+@@ -0,0 +1,42 @@
++/*
++ * dApp hook: export UL_TTI.request / DL_TTI.request contents to the
++ * shared-memory ring (see cuPHY-CP/dapp_hook). Called on the L2 adapter
++ * msg_processing thread (inline mode) or on the dApp export thread (async
++ * mode); must stay allocation-free and bounded.
++ */
++#ifndef SCF_5G_FAPI_DAPP_EXPORT_HPP_INCLUDED_
++#define SCF_5G_FAPI_DAPP_EXPORT_HPP_INCLUDED_
++
++#ifdef ENABLE_DAPP_HOOK
++
++#include "scf_5g_fapi.h"
++#include "nv_ipc.h"
++#include "dapp_hook/dapp_ring.hpp"
++#include "dapp_hook/dapp_async.hpp"
++
++namespace scf_5g_fapi
++{
++
++// Writes one DAPP_REC_UL_PDU record per PDU followed by one DAPP_REC_UL_TTI
++// summary record. `ipc` bounds the walk (never reads past msg_buf + msg_len).
++void dapp_export_ul_tti(nv::dapp::Producer& ring, uint16_t cell_id, const scf_fapi_ul_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns);
++
++// Same for DL_TTI.request: DAPP_REC_DL_PDU records followed by DAPP_REC_DL_TTI.
++void dapp_export_dl_tti(nv::dapp::Producer& ring, uint16_t cell_id, const scf_fapi_dl_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns);
++
++// Asynchronous variants (dapp_hook async_export: 1): hand the message to the
++// export thread instead of walking it here. The export thread calls the two
++// functions above, so the records are identical. Returns false when the
++// message could not be queued (it is then not exported); on true the nvIPC
++// buffer is claimed and its release must go through AsyncExporter::take_claim().
++bool dapp_submit_ul_tti(nv::dapp::AsyncExporter& ax, uint16_t cell_id, const scf_fapi_ul_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns);
++bool dapp_submit_dl_tti(nv::dapp::AsyncExporter& ax, uint16_t cell_id, const scf_fapi_dl_tti_req_t& msg,
++                        const nv_ipc_msg_t& ipc, int64_t ts_l2_send_ns);
++
++} // namespace scf_5g_fapi
++
++#endif // ENABLE_DAPP_HOOK
++#endif // SCF_5G_FAPI_DAPP_EXPORT_HPP_INCLUDED_
+diff --git a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_phy.cpp b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_phy.cpp
+index 1ee6e7e..a11b5ae 100755
+--- a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_phy.cpp
++++ b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_fapi_phy.cpp
+@@ -25,6 +25,10 @@
+ #include "nv_phy_fapi_msg_common.hpp"
+ #include "nv_phy_limit_errors.hpp"
+ #include "cuphydriver_api.hpp"
++#ifdef ENABLE_DAPP_HOOK
++#include "scf_5g_fapi_dapp_export.hpp"
++#include "dapp_hook/dapp_sizer.hpp"
++#endif
+ #include <cerrno>
+ #include <functional>
+ 
+@@ -917,12 +921,12 @@ void phy::prepare_ul_slot_command(slot_command_api::slot_indication& slot_ind, s
+     auto& cell_l1_limit = phy_module().get_cell_limit_errors(get_carrier_id());
+     auto ret = validate_pdcch_pdu_l1_limits(pdu, cell_l1_limit.pdcch_errors);
+     if (phy_module().cell_group() && !ret) {
+-        update_cell_command(grp_cmd, slot_cmd, pdu, 0, get_carrier_id(), slot_ind, phy_cell_params, phy_module().staticPdcchSlotNum(), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info(), &cell_l1_limit.pdcch_errors);
++        update_cell_command(grp_cmd, slot_cmd, pdu, 0, get_carrier_id(), slot_ind, phy_cell_params, phy_module().config_options().staticSlot(phy_module().staticPdcchSlotNum(), get_carrier_id()), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info(), &cell_l1_limit.pdcch_errors);
+     }
+ #else
+     auto ret = VALID_FAPI_PDU;
+     if (phy_module().cell_group() && !ret) {
+-        update_cell_command(grp_cmd, slot_cmd, pdu, 0, get_carrier_id(), slot_ind, phy_cell_params, phy_module().staticPdcchSlotNum(), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info());
++        update_cell_command(grp_cmd, slot_cmd, pdu, 0, get_carrier_id(), slot_ind, phy_cell_params, phy_module().config_options().staticSlot(phy_module().staticPdcchSlotNum(), get_carrier_id()), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info());
+     }
+ #endif
+ 
+@@ -1090,6 +1094,39 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
+     }
+     cur_dl_tti_msg = reinterpret_cast<nv::phy_mac_msg_desc&>(ipc_msg);
+ 
++#ifdef ENABLE_DAPP_HOOK
++    // dApp hook: export this cell's DL_TTI.request (off by default; the DL GPU
++    // work is enqueued immediately, so it has little prediction lead time).
++    if (nv::dapp::Producer* dapp_ring = nv::dapp::producer(); (dapp_ring != nullptr) && nv::dapp::export_dl())
++    {
++        int64_t dapp_ts_send = 0;
++        if (ipc_msg.msg_buf != nullptr)
++        {
++            // get_transport() throws on an unmapped cell id; the hook must never
++            // propagate an exception into the FAPI path, so fall back to 0.
++            try
++            {
++                dapp_ts_send = phy_module().transport(get_carrier_id()).get_ts_send(ipc_msg);
++            }
++            catch (...)
++            {
++                dapp_ts_send = 0;
++            }
++        }
++        nv::dapp::sizer_expect(msg.sfn, msg.slot, 1);   // in-process SM sizer: one more DL_TTI of this slot to account for
++        if (nv::dapp::AsyncExporter* dapp_async = nv::dapp::async_exporter())
++        {
++            // async_export: the export thread walks the message; its buffer is
++            // released later by PHY_module::recv_msg() (see dapp_async.hpp)
++            (void)dapp_submit_dl_tti(*dapp_async, static_cast<uint16_t>(get_carrier_id()), msg, ipc_msg, dapp_ts_send);
++        }
++        else
++        {
++            dapp_export_dl_tti(*dapp_ring, static_cast<uint16_t>(get_carrier_id()), msg, ipc_msg, dapp_ts_send);
++        }
++    }
++#endif
++
+     for (uint16_t i = 0; i < numPDU; i++) {
+         auto &pdu = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(data + offset));
+         NVLOGD_FMT(TAG, "{}: PDU Type ={}, PDU Size={}, Offset={}", __FUNCTION__, static_cast<int>(pdu.pdu_type), static_cast<int>(pdu.pdu_size), offset);
+@@ -1115,7 +1152,7 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
+                     cell_idx = pdsch_info->cell_grp_info.nCells;
+                     pdsch_info->cell_dyn_info[cell_idx].cellPrmStatIdx = cell_stat_prm_idx;
+                     pdsch_info->cell_dyn_info[cell_idx].cellPrmDynIdx = cell_idx;
+-                    pdsch_info->cell_dyn_info[cell_idx].slotNum = ((phy_module().staticPdschSlotNum() > -1)? phy_module().staticPdschSlotNum() : msg.slot);
++                    pdsch_info->cell_dyn_info[cell_idx].slotNum = ((phy_module().config_options().staticSlot(phy_module().staticPdschSlotNum(), get_carrier_id()) > -1)? phy_module().staticPdschSlotNum() : msg.slot);
+                     pdsch_info->cell_dyn_info[cell_idx].pdschStartSym = 0;
+                     pdsch_info->cell_dyn_info[cell_idx].nPdschSym = 0;
+                     pdsch_info->cell_dyn_info[cell_idx].dmrsSymLocBmsk = 0;
+@@ -1353,7 +1390,38 @@ void phy::on_ul_tti_request(scf_fapi_ul_tti_req_t& msg, nv_ipc_msg_t& ipc_msg)
+     auto cell_id = phy_config.cell_config_.carrier_idx;
+     ::cell_mplane_info& mplane = phyDriver.getMPlaneConfig(cell_id);
+     ru_type ru = mplane.ru;
+-    
++
++#ifdef ENABLE_DAPP_HOOK
++    // dApp hook: export this cell's UL_TTI.request before any of it is turned
++    // into slot commands. Observation only - nothing here modifies the message.
++    if (nv::dapp::Producer* dapp_ring = nv::dapp::producer(); (dapp_ring != nullptr) && nv::dapp::export_ul())
++    {
++        int64_t dapp_ts_send = 0;
++        if (ipc_msg.msg_buf != nullptr)
++        {
++            // get_transport() throws on an unmapped cell id; the hook must never
++            // propagate an exception into the FAPI path, so fall back to 0.
++            try
++            {
++                dapp_ts_send = phy_module().transport(get_carrier_id()).get_ts_send(ipc_msg);
++            }
++            catch (...)
++            {
++                dapp_ts_send = 0;
++            }
++        }
++        nv::dapp::sizer_expect(msg.sfn, msg.slot, 0);   // in-process SM sizer: one more UL_TTI of this slot to account for
++        if (nv::dapp::AsyncExporter* dapp_async = nv::dapp::async_exporter())
++        {
++            (void)dapp_submit_ul_tti(*dapp_async, static_cast<uint16_t>(get_carrier_id()), msg, ipc_msg, dapp_ts_send);
++        }
++        else
++        {
++            dapp_export_ul_tti(*dapp_ring, static_cast<uint16_t>(get_carrier_id()), msg, ipc_msg, dapp_ts_send);
++        }
++    }
++#endif
++
+     for (uint i = 0 ; i < num_pdu_rx; i++) {
+         auto &pdu = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(data + offset));
+         switch (pdu.pdu_type)
+@@ -1975,7 +2043,7 @@ void phy::prepare_ul_slot_command(slot_command_api::slot_indication& slot_ind, s
+ 
+     if(phy_module().cell_group())
+     {
+-        update_cell_command(grp_cmd, slot_cmd, pdu, get_carrier_id(), slot_ind, phy_module().staticPuschSlotNum(), phy_module().lbrm(), phy_module().bf_enabled(), (uint16_t) cell_stat_prm_idx, phy_module().dtx_thresholds_pusch(),bfwCoeff_mem_info, get_mMIMO_enable_info(), get_slot_detail(slot_ind), phy_cell_params.nPrbUlBwp);
++        update_cell_command(grp_cmd, slot_cmd, pdu, get_carrier_id(), slot_ind, phy_module().config_options().staticSlot(phy_module().staticPuschSlotNum(), get_carrier_id()), phy_module().lbrm(), phy_module().bf_enabled(), (uint16_t) cell_stat_prm_idx, phy_module().dtx_thresholds_pusch(),bfwCoeff_mem_info, get_mMIMO_enable_info(), get_slot_detail(slot_ind), phy_cell_params.nPrbUlBwp);
+     }
+ }
+ 
+@@ -2018,12 +2086,12 @@ void phy::prepare_dl_slot_command(slot_command_api::slot_indication& slot_ind, s
+     auto ret = validate_pdcch_pdu_l1_limits(pdu, cell_l1_limit.pdcch_errors);
+     if (phy_module().cell_group() && !ret) {
+         // update_cell_command(nv::PHY_module::group_command(), slot_cmd, pdu, get_carrier_id(), slot_ind, phy_cell_params, false, phy_module().staticPdcchSlotNum(), phy_module().bf_enabled());
+-        update_cell_command(grp_cmd, slot_cmd, pdu, testMode, get_carrier_id(), slot_ind, phy_cell_params, phy_module().staticPdcchSlotNum(), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info(), &cell_l1_limit.pdcch_errors);
++        update_cell_command(grp_cmd, slot_cmd, pdu, testMode, get_carrier_id(), slot_ind, phy_cell_params, phy_module().config_options().staticSlot(phy_module().staticPdcchSlotNum(), get_carrier_id()), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info(), &cell_l1_limit.pdcch_errors);
+     }
+ #else
+     auto ret = VALID_FAPI_PDU;
+     if (phy_module().cell_group() && !ret) {
+-        update_cell_command(grp_cmd, slot_cmd, pdu, testMode, get_carrier_id(), slot_ind, phy_cell_params, phy_module().staticPdcchSlotNum(), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info());
++        update_cell_command(grp_cmd, slot_cmd, pdu, testMode, get_carrier_id(), slot_ind, phy_cell_params, phy_module().config_options().staticSlot(phy_module().staticPdcchSlotNum(), get_carrier_id()), phy_module().config_options(), phy_module().pm_map(), get_slot_detail(slot_ind), get_mMIMO_enable_info());
+     }
+ #endif
+ 
+diff --git a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands.cpp b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands.cpp
+index 06f7c40..13e51a1 100755
+--- a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands.cpp
++++ b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands.cpp
+@@ -655,7 +655,7 @@ namespace scf_5g_fapi
+             cuphyPucchCellDynPrm_t& dyn = pucch_grp_params->dyn_pars[grp.nCells];
+             dyn.cellPrmStatIdx              = cell_stat_prm_idx;
+             dyn.cellPrmDynIdx               = grp.nCells;
+-            dyn.slotNum                     = (config_option.staticPucchSlotNum != -1)? config_option.staticPucchSlotNum :slotinfo.slot_;
++            dyn.slotNum                     = (config_option.staticSlot(config_option.staticPucchSlotNum, cell_index) != -1)? config_option.staticPucchSlotNum :slotinfo.slot_;
+             dyn.pucchHoppingId = pucch_hopping_id;
+             grp.nCells++;
+         }
+diff --git a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_pdsch_csirs.cpp b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_pdsch_csirs.cpp
+index f8dcb47..4c5a815 100644
+--- a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_pdsch_csirs.cpp
++++ b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_pdsch_csirs.cpp
+@@ -2965,7 +2965,7 @@ namespace scf_5g_fapi {
+         cell_cmd.slot.slot_3gpp = slotinfo;
+         cell_grp_cmd->slot.type = SLOT_DOWNLINK;
+         cell_grp_cmd->slot.slot_3gpp = slotinfo;
+-        auto& staticCsiRsSlotNum = config_option.staticCsiRsSlotNum;
++        const int staticCsiRsSlotNum = config_option.staticSlot(config_option.staticCsiRsSlotNum, cell_index);
+ 
+         if(pdsch_exist)
+         {
+diff --git a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_ssb_pbch.cpp b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_ssb_pbch.cpp
+index 13766da..8b0a087 100644
+--- a/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_ssb_pbch.cpp
++++ b/cuPHY-CP/scfl2adapter/lib/scf_5g_fapi/scf_5g_slot_commands_ssb_pbch.cpp
+@@ -63,13 +63,13 @@ namespace scf_5g_fapi {
+             grp_params->ncells++;
+             new_cell = true;
+         }
+-        uint16_t slot = (config_option.staticSsbSlotNum != -1) ? config_option.staticSsbSlotNum : slotinfo.slot_;
++        uint16_t slot = (config_option.staticSlot(config_option.staticSsbSlotNum, cell_index) != -1) ? config_option.staticSsbSlotNum : slotinfo.slot_;
+ 
+         if (new_cell) {
+-            cell_dyn_params.NID = (config_option.staticSsbPcid != -1) ? config_option.staticSsbPcid : cell_params.cell_config_.phy_cell_id;
++            cell_dyn_params.NID = (config_option.staticSlot(config_option.staticSsbPcid, cell_index) != -1) ? config_option.staticSsbPcid : cell_params.cell_config_.phy_cell_id;
+             cell_dyn_params.nHF = slot/ (5 << cell_params.ssb_config_.sub_c_common);
+             cell_dyn_params.Lmax = l_max;
+-            if (config_option.enableTickDynamicSfnSlot)
++            if (config_option.enableTickDynamicSfnSlot && !config_option.staticSfnForCell(cell_index))
+             {
+                 cell_dyn_params.SFN = slotinfo.sfn_;
+             }
+diff --git a/cuPHY-CP/testMAC/testMAC/fapi_handler.cpp b/cuPHY-CP/testMAC/testMAC/fapi_handler.cpp
+index f742624..78a0667 100644
+--- a/cuPHY-CP/testMAC/testMAC/fapi_handler.cpp
++++ b/cuPHY-CP/testMAC/testMAC/fapi_handler.cpp
+@@ -520,7 +520,7 @@ int fapi_handler::set_prach_msg2_rapid(int cell_id, uint8_t* rapid)
+ int fapi_handler::get_pramble_params(int cell_id, uint16_t sfn, uint16_t slot, preamble_params_t* preamble)
+ {
+     vector<vector<vector<vector<fapi_req_t*>>>>& slot_cell_patterns = lp->get_slot_cell_patterns(get_slot_in_frame(sfn, slot));
+-    uint32_t                                     slot_idx           = get_slot_in_frame(sfn, slot) % slot_cell_patterns.size();
++    uint32_t                                     slot_idx           = lp->lp_pattern_index(sfn, slot, slot_cell_patterns.size());   // night-3 option (default = the original modulo)
+     vector<vector<fapi_req_t*>>&                 fapi_groups        = slot_cell_patterns[slot_idx][cell_id_map[cell_id]];
+     vector<fapi_req_t*>&                         fapi_reqs          = fapi_groups[UL_TTI_REQ];
+ 
+@@ -660,7 +660,7 @@ pucch_tv_data_t* fapi_handler::get_pucch_tv_pf234_pdu(fapi_req_t* pucch_req, int
+ fapi_req_t* fapi_handler::get_fapi_req_data(int cell_id, uint16_t sfn, uint16_t slot, channel_type_t channel)
+ {
+     vector<vector<vector<vector<fapi_req_t*>>>>& slot_cell_patterns = lp->get_slot_cell_patterns(get_slot_in_frame(sfn, slot));
+-    uint32_t                                     slot_idx           = get_slot_in_frame(sfn, slot) % slot_cell_patterns.size();
++    uint32_t                                     slot_idx           = lp->lp_pattern_index(sfn, slot, slot_cell_patterns.size());   // night-3 option (default = the original modulo)
+     vector<vector<fapi_req_t*>>&                 fapi_groups        = slot_cell_patterns[slot_idx][cell_id_map[cell_id]];
+     vector<fapi_req_t*>&                         fapi_reqs          = fapi_groups[UL_TTI_REQ];
+ 
+@@ -680,7 +680,7 @@ fapi_req_t* fapi_handler::get_fapi_req_data(int cell_id, uint16_t sfn, uint16_t
+ vector<fapi_req_t*>& fapi_handler::get_fapi_req_list(int cell_id, sfn_slot_t ss, fapi_group_t group_id)
+ {
+     slot_pattern_t &slot_cell_patterns = lp->get_slot_cell_patterns(get_slot_in_frame(ss));
+-    uint32_t slot_idx = get_slot_in_frame(ss) % slot_cell_patterns.size();
++    uint32_t sif_ = get_slot_in_frame(ss); uint32_t slot_idx = lp->lp_pattern_index(sif_ / lp->get_slots_per_frame(), sif_ % lp->get_slots_per_frame(), slot_cell_patterns.size());   // night-3 option
+     vector<vector<fapi_req_t*>> &fapi_groups = slot_cell_patterns[slot_idx][cell_id_map[cell_id]];
+     return fapi_groups[group_id];
+ }
+@@ -970,7 +970,7 @@ void fapi_handler::update_dl_thrput(uint32_t sfn, uint32_t slot, uint64_t slot_c
+     vector<vector<vector<vector<fapi_req_t*>>>>& slot_cell_patterns = lp->get_slot_cell_patterns(slot_counter);
+ 
+     uint32_t cell_num = lp->get_cell_num();
+-    uint32_t slot_idx = get_slot_in_frame(sfn, slot) % slot_cell_patterns.size();
++    uint32_t slot_idx = lp->lp_pattern_index(sfn, slot, slot_cell_patterns.size());   // night-3 option
+ 
+     auto cells_size = slot_cell_patterns[slot_idx].size();
+     auto start_cell_index = 0;
+diff --git a/cuPHY-CP/testMAC/testMAC/launch_pattern.cpp b/cuPHY-CP/testMAC/testMAC/launch_pattern.cpp
+index f23f72c..2b27fe3 100644
+--- a/cuPHY-CP/testMAC/testMAC/launch_pattern.cpp
++++ b/cuPHY-CP/testMAC/testMAC/launch_pattern.cpp
+@@ -2983,11 +2983,11 @@ int launch_pattern::parse_tv_channels(slot_pattern_t& slots_data, int cell_id, i
+                                 ch == channel_type_t::PBCH ||
+                                 ch == channel_type_t::PDCCH_DL ||
+                                 ch == channel_type_t::PDCCH_UL ||
+-                                // ch == channel_type_t::PDSCH ||
++                                ch == channel_type_t::PDSCH ||
+                                 ch == channel_type_t::CSI_RS ||
+-                                // ch == channel_type_t::PUSCH ||
+-                                // ch == channel_type_t::PUCCH ||
+-                                // ch == channel_type_t::PRACH ||
++                                ch == channel_type_t::PUSCH ||
++                                ch == channel_type_t::PUCCH ||
++                                ch == channel_type_t::PRACH ||
+                                 ch == channel_type_t::SRS
+                                 );
+ 
+@@ -3235,7 +3235,7 @@ int launch_pattern::save_harq_pid(int cell_id, uint16_t sfn, uint16_t slot, int
+ {
+     int ret = 0;
+     std::unordered_map<uint32_t, std::vector<uint8_t>>& m = hpid_maps[cell_id];
+-    uint32_t sfn_slot = get_slot_in_frame(sfn, slot) % get_slot_cell_patterns(0).size();
++    uint32_t sfn_slot = lp_pattern_index(sfn, slot, get_slot_cell_patterns(0).size());   // night-3 option, default = the original modulo
+ 
+     if (m.find(sfn_slot) == m.end())
+     {
+@@ -3264,7 +3264,7 @@ int launch_pattern::read_harq_pid(int cell_id, uint16_t sfn, uint16_t slot, int
+ {
+     int ret = 0;
+     std::unordered_map<uint32_t, std::vector<uint8_t>>& m = hpid_maps[cell_id];
+-    uint32_t sfn_slot = get_slot_in_frame(sfn, slot) % get_slot_cell_patterns(0).size();
++    uint32_t sfn_slot = lp_pattern_index(sfn, slot, get_slot_cell_patterns(0).size());   // night-3 option, default = the original modulo
+ 
+     if (m.find(sfn_slot) == m.end())
+     {
+diff --git a/cuPHY-CP/testMAC/testMAC/launch_pattern.hpp b/cuPHY-CP/testMAC/testMAC/launch_pattern.hpp
+index 7166346..419d7f9 100644
+--- a/cuPHY-CP/testMAC/testMAC/launch_pattern.hpp
++++ b/cuPHY-CP/testMAC/testMAC/launch_pattern.hpp
+@@ -18,6 +18,9 @@
+ #ifndef _LAUNCH_PATTERN_HPP_
+ #define _LAUNCH_PATTERN_HPP_
+ 
++#include <stdint.h>
++#include <stdlib.h>
++#include <time.h>
+ #include <vector>
+ #include <unordered_map>
+ 
+@@ -179,6 +182,32 @@ public:
+         return mem_bank_config_req[cell_id];
+     }
+ 
++    // night-3 test option (2026-10-18), default OFF = the original (sfn * slots_per_frame + slot) % pattern size.
++    // TESTMAC_LP_BLOCK_REPEAT=<N> (+ TESTMAC_LP_BLOCK_FRAMES, default 4): the pattern file's frames form blocks of
++    // TESTMAC_LP_BLOCK_FRAMES frames, block k is replayed for N consecutive real blocks, then block k+1 (wrapping). The real
++    // frame counter is extended beyond SFN 1023 with CLOCK_REALTIME (frame 0 of SFN 0 at t = 3.64 s mod 10.24 s), nearest-match
++    // adjusted to the slot's SFN. The RU emulator implements the same mapping (RU_LP_BLOCK_REPEAT), so both pick the same vectors.
++    uint32_t lp_pattern_index(uint16_t sfn, uint16_t slot, size_t pattern_slots)
++    {
++        static const int rep = [] { const char* e = getenv("TESTMAC_LP_BLOCK_REPEAT"); return e ? atoi(e) : 0; }();
++        if (rep <= 0 || pattern_slots == 0 || slots_per_frame == 0)
++            return get_slot_in_frame(sfn, slot) % pattern_slots;
++        static const int blk = [] { const char* e = getenv("TESTMAC_LP_BLOCK_FRAMES"); const int n = e ? atoi(e) : 4; return n > 0 ? n : 4; }();
++        struct timespec ts;
++        clock_gettime(CLOCK_REALTIME, &ts);
++        const int64_t t_ns   = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++        const int64_t f_wall = (t_ns - 3640000000LL) / 10000000LL;
++        int64_t d = ((int64_t)sfn - f_wall) % 1024;
++        if (d < 0) d += 1024;
++        if (d > 512) d -= 1024;
++        const int64_t ext      = f_wall + d;
++        const int     n_frames = (int)(pattern_slots / slots_per_frame);
++        const int     n_blocks = (n_frames / blk) > 0 ? (n_frames / blk) : 1;
++        const int64_t seg      = (ext / ((int64_t)blk * rep)) % n_blocks;
++        const int     fib      = (int)(ext % blk);
++        return (uint32_t)(((seg * blk + fib) * slots_per_frame + slot) % pattern_slots);
++    }
++
+     uint32_t get_slot_in_frame(uint16_t sfn, uint16_t slot)
+     {
+         uint32_t index = sfn; // extend to uint32_t
+diff --git a/testBenches/phase4_test_scripts/setup1_DU.sh b/testBenches/phase4_test_scripts/setup1_DU.sh
+index 9287b2f..5adf20f 100755
+--- a/testBenches/phase4_test_scripts/setup1_DU.sh
++++ b/testBenches/phase4_test_scripts/setup1_DU.sh
+@@ -391,3 +391,4 @@ for var in ${VARS}; do
+     echo "$var=\"${!var}\"" >> "$TEST_CONFIG_FILE"
+ done
+ chmod +x "$TEST_CONFIG_FILE"
++echo $CONTROLLER_MODE
+diff --git a/testBenches/phase4_test_scripts/valid_perf_patterns.sh b/testBenches/phase4_test_scripts/valid_perf_patterns.sh
+index 2b51ec8..62919b6 100644
+--- a/testBenches/phase4_test_scripts/valid_perf_patterns.sh
++++ b/testBenches/phase4_test_scripts/valid_perf_patterns.sh
+@@ -15,7 +15,7 @@
+ # limitations under the License.
+ 
+ # Array of valid performance patterns
+-valid_perf_patterns=("46" "47" "48" "49" "50" "51" "53" "54" "55" "56" "59" "59a" "59b" "59c" "59d" "59e" "59f" "60" "60a" "60b" "60c" "60d" "61" "62c" "63c" "65a" "65b" "65c" "65d" "66a" "66b" "66c" "66d" "67a" "67b" "67c" "67d" "67e" "69" "69a" "69b" "69c" "69d" "69e" "71" "73" "75" "77" "79" "81a" "81b" "81c" "81d" "83a" "83b" "83c" "83d" "85")
++valid_perf_patterns=("ddddddsuuu_average" "ddddddsuuu_peak" "ddddddsuuu_l2" "ddddddsuuu_l3" "ddddddsuuu_l4" "ddddddsuuu_l5" "ddddddsuuu_peak_long" "ddddddsuuu_alt_long" "dsuuudsuuu_peak" "46" "47" "48" "49" "50" "51" "53" "54" "55" "56" "59" "59a" "59b" "59c" "59d" "59e" "59f" "60" "60a" "60b" "60c" "60d" "61" "62c" "63c" "65a" "65b" "65c" "65d" "66a" "66b" "66c" "66d" "67a" "67b" "67c" "67d" "67e" "69" "69a" "69b" "69c" "69d" "69e" "71" "73" "75" "77" "79" "81a" "81b" "81c" "81d" "83a" "83b" "83c" "83d" "85")
+ 
+ # Array of valid MIMO patterns
+ mimo_patterns=("66a" "66b" "66c" "66d" "67a" "67b" "67c" "67d" "67e" "69" "69a" "69b" "69c" "69d" "69e" "71" "73" "75" "77" "79" "81a" "81b" "81c" "81d" "83a" "83b" "83c" "83d" "85")
+@@ -24,10 +24,10 @@ mimo_patterns=("66a" "66b" "66c" "66d" "67a" "67b" "67c" "67d" "67e" "69" "69a"
+ dft_s_ofdm_patterns=("65b" "65d" "66b" "66d" "67b" "67d")
+ 
+ # Array of peak patterns
+-peak_patterns=("46" "48" "50" "53" "55" "59" "59a" "59b" "59c" "59d" "59e" "59f" "61" "62c" "65a" "65b" "65c" "65d" "67a" "67b" "67c" "67d" "67e" "69" "69a" "69b" "69c" "69d" "69e" "71" "73" "75" "77" "79" "81a" "81b" "81c" "81d" "83a" "83b" "83c" "83d" "85")
++peak_patterns=("ddddddsuuu_peak" "ddddddsuuu_l2" "ddddddsuuu_l3" "ddddddsuuu_l4" "ddddddsuuu_l5" "ddddddsuuu_peak_long" "ddddddsuuu_alt_long" "dsuuudsuuu_peak" "46" "48" "50" "53" "55" "59" "59a" "59b" "59c" "59d" "59e" "59f" "61" "62c" "65a" "65b" "65c" "65d" "67a" "67b" "67c" "67d" "67e" "69" "69a" "69b" "69c" "69d" "69e" "71" "73" "75" "77" "79" "81a" "81b" "81c" "81d" "83a" "83b" "83c" "83d" "85")
+ 
+ # Array of average patterns
+-average_patterns=("47" "49" "51" "54" "56" "60" "60a" "60b" "60c" "60d" "63c" "66a" "66b" "66c" "66d" "66e")
++average_patterns=("ddddddsuuu_average" "47" "49" "51" "54" "56" "60" "60a" "60b" "60c" "60d" "63c" "66a" "66b" "66c" "66d" "66e")
+ 
+ # Function to get the mode for a given pattern
+ get_pattern_mode() {

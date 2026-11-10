@@ -72,6 +72,8 @@
 ### dgist.sh — L1 + gNB
 `check`(사전 점검) `up [이름]` `down` `status` `ue [이름]`(attach 단계) `logs [l1|gnb]` `test [모델] [req/s] [초]`(dApp RUN 스모크) `build-l1 [타겟]` `build-oai` `core|va|nonva|ric|xapp|all|logs …`(패스스루). 실행 로그는 `runs/<이름>/`.
 
+입력 프로파일 `.env DAPP_INPUT=4k|fhd` (2026-11-09): `4k` = 3840×2160, batch-8 타일(1280 크롭 6 + 전체 2, 엔진 `models/full26*`, 기본), `fhd` = 1920×1080, batch-3(1280×1080 크롭 2 + 전체 1, 엔진 `models/fhd26*`, `scripts/build_yolo_engines.sh fhd`). `VA_CAMERA_WIDTH/HEIGHT`를 같이 맞춘다(`check`가 불일치를 알려 줌; 다른 크기 프레임도 전체 보기만으로 처리는 된다). `fhd`의 SM 클래스는 `DAPP_TENANT_CLASSES_FHD`(기본 24,40,48,56,64,72,80, 4K와 같은 사다리)다. 2026-11-10 오전에 80이 빠졌던 두 원인은 해결됐다: (1) 테넌트가 클래스별 green context에서 엔진을 역직렬화했는데 TensorRT 10.3(Myelin)이 그 시점 context의 SM 수로 GEMM 그리드를 정해 프로세스 전체에 커널별로 캐시하므로 먼저 로드된 클래스의 그리드가 다른 클래스에 적용됐다(72 먼저 → 80 엔진 실패; 24 먼저 → 큰 클래스가 24짜리 그리드로 동작). 지금은 모든 엔진을 primary context에서 역직렬화한다(`DAPP_TENANT_ENGINE_CTX=prim` 기본, 단독 측정 비용 26x +2.7 %). (2) fhd26s/fhd26l의 sm80 엔진은 고유 sm80 tactic으로 빌드하면 같은 모델의 다른 클래스와 한 프로세스에서 "Cask Gemm execution"으로 실패하므로 `scripts/build_yolo_engines.sh`가 sm72 timing cache(`models/fhd26<m>/sm72.timing.cache`)로 빌드한다(26s 3.7 / 26l 8.1 ms, 고유 tactic과 같음). 바꾼 뒤 `./dgist.sh down; ./dgist.sh up`.
+
 ### va.sh — VA 서비스
 `start [local] | stop | restart | status | logs | test [ue] [n] [req/s] | test2 [n] | bg start --fps N|stop|status | make-frame`. 설정 `.env VA_*`(4K, 26x, 5 req/s, QoS 200 ms, JPEG 0.60). CSV `runs/va_service_log/`. 상세 `va_service/README.md`.
 
@@ -102,4 +104,4 @@
 
 ## 6. 설정 (`.env`) 요약
 
-이미지·빌드 디렉터리·코어 수(`BUILD_CPUS`), gNB cpuset, dApp(`DAPP_*`), VA(`VA_*`), non-VA(`NONVA_*`), FlexRIC(`FLEXRIC_BUILD`, `FLEXRIC_SM_DIR`, `RIC_IP`), PPO(`PPO_BUNDLE_NAME`, `PPO_GPU_SOURCE`, `PPO_DAPP`, `PPO_MIN_PRBS`), 전화기 SIM→서비스(`VA_IMSIS`, `NONVA_IMSIS`), guard(`XAPP_GUARD`, `XAPP_GUARD_S`), RU/코어(`RU_IP`, `FH_IF`, `UE_SUBNET`, `NO_CORE`). 바꾼 뒤 해당 모듈만 restart.
+이미지·빌드 디렉터리·코어 수(`BUILD_CPUS`), gNB cpuset, dApp(`DAPP_*`, 입력 프로파일 `DAPP_INPUT=4k|fhd`), VA(`VA_*`), non-VA(`NONVA_*`), FlexRIC(`FLEXRIC_BUILD`, `FLEXRIC_SM_DIR`, `RIC_IP`), PPO(`PPO_BUNDLE_NAME`, `PPO_GPU_SOURCE`, `PPO_DAPP`, `PPO_MIN_PRBS`), 전화기 SIM→서비스(`VA_IMSIS`, `NONVA_IMSIS`), guard(`XAPP_GUARD`, `XAPP_GUARD_S`), RU/코어(`RU_IP`, `FH_IF`, `UE_SUBNET`, `NO_CORE`). 바꾼 뒤 해당 모듈만 restart.

@@ -80,3 +80,6 @@ ultralytics==8.4.163
 ultralytics-thop==2.1.6
 urllib3==2.8.0
 uvicorn==0.54.0
+# ONNX export of the YOLO26 weights (scripts/build_yolo_engines.sh -> models/export_1280.py)
+onnx==1.22.0
+onnxslim==0.1.96

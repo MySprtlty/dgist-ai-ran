@@ -10,17 +10,18 @@
 #   stop | restart
 #   status               process, ports, dApp agent connection + counters + latest estimate, active UE sessions, last CSVs
 #   logs                 follow the uvicorn log
-#   test [ue] [n] [rate] UE stand-in (va_service/ue_sim.py): n 4K frames at rate req/s as ue1|ue2 -> the same CSV the phone writes
+#   test [ue] [n] [rate] UE stand-in (va_service/ue_sim.py): n frames (VA_CAMERA_WIDTH x HEIGHT) at rate req/s as ue1|ue2 -> the same CSV the phone writes
 #   test2 [n] [rate]     ue1 and ue2 at the same time
 #   bg start [--fps N] | bg stop | bg status      background virtual UE inside the service (bg_yolo.py, localhost control)
-#   make-frame           (re)create the 3840x2160 test JPEG from the Aerial tree's 4K images
+#   make-frame           (re)create the VA_CAMERA_WIDTH x VA_CAMERA_HEIGHT test JPEG from the Aerial tree's 4K images
 # settings: .env VA_* | logs: runs/va_service/ (uvicorn) and runs/va_service_log/ (per-session CSV, phone and ue_sim.py)
 set -u
 [ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
 V=$D/va_service; VENV=$V/yolo_env; R=$D/runs/va_service; PIDF=$R/uvicorn.pid
-PORT=${VA_PORT:-8000}; AGENT_PORT=${DAPP_AGENT_PORT:-9810}; FRAME=$V/test_frames/uhd_3840x2160_q90.jpg
+PORT=${VA_PORT:-8000}; AGENT_PORT=${DAPP_AGENT_PORT:-9810}; CW=${VA_CAMERA_WIDTH:-3840}; CH=${VA_CAMERA_HEIGHT:-2160}
+FRAME=$V/test_frames/uhd_3840x2160_q90.jpg; [ "${CW}x${CH}" = 3840x2160 ] || FRAME=$V/test_frames/frame_${CW}x${CH}_q90.jpg   # the UE stand-in sends frames of the configured camera size
 mkdir -p $R $D/runs/va_service_log
 pid() { cat $PIDF 2>/dev/null; }
 alive() { [ -n "$(pid)" ] && kill -0 $(pid) 2>/dev/null; }
@@ -30,19 +31,19 @@ need_up() { alive && port_open $PORT || { echo "VA service not running: $0 start
 make_frame() {
   mkdir -p $V/test_frames
   SRC=$D/aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/models/img4k/img4k_0.jpg
-  $VENV/bin/python - "$SRC" "$FRAME" <<'EOF'
+  $VENV/bin/python - "$SRC" "$FRAME" "$CW" "$CH" <<'EOF'
 import sys
 from PIL import Image
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, W, H = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 im = Image.open(src).convert("RGB")
 w, h = im.size
-if (w, h) != (3840, 2160):
-    # center crop/resize to 4K UHD (what the phone's 3840x2160 capture produces)
-    s = max(3840 / w, 2160 / h)
+if (w, h) != (W, H):
+    # center crop/resize to the camera size the phone page captures (.env VA_CAMERA_WIDTH x VA_CAMERA_HEIGHT)
+    s = max(W / w, H / h)
     im = im.resize((round(w * s), round(h * s)), Image.LANCZOS)
     w, h = im.size
-    l, t = (w - 3840) // 2, (h - 2160) // 2
-    im = im.crop((l, t, l + 3840, t + 2160))
+    l, t = (w - W) // 2, (h - H) // 2
+    im = im.crop((l, t, l + W, t + H))
 im.save(dst, "JPEG", quality=90)
 import os
 print(f"test frame: {dst} {im.size[0]}x{im.size[1]} q90 {os.path.getsize(dst)/1024:.0f} KB (from {src})")

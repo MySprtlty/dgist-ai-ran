@@ -14,7 +14,8 @@ BIN=$SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf
 for kv in SCF_FAPI_10_04:BOOL=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH:BOOL=OFF SCF_FAPI_10_04_SRS:BOOL=ON ENABLE_DAPP_HOOK:BOOL=ON; do
   grep -q "^$kv\$" $SDK/$BUILD_DIR/CMakeCache.txt || log "warning: $BUILD_DIR/CMakeCache.txt lacks $kv (the validated FAPI wire layout + dApp hook)"
 done
-for m in n s m l x; do [ -e $SDK/cuPHY-CP/dapp_hook/models/full26$m/seg00_sm80.engine ] || log "warning: YOLO engine models/full26$m/seg00_sm80.engine missing"; done
+M=$SDK/cuPHY-CP/dapp_hook/models; ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26   # input profile (.env DAPP_INPUT): 4k = batch-8 1280 tiles, fhd = batch-3 (2026-11-09)
+for m in n s m l x; do [ -e $M/$ESET$m/seg00_sm80.engine ] || log "warning: YOLO engine models/$ESET$m/seg00_sm80.engine missing (scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; done
 
 # 1. no MPS: the green contexts partition the GPU (the hsw entrypoint starts MPS; our L1 needs it off)
 export CUDA_MPS_PIPE_DIRECTORY=/var CUDA_MPS_LOG_DIRECTORY=/var
@@ -33,12 +34,18 @@ export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80} DAPP_TEN
 export DAPP_TENANT_CPU=${DAPP_TENANT_CPU:-45} DAPP_AGENT_CPU=${DAPP_AGENT_CPU:-46} DAPP_AGENT_PORT=${DAPP_AGENT_PORT:-9810}
 export DAPP_AGENT_GRAPH_CHUNK=${DAPP_AGENT_GRAPH_CHUNK:-3} DAPP_AGENT_CHUNK_AHEAD=${DAPP_AGENT_CHUNK_AHEAD:-2} DAPP_AGENT_QOS=${DAPP_AGENT_QOS:-1}
 export DAPP_TENANT_LOG=/tmp/dapp_tenant.log DAPP_TENANT_CSV=/tmp/dapp_tenant_slots.csv
+export DAPP_INPUT=${DAPP_INPUT:-4k}
+if [ "$DAPP_INPUT" = fhd ]; then   # the batch-3 FHD engine set + FHD warm-up frames (the tenant defaults are the 4K set models/full26<m> and 4K frames)
+  export DAPP_TENANT_MODELS=$(c=""; for m in n s m l x; do printf "%s26%s=%s" "$c" $m $M/fhd26$m; c=,; done)
+  export DAPP_AGENT_WARMUP=$M/imgfhd/fhd_0_q85.jpg,$M/imgfhd/fhd_1_q85.jpg
+  export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80}   # the FHD ladder (.env; 26s/26l sm80 = sm72-tactic engines, see build_yolo_engines.sh)
+fi
 [ -n "${PRACH_FORCE_THR0:-}" ] && export CUPHY_PRACH_FORCE_THR0=$PRACH_FORCE_THR0
 rm -f $PHYLOG /tmp/dapp_tenant.log /tmp/dapp_tenant_slots.csv
 env | grep -E '^(DAPP_|CUPHY_|BUILD_DIR|L1_CONFIG|RUN_NAME)' | sort > $RUN/l1_env.txt
 
 # 4. the L1 (the process renames itself phy_main)
-log "cuphycontroller_scf $L1_CONFIG | $BUILD_DIR | dApp classes $DAPP_TENANT_CLASSES | agent TCP $DAPP_AGENT_PORT${CUPHY_PRACH_FORCE_THR0:+ | CUPHY_PRACH_FORCE_THR0=$CUPHY_PRACH_FORCE_THR0}"
+log "cuphycontroller_scf $L1_CONFIG | $BUILD_DIR | dApp classes $DAPP_TENANT_CLASSES | input $DAPP_INPUT ($ESET) | agent TCP $DAPP_AGENT_PORT${CUPHY_PRACH_FORCE_THR0:+ | CUPHY_PRACH_FORCE_THR0=$CUPHY_PRACH_FORCE_THR0}"
 ( cd $SDK && exec $BIN $L1_CONFIG ) > $RUN/l1_console.log 2>&1 & L1=$!
 chown $OWN $RUN/l1_console.log $RUN/l1_env.txt 2>/dev/null
 stopping=0

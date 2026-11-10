@@ -13,7 +13,7 @@
 | Aerial cuPHY (FAPI-Aware Scheduler L1) `aerial-cuda-accelerated-ran/` | **서브모듈** = 포크 `MySprtlty/aerial-cuda-accelerated-ran` 브랜치 `hybrid` | 빌드: `./dgist.sh build-l1` (컨테이너 안 Ninja, `build.aarch64_f1002/`) |
 | OAI gNB + FlexRIC (연구실 MAC 쿼터 스케줄러·E2 agent·xApp) `openairinterface5g/` | **패치 묶음** `oai/` (업스트림 커밋 고정 + 변경분) | `./oai/fetch_oai.sh` → 이미지: `./dgist.sh build-oai`, RIC/xApp: `./ric.sh build` |
 | Open5GS 소스 `open5gs/` (v2.8.0) | **서브모듈** (업스트림) | 실행은 apt 패키지; 소스 빌드는 선택(`./core.sh build`) |
-| YOLO 가중치·ONNX·TensorRT 엔진 (`models/full26*/seg00_sm<N>.engine`) | 없음 | `scripts/build_yolo_engines.sh` (~3 h) |
+| YOLO 가중치·ONNX·TensorRT 엔진 (`models/full26*/seg00_sm<N>.engine`; FHD 프로파일은 `models/fhd26*/`) | 없음 | `scripts/build_yolo_engines.sh` (~3 h) |
 | Docker 이미지 (`nvcr.io/.../aerial-cuda-accelerated-ran:25-3-cubb`, `ran-base:latest`, `dgist-oai-gnb-aerial:latest`) | 없음 | NGC pull / `docker build` (§3) |
 | 실행 로그 `runs/`, `log/`, E2 SM 라이브러리 `flexric_sm/`, 개인키 `*/certs/`, `core/etc/tls/*.key` | 없음 (.gitignore) | 실행·빌드 때 생성 |
 | 전화기 SIM 가입자(K/OPc) | 없음 | Open5GS WebUI(:9999)에 등록; IMSI는 `.env VA_IMSIS/NONVA_IMSIS` |
@@ -49,6 +49,7 @@ vi .env                       # 호스트에 맞게: FH_IF, RU_IP, BUILD_CPUS와
 ./scripts/setup_venvs.sh                          # (4) va_service/yolo_env, xapp_ppo venv
 ./scripts/make_certs.sh                           # (5) HTTPS 인증서 CN=10.45.0.1 (전화기에 ca.crt 설치 또는 경고 수락)
 ./scripts/build_yolo_engines.sh                   # (6) YOLO26 n/s/m/l/x × SM 클래스(.env DAPP_TENANT_CLASSES) 엔진, GPU 비어 있어야 함  ~3시간
+./scripts/build_yolo_engines.sh fhd               # (6b) 선택: FHD 프로파일(batch 3, 1280x1080 크롭 2 + 전체 1) 엔진 -> .env DAPP_INPUT=fhd 로 사용 (26s/26l의 80 SM 엔진은 sm72 timing cache로 빌드됨, 스크립트가 처리: MANUAL.md)
 for nf in amf smf upf nrf ausf udm udr pcf nssf bsf scp; do ./core.sh install-config $nf; done   # (7) 코어 설정 (라이브 /etc/open5gs 백업 후 교체)
 ```
 가입자: WebUI에 IMSI(`.env`의 네 개)·K·OPc 등록. 기존 서버에서 옮길 때는 그 서버의 MongoDB에서 내보낸다(이 저장소에는 없음).

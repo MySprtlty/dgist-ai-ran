@@ -9,7 +9,7 @@
 #   status           containers, RAN processes, MPS, core, agent port, GPU, last cell-0 traffic line, UE counters
 #   logs [l1|gnb]    follow the live log (default gnb)
 #   ue [name]        UE attach phases from the gNB log (live container, else runs/<name>/oai.log)
-#   test [model] [req/s] [seconds]   xApp smoke test: ra_stub.py inside dgist-l1 sends 4K JPEGs to the agent (default 26x 2 15)
+#   test [model] [req/s] [seconds]   xApp smoke test: ra_stub.py inside dgist-l1 sends JPEGs of the .env DAPP_INPUT profile (img4k / imgfhd) to the agent (default 26x 2 15)
 #   check            host prechecks only
 #   core up|down|status              Open5GS + UE NAT (sudo)                                         = ./core.sh
 #   va start|stop|status|test|...    VA service: phone frames -> RUN to the dApp -> reply (va_service/) = ./va.sh
@@ -25,6 +25,7 @@ set -u
 [ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
+CL=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80}; [ "${DAPP_INPUT:-4k}" = fhd ] && CL=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80}   # dApp SM classes of the input profile
 OUT=$D/runs; CUR=$OUT/current_run; L1C=dgist-l1; GNBC=dgist-gnb; PHYLOG=/tmp/phy.log; T=$D/aerial-cuda-accelerated-ran; mkdir -p $OUT
 cmd=${1:-status}
 c_up() { [ "$(docker inspect -f '{{.State.Running}}' $1 2>/dev/null)" = true ]; }
@@ -44,7 +45,10 @@ check() {
   for im in $AERIAL_IMAGE $OAI_IMAGE; do docker image inspect $im > /dev/null 2>&1 || { echo "!! image $im missing ($0 build-oai builds the gNB image)"; ok=0; }; done
   [ -x $T/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf ] || { echo "!! L1 binary $BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf missing ($0 build-l1)"; ok=0; }
   for kv in SCF_FAPI_10_04:BOOL=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH:BOOL=OFF SCF_FAPI_10_04_SRS:BOOL=ON ENABLE_DAPP_HOOK:BOOL=ON; do grep -q "^$kv\$" $T/$BUILD_DIR/CMakeCache.txt 2>/dev/null || { echo "!! $BUILD_DIR/CMakeCache.txt: expected $kv (validated FAPI wire layout + dApp hook)"; ok=0; }; done
-  for m in n s m l x; do [ -e $T/cuPHY-CP/dapp_hook/models/full26$m/seg00_sm80.engine ] || { echo "!! YOLO engine models/full26$m/seg00_sm80.engine missing"; ok=0; }; done
+  ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26
+  for m in n s m l x; do [ -e $T/cuPHY-CP/dapp_hook/models/$ESET$m/seg00_sm${CL##*,}.engine ] || { echo "!! YOLO engine models/$ESET$m/seg00_sm${CL##*,}.engine missing (DAPP_INPUT=${DAPP_INPUT:-4k}: scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; ok=0; }; done
+  want=3840x2160; [ "${DAPP_INPUT:-4k}" = fhd ] && want=1920x1080; have=${VA_CAMERA_WIDTH:-3840}x${VA_CAMERA_HEIGHT:-2160}
+  [ "$have" = "$want" ] || echo "   note: DAPP_INPUT=${DAPP_INPUT:-4k} expects $want frames but .env VA_CAMERA_WIDTH/HEIGHT = $have (such frames still run, whole-image views only)"
   [ -f $D/config/cuphycontroller_$L1_CONFIG.yaml ] && [ -f $D/config/l2_adapter_$L1_CONFIG.yaml ] && [ -f $D/config/gnb.conf ] || { echo "!! config/ files missing (cuphycontroller_$L1_CONFIG.yaml, l2_adapter_$L1_CONFIG.yaml, gnb.conf)"; ok=0; }
   other=$(docker ps --format '{{.Names}}' | grep -E '^(nv-cubb|oai-gnb.*|dgist-l1|dgist-gnb)$' | tr '\n' ' '); [ -z "$other" ] || { echo "!! L1/gNB container(s) running: $other - stop that stack first (never two L1s on this GPU/NIC)"; ok=0; }
   rp=$(ran_procs); [ -z "$rp" ] || { echo "!! RAN processes alive: $rp"; ok=0; }
@@ -66,7 +70,7 @@ check) check && echo "== ready: $0 up [name]" || { echo "== fix the !! lines fir
 up)
   NAME=${2:-dgist_$(date +%m%d_%H%M)}; RUN=$OUT/$NAME
   [ -f $CUR ] && { echo "!! a run is registered as current ($(cat $CUR)): $0 down first"; exit 1; }
-  echo "== $NAME: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $DAPP_TENANT_CLASSES) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
+  echo "== $NAME: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
   check || { echo "precheck failed"; exit 1; }
   mkdir -p $RUN; echo "$NAME" > $CUR
   echo "   docker compose up -d: the gNB starts once the L1 is healthy (L1 ready + dApp engines loaded + agent port open; up to ~10 min)"
@@ -124,8 +128,9 @@ ue)
 test)
   m=${2:-26x}; rate=${3:-2}; sec=${4:-15}
   port_open || { echo "xApp agent port $DAPP_AGENT_PORT closed - is the L1 running ($0 status)?"; exit 1; }
-  echo "== xApp smoke test: model $m, $rate req/s, $sec s, 4K JPEGs from models/img4k (closed loop, ra_stub.py inside $L1C)"
-  docker exec $L1C bash -c "cd /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/python && taskset -c 65-71 python3 ra_stub.py --rate $rate --duration $sec --policy fixed:$m --deadline-ms 1000 --max-inflight 1 --csv /tmp/ra_test.csv" 2>&1 | tail -12
+  IMGS=img4k; [ "${DAPP_INPUT:-4k}" = fhd ] && IMGS=imgfhd
+  echo "== xApp smoke test: model $m, $rate req/s, $sec s, JPEGs from models/$IMGS (DAPP_INPUT=${DAPP_INPUT:-4k}; closed loop, ra_stub.py inside $L1C)"
+  docker exec $L1C bash -c "cd /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/python && taskset -c 65-71 python3 ra_stub.py --images /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/models/$IMGS --rate $rate --duration $sec --policy fixed:$m --deadline-ms 1000 --max-inflight 1 --csv /tmp/ra_test.csv" 2>&1 | tail -12
   echo "   (FlexRIC xApp with the same RUN path: aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/xapp_flexric/README.md)"
   ;;
 core) bash $D/scripts/core.sh "${2:-status}" ;;

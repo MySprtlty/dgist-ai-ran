@@ -1,5 +1,5 @@
 {
-  "schema": "ppo20-radio18-modelscalar1-sm1-ensemble-v1",
+  "schema": "ppo20-unified-fixedcontract-residual-v1",
   "input_dim": 20,
   "model_ids": [
     "26n",
@@ -20,9 +20,9 @@
     352,
     353
   ],
-  "actor_sha256": "bf8ef45b1337814f2163d4f271c394e3e6f99a7f67779e01555940b2d7ffb0ba",
-  "selected_training": "v24",
-  "actor_architecture": "each:20->128Tanh->128Tanh->264categorical logits; mean softmax over3actors; argmax+5VA,273-VA NonVA",
+  "actor_sha256": "570d181d3d55b83ea9813345275a59c5d7220f9160ddbe48c03feb7d46fc1041",
+  "selected_training": "transition_recovery_20261110",
+  "actor_architecture": "frozen28feature backbone+264logit residual;3seed ensemble;VA5..268,NV273-VA",
   "input_normalization": "radio v/(scale+abs(v)); service budgets/273; model_index/4; SM/80; peractor fixed training normalization buffers then clip[-10,10]",
   "compute_contract": "atomic model_id,allocated_sm,timestamp_ms; timestamp metadata is not NN input; single service-level model condition",
   "compute_max_age_ms": 2000,
@@ -30,72 +30,13 @@
   "simulation_only": true,
   "rf_validated": false,
   "source_checkpoints": [
-    "C:\\25_3_hsw\\training_6g_sm_allocation\\runs\\sm_direct20_v24\\seed_351_dim_20\\actor_u30.pt",
-    "C:\\25_3_hsw\\training_6g_sm_allocation\\runs\\sm_direct20_v24\\seed_352_dim_20\\actor_u30.pt",
-    "C:\\25_3_hsw\\training_6g_sm_allocation\\runs\\sm_direct20_v24\\seed_353_dim_20\\actor_u30.pt"
+    "C:\\_dgist\\training_6g_sm_allocation\\runs\\transition_recovery_20261110\\seed_351_dim_20\\actor.pt",
+    "C:\\_dgist\\training_6g_sm_allocation\\runs\\transition_recovery_20261110\\seed_352_dim_20\\actor.pt",
+    "C:\\_dgist\\training_6g_sm_allocation\\runs\\transition_recovery_20261110\\seed_353_dim_20\\actor.pt"
   ],
-  "training_note": "v24 direct20 PPO300episodes; v26 attempted but not selected by predefined validation rule",
-  "evaluation": {
-    "Basic18": {
-      "q": 198.58533333333332,
-      "va": {
-        "e2e": 186.3047424670167,
-        "ul": 145.2061190938016,
-        "satisfaction": 76.95511796757799,
-        "used": 185.68170370370368,
-        "skipped": 6.999999999999999
-      },
-      "nv": {
-        "e2e": 205.36586431206132,
-        "ul": 205.36586431206132,
-        "satisfaction": 87.09892839219593,
-        "used": 74.35617407407409,
-        "skipped": 215.35000000000005
-      },
-      "n": 60,
-      "nv_below85": 15,
-      "min_nv": 78.93593919652552
-    },
-    "PF": {
-      "q": null,
-      "va": {
-        "e2e": 272.6372887664687,
-        "ul": 231.53950582040517,
-        "satisfaction": 42.35659142335715,
-        "used": 174.56360277777773,
-        "skipped": 39.349999999999994
-      },
-      "nv": {
-        "e2e": 32.0731838743125,
-        "ul": 32.0731838743125,
-        "satisfaction": 98.2400048461267,
-        "used": 90.58678703703703,
-        "skipped": 6.416666666666667
-      },
-      "n": 60,
-      "nv_below85": 0,
-      "min_nv": 97.6470588235294
-    },
-    "SM20": {
-      "q": 198.70711111111112,
-      "va": {
-        "e2e": 185.76280953350366,
-        "ul": 144.66430805113515,
-        "satisfaction": 77.67171499426684,
-        "used": 185.6781055555555,
-        "skipped": 7.016666666666667
-      },
-      "nv": {
-        "e2e": 205.36716198372463,
-        "ul": 205.36716198372463,
-        "satisfaction": 86.88658395396966,
-        "used": 74.26770925925926,
-        "skipped": 216.6499999999999
-      },
-      "n": 60,
-      "nv_below85": 22,
-      "min_nv": 77.80195865070729
-    }
-  },
-  "selection": "choose highest SM20 VA among pairs where BOTH mean NV>=85; if none retain v24; all3seeds averaged probabilities"
+  "effective_input_dim": 20,
+  "training_note": "same physical environment, branch score, targets and auxiliary fine-tuning for Basic18/SM20; 3500+1500+2500 updates; last stage chooses smallest active budget within 0.1 score and 0.005 latency satisfaction of best branch; frozen paired PPO backbone; no hidden mode input",
+  "selection": "simulation candidate; no live deployment",
+  "previous_compatible_package": "testbed_inference_only_20261108",
+  "sm_runtime_sha256": "52408352d545d6a0f063f88fc8fca57fd22431651505ba9623b39be651c6d1f7"
 }

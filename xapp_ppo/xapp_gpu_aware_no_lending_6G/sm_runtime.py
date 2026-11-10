@@ -5,18 +5,35 @@ import torch
 from radio_runtime import encode as radio_encode
 
 MODELS=('26n','26s','26m','26l','26x')
-SCHEMA='ppo20-radio18-modelscalar1-sm1-ensemble-v1'
+SCHEMA='ppo20-unified-fixedcontract-residual-v1'
+
+class Features(torch.nn.Module):
+ def __init__(self,dim):
+  super().__init__();self.dim=dim
+  self.register_buffer('mean',torch.zeros(18));self.register_buffer('std',torch.ones(18))
+ def forward(self,x):
+  radio=((x[...,:18]-self.mean)/self.std).clamp(-10,10)
+  if self.dim==18:extra=torch.zeros(*x.shape[:-1],10,device=x.device)
+  else:
+   one=torch.nn.functional.one_hot((x[...,18]*4).round().long().clamp(0,4),5).to(x.dtype)
+   extra=torch.cat([one-.2,one*(x[...,19:20]-.65)/.35],-1)
+  return torch.cat([radio,extra],-1)
+
+class Base(torch.nn.Module):
+ def __init__(self,dim):
+  super().__init__();self.features=Features(dim)
+  self.net=torch.nn.Sequential(torch.nn.Linear(28,128),torch.nn.Tanh(),torch.nn.Linear(128,128),torch.nn.Tanh())
+  self.head=torch.nn.Linear(128,264)
+ def logits(self,x):return self.head(self.net(self.features(x)))
 
 class Actor(torch.nn.Module):
  def __init__(self,dim=20):
-  super().__init__()
-  self.net=torch.nn.Sequential(torch.nn.Linear(dim,128),torch.nn.Tanh(),torch.nn.Linear(128,128),torch.nn.Tanh())
-  self.head=torch.nn.Linear(128,264)
-  self.register_buffer('mean_obs',torch.zeros(dim));self.register_buffer('std_obs',torch.ones(dim))
- def logits(self,x):return self.head(self.net(((x-self.mean_obs)/self.std_obs).clamp(-10,10)))
+  super().__init__();self.base=Base(dim)
+  self.delta=torch.nn.Sequential(torch.nn.Linear(28,128),torch.nn.ReLU(),torch.nn.Linear(128,128),torch.nn.ReLU(),torch.nn.Linear(128,264))
+ def logits(self,x):return self.base.logits(x)+self.delta(self.base.features(x))
 
 class Ensemble(torch.nn.Module):
- def __init__(self,count=3):super().__init__();self.actors=torch.nn.ModuleList([Actor() for _ in range(count)])
+ def __init__(self,count=3,dim=20):super().__init__();self.actors=torch.nn.ModuleList([Actor(dim) for _ in range(count)])
  def forward(self,x):
   probs=torch.stack([a.logits(x).softmax(-1) for a in self.actors]).mean(0)
   return probs.argmax(-1)+5
@@ -43,13 +60,13 @@ class BasicPolicy:
   if (m.get('schema')!=SCHEMA or m.get('input_dim')!=20 or m.get('model_ids')!=list(MODELS)
       or m.get('total_ul_prbs')!=273 or m.get('min_slice_prbs')!=5
       or m.get('borrow_unused_prbs') is not False or m.get('ensemble_size')!=3
-      or m.get('model_code_scale')!=4 or m.get('sm_scale')!=80):raise ValueError('Incompatible model contract')
+      or m.get('effective_input_dim') not in (18,20) or m.get('model_code_scale')!=4 or m.get('sm_scale')!=80):raise ValueError('Incompatible model contract')
   path=self.bundle/'actor.pt'
   if hashlib.sha256(path.read_bytes()).hexdigest()!=m['actor_sha256']:raise ValueError('Actor checksum mismatch')
-  torch.set_num_threads(num_threads);self.actor=Ensemble(3)
+  torch.set_num_threads(num_threads);self.actor=Ensemble(3,m['effective_input_dim'])
   self.actor.load_state_dict(torch.load(path,map_location='cpu',weights_only=True),strict=True);self.actor.eval()
   for a in self.actor.actors:
-   if not all(torch.isfinite(x).all() for x in a.state_dict().values()) or not (a.std_obs>0).all():raise ValueError('Invalid model tensors')
+   if not all(torch.isfinite(x).all() for x in a.state_dict().values()) or not (a.base.features.std>0).all():raise ValueError('Invalid model tensors')
  def predict(self,sample,now_ms,*,window_tolerance_ms=0.):
   with torch.inference_mode():q=int(self.actor(encode(sample,now_ms=now_ms,window_tolerance_ms=window_tolerance_ms)).item())
   if not 5<=q<=268:raise ValueError('Invalid policy budget')
@@ -63,3 +80,4 @@ if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('--input',type=Path,default=Path(__file__).with_name('sample_input.json'));p.add_argument('--offline',action='store_true');a=p.parse_args()
  sample=json.loads(a.input.read_text(encoding='utf-8'))
  print(json.dumps(BasicPolicy().predict(sample,sample['timestamp_ms'] if a.offline else time.time()*1000),indent=2))
+

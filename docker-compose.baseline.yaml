@@ -1,0 +1,110 @@
+# _dgist BASELINE mode (.env DEMO_MODE=baseline, 2026-11-12): the same 1-cell COTS-UE stack with the GPU split by MIG
+#   l1   = the researchers' VANILLA cuBB 25-3 cuphycontroller (their tree ${BASELINE_TREE}, their build.aarch64, config_benetal, MPS)
+#          on the MIG 4g instance (72 SMs)  -> container dgist-l1   (no dApp hook, no green contexts, no FAPI-aware scheduler)
+#   yolo = NAIVE YOLO server: the stand-alone tenant of our tree with every scheduling feature off, one batch-3 FHD engine of .env VA_MODEL
+#          built for the MIG 3g instance (60 SMs) -> container dgist-yolo, agent TCP ${DAPP_AGENT_PORT} (the VA service connects as in Ours)
+#   gnb  = hsw OAI gNB, unchanged -> container dgist-gnb (no slicing xApp in this mode; all.sh skips it)
+# Needs: sudo -n scripts/mig.sh on (writes runs/mig.env with MIG_4G / MIG_3G); dgist.sh exports those for this file. Driven by ./dgist.sh.
+name: dgist
+
+services:
+  l1:
+    container_name: dgist-l1
+    image: ${AERIAL_IMAGE}
+    init: true
+    privileged: true
+    network_mode: host
+    ipc: host
+    userns_mode: host
+    shm_size: 4096m
+    ulimits:
+      memlock: -1
+    user: root
+    stdin_open: true
+    tty: true
+    env_file: .env
+    environment:
+      - cuBB_SDK=/opt/nvidia/cuBB
+      - RUN_NAME=${RUN_NAME:-manual}
+      - NVIDIA_VISIBLE_DEVICES=${MIG_4G}
+      - CUDA_VISIBLE_DEVICES=${MIG_4G}     # privileged containers see every MIG instance: CUDA must be pinned to the 4g one
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    devices:
+      - /dev/gdrdrv:/dev/gdrdrv
+    volumes:
+      - ${BASELINE_TREE}:/opt/nvidia/cuBB:ro
+      - ./config/baseline_cuphy_config:/opt/nvidia/cuBB/cuPHY-CP/cuphycontroller/config:ro   # the lab's config dir + cuphycontroller_baseline.yaml (mps_sm_pusch fitted to the 4g instance)
+      - ./scripts:/opt/dgist/scripts:ro
+      - ./runs:/opt/dgist/runs
+      - /dev/hugepages:/dev/hugepages
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+    command: ["bash", "/opt/dgist/scripts/l1_entrypoint_baseline.sh"]
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/dgist_l1_ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  yolo:
+    container_name: dgist-yolo
+    image: ${AERIAL_IMAGE}
+    init: true
+    privileged: true
+    network_mode: host
+    ipc: host
+    userns_mode: host
+    shm_size: 2048m
+    user: root
+    stdin_open: true
+    tty: true
+    env_file: .env
+    environment:
+      - cuBB_SDK=/opt/nvidia/cuBB
+      - RUN_NAME=${RUN_NAME:-manual}
+      - NVIDIA_VISIBLE_DEVICES=${MIG_3G}
+      - CUDA_VISIBLE_DEVICES=${MIG_3G}     # ... and the YOLO server to the 3g one
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - ./aerial-cuda-accelerated-ran:/opt/nvidia/cuBB
+      - ./scripts:/opt/dgist/scripts:ro
+      - ./runs:/opt/dgist/runs
+    command: ["bash", "/opt/dgist/scripts/yolo_entrypoint_baseline.sh"]
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/dgist_yolo_ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  gnb:
+    container_name: dgist-gnb
+    image: ${OAI_IMAGE}
+    cpuset: "${OAI_CPUSET}"
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
+    ipc: host
+    network_mode: host
+    stdin_open: true
+    tty: true
+    environment:
+      USE_ADDITIONAL_OPTIONS: --log_config.global_log_options level,nocolor,utc_time
+    volumes:
+      - ./config/gnb.conf:/opt/oai-gnb/etc/gnb.conf:ro
+      - ${FLEXRIC_SM_DIR:-/usr/local/lib/flexric}:/usr/local/lib/flexric:ro
+    depends_on:
+      l1:
+        condition: service_healthy
+      yolo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -c softmodem"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

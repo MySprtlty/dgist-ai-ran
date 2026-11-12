@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ue_sim.py - a COTS-UE stand-in for the VA service (2026-11-05). It does what the phone page does, without a camera or a radio:
 
-   POST /telemetry/start -> GET /clock_sync x10 -> N x POST /detect_frame (multipart: file, enable_yolo, ue_id, session_token)
+   POST /telemetry/start -> GET /clock_sync x10 -> N x POST /detect_frame (multipart: file, enable_yolo, ue_id, session_token, client_send_ms, clock_offset_ms)
    at R req/s with at most K frames in flight -> POST /save_latency_log (the same CSV the phone produces) -> POST /telemetry/stop
 
 Standard library only (runs with the system python3 or the venv). Self-signed certificate accepted.
@@ -123,7 +123,8 @@ def main():
         client_send_ms = time.time() * 1000.0
         e2e0 = time.perf_counter()
         try:
-            raw = h.post_multipart("/detect_frame", {"enable_yolo": "false" if a.no_yolo else "true", "ue_id": ue, "session_token": token},
+            raw = h.post_multipart("/detect_frame", {"enable_yolo": "false" if a.no_yolo else "true", "ue_id": ue, "session_token": token, "frame_id": str(frame_id),
+                                             "client_send_ms": f"{client_send_ms:.3f}", "clock_offset_ms": f"{offset_ms:.3f}"},   # viewer: UL on the server
                                    "frame.jpg", data)
         except HTTPError as e:
             msg = e.read().decode(errors="replace")[:200]

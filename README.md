@@ -7,6 +7,12 @@ hsw 연구실의 **OAI gNB(MAC 스케줄러 UL 개수-쿼터 + E2 agent 확장)*
 green context 기반 동적 SM 할당 + YOLO 추론 테넌트, xApp 인터페이스)** 를 한 디렉터리의 코드·빌드물·스크립트로 묶었다.
 nvidia 계정에서 `./dgist.sh up` / `./dgist.sh down` 으로 올리고 내린다. 코어망(Open5GS)은 이 호스트의 systemd 서비스를 그대로 쓴다.
 
+## Ours / Baseline 모드 (2026-11-12)
+
+`.env DEMO_MODE=ours|baseline`, 전환 `./all.sh mode <모드>`(스택 내린 뒤; MIG는 `sudo -n scripts/mig.sh on|off`). Baseline = 연구실 바닐라 cuBB 25-3을 MIG 4g에서,
+naive YOLO 서버(batch-3 FHD, 60 SM 고정, QoS·분할·모델 선택 없음)를 MIG 3g에서, xApp 없이. 파일: `docker-compose.baseline.yaml`,
+`scripts/l1_entrypoint_baseline.sh`, `scripts/yolo_entrypoint_baseline.sh`, `scripts/mig.sh`, `scripts/build_yolo_engines_mig.sh`. 자세한 표는 MANUAL.md.
+
 ## 1. 무엇이 어디서 도는가
 
 | 구성 요소 | 어디서 | 소스 / 빌드물 | 설정 |
@@ -32,6 +38,7 @@ _dgist/
 ├── xapp.sh                       hsw GPU-aware PPO 슬라이싱 xApp (rntis | start | stop | status | trace | dapp | moni) — xapp_ppo/README.md
 ├── all.sh                        전체 up | down | status (core → RIC → L1+gNB → VA → non-VA [→ xApp])
 ├── logs.sh                       읽기 쉬운 실시간 로그 (gnb | mac | l1 | dapp | va | nonva | ric | xapp | ppo | core | ue | all)
+├── dash.sh                       실험 대시보드 on/off (start | stop | status | logs | list | sim), http://10.150.21.161:8010/ — dash/README.md
 ├── ue_table.py                   UE 표: RNTI·IMSI·IP·서비스 (xapp.sh의 RNTI 자동 매핑에 사용)
 ├── .env                          모든 설정 (이미지, 빌드 디렉터리, 코어 수, dApp 파라미터, VA_* , RU/코어)
 ├── docker-compose.yaml           서비스 l1(dgist-l1), gnb(dgist-gnb)
@@ -41,6 +48,8 @@ _dgist/
 ├── docs/                         CHANGES_HSW_OAI.md, CHANGES_DGIST_AERIAL.md, patches/*.patch
 ├── runs/<이름>/                  실행 로그 (l1_console, phy_warn, l1_persec, phy_tail, dapp_tenant.log/csv, oai.log, l1_env.txt)
 ├── runs/va_service/              VA 서비스 uvicorn 로그 + pid;  runs/va_service_log/  세션별 지연 CSV (전화기·ue_sim·가상 UE)
+├── runs/dash/<이름>_<시각>/      대시보드 측정 기록 (replay.jsonl, summary, timeseries.csv, frames.csv, slots.csv.gz);  runs/dash_service/  서버 로그
+├── dash/                         실험 대시보드: 측정 시작/종료, 실시간 그래프(UE·서비스·GPU 슬롯·PRB·무선), Replay. 스택에 대해 읽기 전용, UE 망 차단 — dash/README.md
 ├── va_service/                   VA 서비스: hsw yolo_service(앱·인증서·텔레메트리·venv 8.4 GB) + dapp_backend.py (추론을 dApp RUN으로) — va_service/README.md
 ├── nonva_service/                non-VA 서비스: hsw video_stream_service 그대로(720p 20 fps 업로드 → /viewer 중계, 추론 없음), venv는 va_service 것 공유 — nonva_service/README.md
 ├── xapp_ppo/                     hsw PPO 묶음 복사: 6G 20입력(기본, YOLO 모델·SM을 우리 dApp에서 받음) + 19입력 GPU-util + venv 798 MB — xapp_ppo/README.md
@@ -85,6 +94,8 @@ _dgist/
 | `./xapp.sh rntis\|start\|stop\|status\|trace\|dapp` | hsw GPU-aware PPO 슬라이싱 xApp + dApp 피드 (`xapp_ppo/README.md`) |
 | `./all.sh up\|down\|status` | 전체를 순서대로 |
 | `./logs.sh <대상>` | 색·필터가 들어간 실시간 로그 (`--raw`로 원문) |
+| `./dash.sh start\|stop\|status\|logs\|list` | 실험 대시보드 on/off: PC에서 `http://10.150.21.161:8010/` → "측정 시작"(이름) / "측정 종료"(요약), 기록 `runs/dash/`, 같은 페이지에서 Replay. 스택과 따로 돈다 (`dash/README.md`) |
+| `./dash.sh sim [ours\|baseline\|stop]` | 연습용 인스턴스(포트 8011): 가짜 숫자로 같은 화면·측정·Replay |
 | `./core.sh config\|diff\|install-config\|build\|subs` | 코어 설정 복사본·소스 빌드·가입자 목록 (sudo) |
 | `./dgist.sh build-l1 [타겟]` | 임시 Aerial 컨테이너에서 `ninja` 증분 빌드 (`FULL=1` 재구성 약 1시간, `ALL_CPUS=1` 전체 코어; 기본은 `BUILD_CPUS`=0-3,65-71) |
 | `./dgist.sh build-oai` | `openairinterface5g/`로 gNB 이미지 재빌드 (11코어 약 8분; `ALL_CPUS=1` 가능) |
@@ -99,7 +110,7 @@ cd /home/nvidia/_dgist
 ./va.sh start                     # VA 서비스 (전화기 → 4K 프레임 → dApp RUN → reply): agent connected 가 보이면 정상
 ./nonva.sh start                  # non-VA 서비스 (다른 전화기의 라이브 스트리밍, 추론 없음) - hsw 두-슬라이스 실험 구도(ue1 VA, ue2 non-VA)
 #   전화기를 켜서 붙인다. 확인: ./dgist.sh ue   (RRCSetupComplete, PDU session 카운트)
-#   전화기 브라우저 https://10.45.0.1:8000/ → UE1 선택 → Start Camera → Start VA (Stop VA에서 CSV 저장: runs/va_service_log/)
+#   전화기 브라우저 https://10.45.0.1:8000/ → UE1 선택 → Start Camera 또는 Video File(폰에 저장된 동영상) → Start VA (Stop VA에서 CSV 저장: runs/va_service_log/)
 ./va.sh test ue1 25 5             # 전화기 없이 경로 확인: 25/25 success, QoS met 100 %, dApp sm 80 / inf 약 33 ms 이면 정상
 ./dgist.sh test 26x 2 15          # dApp 자체: sm 80, 서버 약 38 ms 이면 정상
 ./dgist.sh status                 # VA 서비스 줄 포함; 자세히는 ./va.sh status
@@ -111,7 +122,7 @@ FlexRIC xApp까지 쓰려면 nearRT-RIC → `up` → xApp 순서 (`aerial-cuda-a
 ## 6. 로그 (`runs/<이름>/`)
 
 `entrypoint.log`(기동/정지 단계), `l1_console.log`(cuphycontroller 콘솔), `phy_warn.log`(WRN/ERR/FATAL·Err.ind·CONFIG/START·RACH 발췌), `l1_persec.log`(cell 0 초당 DL/UL 줄),
-`phy_tail.log`(nvlog 마지막 200만 줄), `dapp_tenant.log`·`dapp_tenant_slots.csv`(테넌트·슬롯별 SM 기록), `oai.log`(gNB 전체 로그), `l1_env.txt`, `compose_up.log`.
+`phy_tail.log`(nvlog 마지막 200만 줄), `dapp_tenant.log`·`dapp_tenant_slots.csv`(테넌트·슬롯별 SM 기록: YOLO에 제공된 틈 `gap_P/gap_N`, 추론 중 점유 SM `run_cls`, 큐, 벽시계; `./dgist.sh slotmap <name>`으로 GPU Slot Map 영상), `oai.log`(gNB 전체 로그), `l1_env.txt`, `compose_up.log`.
 정상: Err.ind 0, FATAL 0. 시작 직후 WRN 2건 "Incorrect msg length"(OAI CONFIG/START.request가 8바이트 긴 것)와 "YAML invalid key: ul_*" 5건은 무해하다.
 
 ## 7. 빌드

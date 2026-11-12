@@ -5,13 +5,16 @@ to /viewer/<ue> (/video_feed); UL latency per frame -> CSV at /stop_session; tel
 DGIST changes: the capture settings come from the environment with the hsw values as defaults (NONVA_WIDTH 1280, NONVA_HEIGHT 720,
 NONVA_FPS 20, NONVA_JPEG_QUALITY 0.80, NONVA_VIEWER_FPS 20), the page JS constants are filled by the server, the CSV directory is
 <_dgist>/runs/nonva_service_log (NONVA_LOG_DIR), service_common/ lives next to this file, GET /nonva/status added. Run: nonva.sh start
+2026-11-12: the phone page can take a video file stored on the phone as the source instead of the camera (frames scaled to
+NONVA_WIDTH x NONVA_HEIGHT, aspect kept; read locally, nothing is downloaded) and has a full-screen button.
 (uvicorn app:app --host 0.0.0.0 --port 8001 --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt). Original: upstream_hsw/app.py
 """
 from fastapi import (
     FastAPI,
     File,
     Form,
-    UploadFile
+    UploadFile,
+    Request
 )
 
 from fastapi.responses import (
@@ -60,6 +63,21 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # ./service_common (hsw module, unchanged)
 from service_common.service_telemetry import attach_telemetry
 telemetry = attach_telemetry(app, 'nonva')
+
+# ---- DGIST measurement dashboard feed (dash/dash_server.py, 2026-11-12): one event per uploaded frame in a ring the dashboard
+# polls from this host (GET /metrics/frames?since=N, loopback only: nothing of it travels over the cell).
+import threading
+DASH_RING = deque(maxlen=int(os.environ.get("NONVA_DASH_RING", "8000") or 8000))
+_dash_lock = threading.Lock()
+_dash_seq = 0
+
+
+def dash_event(ev):
+    global _dash_seq
+    with _dash_lock:
+        _dash_seq += 1
+        ev["s"] = _dash_seq
+        DASH_RING.append(ev)
 
 # GPU-wide telemetry only; never used for scheduling or latency/TP calculation.
 # Match the VA service's default physical GPU and CSV column names.
@@ -219,6 +237,46 @@ video {
     background: black;
 }
 
+/* DGIST 2026-11-12: #stage is the element that goes full screen (the video fills the screen, aspect kept) */
+#stage {
+    position: relative;
+}
+
+#stage:fullscreen {
+    width: 100vw;
+    height: 100vh;
+    background: black;
+}
+
+#stage:fullscreen video {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    object-fit: contain;
+}
+
+#fsExit {
+    display: none;
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 5;
+    margin: 0;
+    padding: 6px 12px;
+    font-size: 16px;
+    color: white;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    border-radius: 6px;
+}
+
+#stage:fullscreen #fsExit {
+    display: block;
+}
+
 button {
     font-size: 18px;
     margin: 5px;
@@ -255,11 +313,19 @@ __NONVA_WIDTH__x__NONVA_HEIGHT__ / __NONVA_FPS__ FPS / JPEG Quality __NONVA_JPEG
      Camera
      ================================================= -->
 
+<div id="stage">
+
 <video id="camera"
        autoplay
        playsinline
        muted>
 </video>
+
+<button id="fsExit" onclick="exitFullscreen()">
+    Exit Full Screen
+</button>
+
+</div>
 
 
 <canvas id="captureCanvas"
@@ -280,7 +346,20 @@ __NONVA_WIDTH__x__NONVA_HEIGHT__ / __NONVA_FPS__ FPS / JPEG Quality __NONVA_JPEG
 
 
 <button onclick="stopCamera()">
-    Stop Camera
+    Stop Camera / Video
+</button>
+
+
+<!-- DGIST 2026-11-12: a video file stored on this phone as the source instead of the camera (read locally, nothing is downloaded) -->
+<button onclick="pickVideoFile()">
+    Video File
+</button>
+
+<input type="file" id="videoFile" accept="video/*" style="display:none;" onchange="onVideoFilePicked(this)">
+
+
+<button onclick="enterFullscreen()">
+    Full Screen
 </button>
 
 
@@ -327,7 +406,7 @@ __NONVA_WIDTH__x__NONVA_HEIGHT__ / __NONVA_FPS__ FPS / JPEG Quality __NONVA_JPEG
      ================================================= -->
 <div class="info-box">
 <h2>Non-VA Service Traffic</h2>
-<p>Camera Resolution: <strong id="resolution">-</strong></p>
+<p>Camera / Video Resolution: <strong id="resolution">-</strong></p>
 <p>UL JPEG Frame Size: <strong id="frameSize">-</strong></p>
 <p>Actual FPS: <strong id="sendFPS">-</strong></p>
 <p>UL Payload Rate: <strong id="ulRate">-</strong></p>
@@ -617,10 +696,137 @@ async function synchronizeClocks() {
 }
 
 // =====================================================
+// DGIST 2026-11-12: video-file source + full screen
+// A video file stored on the phone replaces the camera as the picture source. It is read locally through a blob: URL - nothing is
+// downloaded. The send timer, in-flight gate, upload and logs are the ones of the camera mode. Every frame of a file is scaled
+// (aspect kept, black bars) to CAMERA_WIDTH x CAMERA_HEIGHT (.env NONVA_WIDTH/HEIGHT, the size the camera is asked for), so the
+// uplink load stays the one this service is configured for; the camera mode sends the camera's native frame as before.
+// =====================================================
+
+let fileUrl = null;            // blob: URL of the chosen video file; null = no file source
+let wakeLock = null;
+let wakeLockPending = false;
+
+function sourceReady() { return stream !== null || fileUrl !== null; }
+
+// aspect-preserving fit of sw x sh into dw x dh, centred
+function fitRect(sw, sh, dw, dh) {
+    const s = Math.min(dw / sw, dh / sh), w = Math.round(sw * s), h = Math.round(sh * s);
+    return { x: Math.floor((dw - w) / 2), y: Math.floor((dh - h) / 2), w: w, h: h };
+}
+
+function pickVideoFile() {
+    const input = document.getElementById("videoFile");
+    input.value = "";            // choosing the same file again must fire "change" too
+    input.click();
+}
+
+async function onVideoFilePicked(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+
+    await stopCamera();          // ends a running stream (log saved) and releases the previous source, camera or file
+
+    const video = document.getElementById("camera");
+    const url = URL.createObjectURL(file);
+    try {
+        video.loop = true;
+        video.muted = true;
+        video.src = url;
+        await video.play();
+        if (video.videoWidth === 0 || video.videoHeight === 0) throw new Error("no video track");
+    } catch (error) {
+        console.error(error);
+        video.pause(); video.loop = false; video.removeAttribute("src"); video.load();
+        URL.revokeObjectURL(url);
+        document.getElementById("status").innerText = "Video Error";
+        alert("Cannot play this video file: " + (error && (error.message || error)));
+        return;
+    }
+
+    fileUrl = url;
+    document.getElementById("resolution").innerText =
+        video.videoWidth + " x " + video.videoHeight + " (file " + file.name + ") -> " + CAMERA_WIDTH + " x " + CAMERA_HEIGHT + " sent";
+    document.getElementById("status").innerText = "Video Ready";
+    wakeLockUpdate();
+}
+
+// true when a file source was released
+function releaseVideoFile() {
+    if (fileUrl === null) return false;
+    const video = document.getElementById("camera");
+    video.pause(); video.loop = false; video.removeAttribute("src"); video.load();
+    URL.revokeObjectURL(fileUrl);
+    fileUrl = null;
+    document.getElementById("resolution").innerText = "-";
+    wakeLockUpdate();
+    return true;
+}
+
+function fullscreenOn() { return (document.fullscreenElement || document.webkitFullscreenElement || null) !== null; }
+
+async function enterFullscreen() {
+    const stage = document.getElementById("stage");
+    try {
+        if (stage.requestFullscreen) await stage.requestFullscreen({ navigationUI: "hide" });
+        else if (stage.webkitRequestFullscreen) stage.webkitRequestFullscreen();
+        else throw new Error("not supported by this browser");
+    } catch (error) {
+        alert("Cannot enter full screen: " + (error && (error.message || error)));
+        return;
+    }
+    // a file is sent as a frame of a fixed shape: turn the screen to it (the camera mode follows the phone's own rotation)
+    if (fileUrl !== null && screen.orientation && screen.orientation.lock) {
+        try { await screen.orientation.lock(CAMERA_WIDTH >= CAMERA_HEIGHT ? "landscape" : "portrait"); } catch (e) {}
+    }
+}
+
+function exitFullscreen() {
+    if (!fullscreenOn()) return;
+    if (document.exitFullscreen) document.exitFullscreen(); else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+}
+
+function onFullscreenChange() {
+    if (!fullscreenOn() && screen.orientation && screen.orientation.unlock) { try { screen.orientation.unlock(); } catch (e) {} }
+    wakeLockUpdate();
+}
+document.addEventListener("fullscreenchange", onFullscreenChange);
+document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+
+// the screen stays on while a file plays or the picture is full screen (best effort; the camera mode outside full screen is as before)
+function wakeLockWanted() { return (fileUrl !== null || fullscreenOn()) && document.visibilityState === "visible"; }
+async function wakeLockUpdate() {
+    if (!navigator.wakeLock || wakeLockPending) return;
+    wakeLockPending = true;
+    try {
+        if (wakeLockWanted() && wakeLock === null) {
+            const lock = await navigator.wakeLock.request("screen");
+            lock.addEventListener("release", () => { if (wakeLock === lock) wakeLock = null; });
+            wakeLock = lock;
+        }
+        if (!wakeLockWanted() && wakeLock !== null) { const lock = wakeLock; wakeLock = null; await lock.release(); }
+    } catch (e) {}
+    wakeLockPending = false;
+}
+document.addEventListener("visibilitychange", () => {
+    wakeLockUpdate();
+    if (document.visibilityState === "visible" && fileUrl !== null) {     // a file paused while the page was hidden plays on
+        const video = document.getElementById("camera");
+        if (video.paused) video.play().catch(() => {});
+    }
+});
+
+
+// =====================================================
 // Start Camera
 // =====================================================
 
 async function startCamera() {
+
+    if (fileUrl !== null) {
+
+        await stopCamera();      // DGIST: from the file source back to the camera (ends a running stream, releases the file)
+    }
 
     if (stream !== null) {
 
@@ -730,11 +936,15 @@ async function stopCamera() {
         "camera"
     ).srcObject = null;
 
+    const wasFile = releaseVideoFile();      // DGIST: the file source, if that was the source
+
 
     document.getElementById(
         "status"
     ).innerText =
-        "Camera Stopped";
+        wasFile
+        ? "Video Stopped"
+        : "Camera Stopped";
 }
 
 
@@ -753,13 +963,19 @@ async function startStreaming() {
     let clockSyncDurationMs = 0;
     let sessionStartDurationMs = 0;
 
-    if (stream === null) {
+    if (!sourceReady()) {
 
         alert(
-            "Please start the camera first."
+            "Please start the camera or choose a video file first."
         );
 
         return;
+    }
+
+    if (fileUrl !== null) {      // DGIST: a file that was paused (page in the background) plays again
+
+        const fileVideo = document.getElementById("camera");
+        if (fileVideo.paused) { try { await fileVideo.play(); } catch (e) {} }
     }
 
 
@@ -1055,6 +1271,13 @@ async function stopStreaming() {
         ).innerText =
             "Camera Ready";
 
+    } else if (fileUrl !== null) {
+
+        document.getElementById(
+            "status"
+        ).innerText =
+            "Video Ready";
+
     } else {
 
         document.getElementById(
@@ -1120,21 +1343,37 @@ async function captureAndSend() {
     // Capture Camera Frame
     // =====================================================
 
-    canvas.width =
-        video.videoWidth;
+    if (fileUrl !== null) {
+
+        // DGIST file source: CAMERA_WIDTH x CAMERA_HEIGHT, aspect kept, black bars
+        const fit = fitRect(video.videoWidth, video.videoHeight, CAMERA_WIDTH, CAMERA_HEIGHT);
+
+        canvas.width = CAMERA_WIDTH;
+        canvas.height = CAMERA_HEIGHT;
+
+        context.fillStyle = "black";
+        context.fillRect(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
+        context.imageSmoothingQuality = "high";
+        context.drawImage(video, fit.x, fit.y, fit.w, fit.h);
+
+    } else {
+
+        canvas.width =
+            video.videoWidth;
 
 
-    canvas.height =
-        video.videoHeight;
+        canvas.height =
+            video.videoHeight;
 
 
-    context.drawImage(
-        video,
-        0,
-        0,
-        canvas.width,
-        canvas.height
-    );
+        context.drawImage(
+            video,
+            0,
+            0,
+            canvas.width,
+            canvas.height
+        );
+    }
 
 
     // =================================================
@@ -1807,6 +2046,7 @@ async def upload_frame(
     upload_start_ms: float = Form(...),
     session_id: str = Form(...),
     session_token: str = Form(...),
+    request: Request = None,
 ):
     session = get_session(session_id)
     try:
@@ -1828,6 +2068,13 @@ async def upload_frame(
                          frame_size, server_receive_ms)
     else:
         telemetry.result(session_id, session_token, frame_id, success=False)
+    try:   # DGIST dashboard feed
+        dash_event({"k": "f", "t": server_receive_ms, "ue": session_id, "fid": frame_id,
+                    "ip": request.client.host if request is not None and request.client else None,
+                    "ul": ul_latency_ms if math.isfinite(raw_ul_latency_ms) and -5 <= raw_ul_latency_ms <= 60000 else None,
+                    "kb": frame_size / 1024.0})
+    except Exception:
+        pass
     # Existing definition: E2E is a provisional UL-only estimate.
     e2e_latency_ms = ul_latency_ms
     session.latest_ul_latency_ms = ul_latency_ms
@@ -1932,6 +2179,17 @@ async def receiver_stats(session_id: str):
         "clock_offset_ms": session.clock_offset_ms,
         "sync_rtt_ms": session.sync_rtt_ms,
     }
+
+
+@app.get("/metrics/frames")
+async def metrics_frames(request: Request, since: int = 0):
+    """DGIST dashboard feed: the events after sequence number `since` (served to this host only)"""
+    if request.client is None or request.client.host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="local only")
+    with _dash_lock:
+        ev = [e for e in DASH_RING if e["s"] > since]
+        seq = _dash_seq
+    return {"service": "nonva", "seq": seq, "t": time.time_ns() / 1e6, "ev": ev}
 
 
 # =====================================================

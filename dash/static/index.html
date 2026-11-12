@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-RAN 실험 대시보드</title>
+<link rel="preload" href="/static/fonts/PretendardVariable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo"><svg viewBox="0 0 18 18" fill="none"><path d="M2 12.5 6.2 7l3.3 3.6L12.6 5 16 9.5" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+    <span>AI-RAN 실험 대시보드</span>
+  </div>
+  <span class="badge" id="modeBadge">연결 중</span>
+  <span class="badge sim" id="simBadge" hidden>SIMULATION · 가상 데이터</span>
+  <div class="syschips" id="sysChips"></div>
+  <div class="spacer"></div>
+  <div class="recind" id="recInd" hidden><span class="dot"></span><span class="nm" id="recName"></span><span class="tm" id="recTime"></span></div>
+  <button class="btn primary" id="recBtn">측정 시작</button>
+  <button class="iconbtn" id="themeBtn" title="밝은 / 어두운 테마" aria-label="테마 전환"><svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M10 3a7 7 0 0 0 0 14z" fill="currentColor"/></svg></button>
+  <button class="iconbtn" id="fsBtn" title="전체 화면" aria-label="전체 화면"><svg viewBox="0 0 20 20" fill="none"><path d="M3.5 8V3.5H8M12 3.5h4.5V8M16.5 12v4.5H12M8 16.5H3.5V12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+</header>
+<nav class="tabs" id="tabs">
+  <button class="tabbtn on" data-tab="ov">종합</button>
+  <button class="tabbtn" data-tab="va">VA 서비스</button>
+  <button class="tabbtn" data-tab="nv">Non-VA 서비스</button>
+  <button class="tabbtn" data-tab="gpu">GPU · 슬롯</button>
+  <button class="tabbtn" data-tab="radio">무선 · 슬라이싱</button>
+  <button class="tabbtn" data-tab="rec">기록 · Replay</button>
+  <div class="ctls">
+    <span class="lab">그래프 값</span>
+    <div class="seg" id="segVal"><button data-v="cum">누적 평균</button><button data-v="inst">순간값</button><button data-v="both" class="on">둘 다</button></div>
+    <span class="lab">구간</span>
+    <div class="seg" id="segWin"><button data-v="all" class="on">전체</button><button data-v="300">5분</button><button data-v="60">1분</button></div>
+  </div>
+</nav>
+<div class="replaybar" id="replayBar" hidden>
+  <span class="badge replay" style="background:var(--blue);color:#fff">REPLAY</span>
+  <span class="nm" id="rpName"></span>
+  <button class="rbtn" id="rpPlay" aria-label="재생 / 일시정지"></button>
+  <input type="range" id="rpSeek" min="0" max="100" step="0.1" value="0" aria-label="재생 위치">
+  <span id="rpTime">00:00 / 00:00</span>
+  <div class="seg" id="rpSpeed"><button data-v="1" class="on">1×</button><button data-v="2">2×</button><button data-v="4">4×</button><button data-v="8">8×</button></div>
+  <button class="x" id="rpSummary">요약</button>
+  <button class="x" id="rpClose">실시간으로 돌아가기</button>
+</div>
+<main>
+  <section class="tabpage on" id="tab-ov"></section>
+  <section class="tabpage" id="tab-va"></section>
+  <section class="tabpage" id="tab-nv"></section>
+  <section class="tabpage" id="tab-gpu"></section>
+  <section class="tabpage" id="tab-radio"></section>
+  <section class="tabpage" id="tab-rec"></section>
+</main>
+<div id="modalHost"></div>
+<div class="offline tag bad" id="offline" hidden>서버 연결 끊김 · 재연결 중</div>
+<script src="/static/js/util.js"></script>
+<script src="/static/js/charts.js"></script>
+<script src="/static/js/views.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

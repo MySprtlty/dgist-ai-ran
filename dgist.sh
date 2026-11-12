@@ -11,6 +11,7 @@
 #   ue [name]        UE attach phases from the gNB log (live container, else runs/<name>/oai.log)
 #   test [model] [req/s] [seconds]   xApp smoke test: ra_stub.py inside dgist-l1 sends JPEGs of the .env DAPP_INPUT profile (img4k / imgfhd) to the agent (default 26x 2 15)
 #   check            host prechecks only
+#   slotmap <name> [render options]   GPU slot-map video from runs/<name>/dapp_tenant_slots.csv -> runs/<name>/slotmap.mp4 (tools/slotmap_render.py --help)
 #   core up|down|status              Open5GS + UE NAT (sudo)                                         = ./core.sh
 #   va start|stop|status|test|...    VA service: phone frames -> RUN to the dApp -> reply (va_service/) = ./va.sh
 #   nonva start|stop|status|test     non-VA live-streaming service of the other phone (nonva_service/, no inference) = ./nonva.sh
@@ -21,12 +22,20 @@
 #   build-l1 [ninja targets]         incremental build of ./aerial-cuda-accelerated-ran/$BUILD_DIR in a throwaway Aerial container (FULL=1 reconfigures)
 #   build-oai                        rebuild $OAI_IMAGE from ./openairinterface5g
 # settings: .env | env: NO_CORE=1 (skip the Open5GS check), ALL_CPUS=1 (builds on every core)
+# modes (.env DEMO_MODE, 2026-11-12): ours = this L1 on the whole GPU (default) | baseline = the researchers' vanilla cuBB 25-3 on MIG 4g + a naive
+#   YOLO server on MIG 3g (docker-compose.baseline.yaml, containers dgist-l1 + dgist-yolo); switch with ./all.sh mode baseline|ours (MIG: sudo -n scripts/mig.sh)
 set -u
 [ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
-CL=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80}; [ "${DAPP_INPUT:-4k}" = fhd ] && CL=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80}   # dApp SM classes of the input profile
-OUT=$D/runs; CUR=$OUT/current_run; L1C=dgist-l1; GNBC=dgist-gnb; PHYLOG=/tmp/phy.log; T=$D/aerial-cuda-accelerated-ran; mkdir -p $OUT
+CL=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80}; [ "${DAPP_INPUT:-4k}" = fhd ] && CL=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}   # dApp SM classes of the input profile
+OUT=$D/runs; CUR=$OUT/current_run; L1C=dgist-l1; GNBC=dgist-gnb; YOLOC=dgist-yolo; PHYLOG=/tmp/phy.log; T=$D/aerial-cuda-accelerated-ran; mkdir -p $OUT
+MODE=${DEMO_MODE:-ours}; COMPOSE="docker compose"
+if [ "$MODE" = baseline ]; then   # vanilla cuBB on MIG 4g + naive YOLO on MIG 3g (docker-compose.baseline.yaml needs MIG_4G / MIG_3G from runs/mig.env)
+  [ -f $OUT/mig.env ] && { set -a; . $OUT/mig.env; set +a; }
+  export BASELINE_TREE=${BASELINE_TREE:-/home/nvidia/hsw/25_3_hsw/aerial-cuda-accelerated-ran} BASELINE_L1_CONFIG=${BASELINE_L1_CONFIG:-baseline} BASELINE_YOLO_SM=${BASELINE_YOLO_SM:-auto} MIG_4G=${MIG_4G:-} MIG_3G=${MIG_3G:-}
+  COMPOSE="docker compose -f docker-compose.baseline.yaml"
+elif [ "$MODE" != ours ]; then echo "!! .env DEMO_MODE=$MODE unknown (ours|baseline)"; exit 2; fi
 cmd=${1:-status}
 c_up() { [ "$(docker inspect -f '{{.State.Running}}' $1 2>/dev/null)" = true ]; }
 in_l1() { docker exec $L1C bash -c "$1" 2>/dev/null; }
@@ -41,18 +50,27 @@ check() {
   local ok=1 kv m im other rp apps hp
   docker compose version > /dev/null 2>&1 || { echo "!! docker compose v2 missing"; ok=0; }
   nvidia-smi -L > /dev/null 2>&1 || { echo "!! no GPU visible"; ok=0; }
-  [ "$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null)" = Disabled ] || { echo "!! GPU MIG mode is not Disabled"; ok=0; }
   for im in $AERIAL_IMAGE $OAI_IMAGE; do docker image inspect $im > /dev/null 2>&1 || { echo "!! image $im missing ($0 build-oai builds the gNB image)"; ok=0; }; done
+  if [ "$MODE" = baseline ]; then
+    nvidia-smi -L 2>/dev/null | grep -q 'MIG 4g' && nvidia-smi -L 2>/dev/null | grep -q 'MIG 3g' || { echo "!! baseline needs the MIG 4g + 3g instances: sudo -n scripts/mig.sh on"; ok=0; }
+    [ -n "$MIG_4G" ] && [ -n "$MIG_3G" ] || { echo "!! runs/mig.env lacks MIG_4G / MIG_3G (sudo -n scripts/mig.sh on)"; ok=0; }
+    [ -r $BASELINE_TREE/build.aarch64/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf ] || { echo "!! vanilla L1 binary missing/unreadable: $BASELINE_TREE/build.aarch64/.../cuphycontroller_scf (.env BASELINE_TREE)"; ok=0; }
+    [ -r $D/config/baseline_cuphy_config/cuphycontroller_$BASELINE_L1_CONFIG.yaml ] || { echo "!! config/baseline_cuphy_config/cuphycontroller_$BASELINE_L1_CONFIG.yaml missing (copy of the lab config dir + the fitted yaml)"; ok=0; }
+    [ -x $T/$BUILD_DIR/cuPHY-CP/dapp_hook/dapp_tenant_main ] || { echo "!! $BUILD_DIR/cuPHY-CP/dapp_hook/dapp_tenant_main missing ($0 build-l1)"; ok=0; }
+    ls $T/cuPHY-CP/dapp_hook/models/migfhd26${VA_MODEL#26}/seg00_sm*.engine > /dev/null 2>&1 || { echo "!! Baseline engine models/migfhd26${VA_MODEL#26}/seg00_sm<N>.engine missing (scripts/build_yolo_engines_mig.sh ${VA_MODEL#26} after MIG on)"; ok=0; }
+  else
+  [ "$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null)" = Disabled ] || { echo "!! GPU MIG mode is not Disabled (./all.sh mode ours / sudo -n scripts/mig.sh off)"; ok=0; }
   [ -x $T/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf ] || { echo "!! L1 binary $BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf missing ($0 build-l1)"; ok=0; }
   for kv in SCF_FAPI_10_04:BOOL=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH:BOOL=OFF SCF_FAPI_10_04_SRS:BOOL=ON ENABLE_DAPP_HOOK:BOOL=ON; do grep -q "^$kv\$" $T/$BUILD_DIR/CMakeCache.txt 2>/dev/null || { echo "!! $BUILD_DIR/CMakeCache.txt: expected $kv (validated FAPI wire layout + dApp hook)"; ok=0; }; done
   ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26
   for m in n s m l x; do [ -e $T/cuPHY-CP/dapp_hook/models/$ESET$m/seg00_sm${CL##*,}.engine ] || { echo "!! YOLO engine models/$ESET$m/seg00_sm${CL##*,}.engine missing (DAPP_INPUT=${DAPP_INPUT:-4k}: scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; ok=0; }; done
+  fi
   want=3840x2160; [ "${DAPP_INPUT:-4k}" = fhd ] && want=1920x1080; have=${VA_CAMERA_WIDTH:-3840}x${VA_CAMERA_HEIGHT:-2160}
   [ "$have" = "$want" ] || echo "   note: DAPP_INPUT=${DAPP_INPUT:-4k} expects $want frames but .env VA_CAMERA_WIDTH/HEIGHT = $have (such frames still run, whole-image views only)"
   [ -f $D/config/cuphycontroller_$L1_CONFIG.yaml ] && [ -f $D/config/l2_adapter_$L1_CONFIG.yaml ] && [ -f $D/config/gnb.conf ] || { echo "!! config/ files missing (cuphycontroller_$L1_CONFIG.yaml, l2_adapter_$L1_CONFIG.yaml, gnb.conf)"; ok=0; }
-  other=$(docker ps --format '{{.Names}}' | grep -E '^(nv-cubb|oai-gnb.*|dgist-l1|dgist-gnb)$' | tr '\n' ' '); [ -z "$other" ] || { echo "!! L1/gNB container(s) running: $other - stop that stack first (never two L1s on this GPU/NIC)"; ok=0; }
+  other=$(docker ps --format '{{.Names}}' | grep -E '^(nv-cubb|oai-gnb.*|dgist-l1|dgist-gnb|dgist-yolo)$' | tr '\n' ' '); [ -z "$other" ] || { echo "!! L1/gNB container(s) running: $other - stop that stack first (never two L1s on this GPU/NIC)"; ok=0; }
   rp=$(ran_procs); [ -z "$rp" ] || { echo "!! RAN processes alive: $rp"; ok=0; }
-  mps_on && echo "   note: an MPS server is running; the L1 entrypoint stops it (green contexts need MPS off)"
+  [ "$MODE" = ours ] && mps_on && echo "   note: an MPS server is running; the L1 entrypoint stops it (green contexts need MPS off)"
   apps=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v nvidia-cuda-mps-server | grep -c .); [ "$apps" = 0 ] || echo "!! $apps other process(es) on the GPU: $(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | tr '\n' ' ')"
   hp=$(awk '/HugePages_Free/{print $2}' /proc/meminfo); [ "${hp:-0}" -ge 20 ] || echo "!! only ${hp:-0} hugepages free"
   pgrep -x ptp4l > /dev/null && pgrep -x phc2sys > /dev/null || { echo "!! ptp4l/phc2sys not running (PTP)"; ok=0; }
@@ -67,17 +85,23 @@ check() {
 
 case "$cmd" in
 check) check && echo "== ready: $0 up [name]" || { echo "== fix the !! lines first"; exit 1; } ;;
+slotmap)
+  NAME=${2:?run name}; shift 2; CSV=$OUT/$NAME/dapp_tenant_slots.csv; [ -f $CSV ] || CSV=$CSV.gz; [ -f $CSV ] || { echo "!! $OUT/$NAME/dapp_tenant_slots.csv missing (.env DAPP_SLOT_CSV=1 and a finished run)"; exit 1; }
+  PY=$D/va_service/yolo_env/bin/python; [ -x $PY ] || PY=python3   # Pillow + cv2 live in the VA venv (scripts/setup_venvs.sh)
+  echo "== slot-map video: $CSV -> $OUT/$NAME/slotmap.mp4 $*"; $PY $T/cuPHY-CP/dapp_hook/tools/slotmap_render.py $CSV -o $OUT/$NAME/slotmap.mp4 --run $NAME "$@" ;;
 up)
   NAME=${2:-dgist_$(date +%m%d_%H%M)}; RUN=$OUT/$NAME
   [ -f $CUR ] && { echo "!! a run is registered as current ($(cat $CUR)): $0 down first"; exit 1; }
-  echo "== $NAME: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
+  if [ "$MODE" = baseline ]; then echo "== $NAME [BASELINE]: vanilla cuBB 25-3 L1 ($BASELINE_TREE, config $BASELINE_L1_CONFIG) on MIG 4g + naive YOLO ${VA_MODEL:-26x} (whole MIG 3g instance) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
+  else echo "== $NAME [OURS]: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"; fi
   check || { echo "precheck failed"; exit 1; }
   mkdir -p $RUN; echo "$NAME" > $CUR
-  echo "   docker compose up -d: the gNB starts once the L1 is healthy (L1 ready + dApp engines loaded + agent port open; up to ~10 min)"
-  RUN_NAME=$NAME docker compose up -d > $RUN/compose_up.log 2>&1; grep -E 'Healthy|Started|rror|unhealthy' $RUN/compose_up.log | sed 's/^/   /'
+  echo "   $COMPOSE up -d: the gNB starts once the L1 is healthy ($( [ "$MODE" = baseline ] && echo 'vanilla L1 ready + YOLO server port open' || echo 'L1 ready + dApp engines loaded + agent port open'); up to ~10 min)"
+  RUN_NAME=$NAME $COMPOSE up -d > $RUN/compose_up.log 2>&1; grep -E 'Healthy|Started|rror|unhealthy' $RUN/compose_up.log | sed 's/^/   /'
   c_up $L1C || { echo "!! L1 container is not running:"; tail -5 $RUN/l1_console.log 2>/dev/null; docker logs $L1C 2>&1 | tail -3; rm -f $CUR; exit 1; }
   c_up $GNBC || { echo "!! gNB container is not running (L1 unhealthy?): docker logs $L1C"; docker logs $L1C 2>&1 | tail -5; echo "   tear down with: $0 down"; exit 1; }
-  echo "   L1 + dApp ready $(date +%T) | $(docker logs $L1C 2>&1 | grep -E 'dApp tenant ready' | tail -1 | cut -c1-120)"
+  if [ "$MODE" = baseline ]; then echo "   vanilla L1 + naive YOLO ready $(date +%T) | $(docker logs $YOLOC 2>&1 | grep -E 'ready:' | tail -1 | cut -c1-120)"
+  else echo "   L1 + dApp ready $(date +%T) | $(docker logs $L1C 2>&1 | grep -E 'dApp tenant ready' | tail -1 | cut -c1-120)"; fi
   for i in $(seq 1 90); do gnb_started && break; c_up $GNBC || break; sleep 2; done
   gnb_started && echo "   cell 0 CONFIG/START done $(date +%T)" || echo "!! no START.request for cell 0 within 180 s ($0 logs gnb)"
   for i in $(seq 1 15); do docker logs $GNBC 2>&1 | grep -q NGSetupResponse && break; sleep 2; done
@@ -89,13 +113,14 @@ down)
   NAME=$(cat $CUR 2>/dev/null || echo stop_$(date +%m%d_%H%M)); RUN=$OUT/$NAME; mkdir -p $RUN
   echo "== down ($NAME) $(date +%T)"
   docker ps -a --format '{{.Names}}' | grep -qx $GNBC && docker logs $GNBC > $RUN/oai.log 2>&1
-  docker compose down -t 40 2>&1 | grep -E 'Stopped|Removed|rror' | sed 's/^/   /'
+  $COMPOSE down -t 40 2>&1 | grep -E 'Stopped|Removed|rror' | sed 's/^/   /'
+  for c in $L1C $GNBC $YOLOC; do docker ps -a --format '{{.Names}}' | grep -qx $c && { docker rm -f $c > /dev/null 2>&1 && echo "   removed leftover $c"; }; done   # a mode flipped while up
   rm -f $CUR
   echo "   L1 Err.ind $(grep -c 'Send Err.ind' $RUN/phy_warn.log 2>/dev/null), FATAL $(grep -c FATAL $RUN/phy_warn.log 2>/dev/null) | UE: $( [ -f $RUN/oai.log ] && ue_counts $RUN/oai.log ) | logs: $RUN"
   echo "   RAN processes now: $(rp=$(ran_procs); echo ${rp:-none}) | GPU: $(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader)"
   ;;
 status)
-  echo "containers: $(docker ps --format '{{.Names}}({{.Status}})' | grep -E 'dgist-|nv-cubb|oai-gnb' | tr '\n' ' ')"
+  echo "mode: $MODE$( [ "$MODE" = baseline ] && echo " (MIG 4g $MIG_4G / 3g $MIG_3G)") | containers: $(docker ps --format '{{.Names}}({{.Status}})' | grep -E 'dgist-|nv-cubb|oai-gnb' | tr '\n' ' ')"
   echo "RAN processes: $(rp=$(ran_procs); echo ${rp:-none}) | MPS: $(mps_on && echo ON || echo off) | Open5GS: $(core_up && echo up || echo down) | xApp agent port $DAPP_AGENT_PORT: $(port_open && echo open || echo closed) | current run: $(cat $CUR 2>/dev/null || echo none)"
   echo "GPU: $(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader)"
   if c_up $L1C; then echo "L1: Err.ind $(in_l1 "grep -c 'Send Err.ind' $PHYLOG") FATAL $(in_l1 "grep -c FATAL $PHYLOG") | cell 0: $(in_l1 "grep -E '\] Cell +0 \| DL' $PHYLOG | tail -1" | sed -E 's/.*(DL +[0-9.]+ Mbps).*(UL +[0-9.]+ Mbps +[0-9]+ Slots CRC +[0-9]+).*/\1 \2/') | dApp: $(in_l1 'grep -E "agent ok" /tmp/dapp_tenant.log | tail -1' | sed -E 's/.*(agent ok [0-9]+ fail [0-9]+ queue [0-9]+).*/\1/')"; fi
@@ -129,8 +154,9 @@ test)
   m=${2:-26x}; rate=${3:-2}; sec=${4:-15}
   port_open || { echo "xApp agent port $DAPP_AGENT_PORT closed - is the L1 running ($0 status)?"; exit 1; }
   IMGS=img4k; [ "${DAPP_INPUT:-4k}" = fhd ] && IMGS=imgfhd
-  echo "== xApp smoke test: model $m, $rate req/s, $sec s, JPEGs from models/$IMGS (DAPP_INPUT=${DAPP_INPUT:-4k}; closed loop, ra_stub.py inside $L1C)"
-  docker exec $L1C bash -c "cd /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/python && taskset -c 65-71 python3 ra_stub.py --images /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/models/$IMGS --rate $rate --duration $sec --policy fixed:$m --deadline-ms 1000 --max-inflight 1 --csv /tmp/ra_test.csv" 2>&1 | tail -12
+  echo "== xApp smoke test [$MODE]: model $m, $rate req/s, $sec s, JPEGs from models/$IMGS (DAPP_INPUT=${DAPP_INPUT:-4k}; closed loop, ra_stub.py inside $( [ "$MODE" = baseline ] && echo $YOLOC || echo $L1C))"
+  TC=$L1C; [ "$MODE" = baseline ] && TC=$YOLOC
+  docker exec $TC bash -c "cd /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/python && taskset -c 65-71 python3 ra_stub.py --images /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/models/$IMGS --rate $rate --duration $sec --policy fixed:$m --deadline-ms 1000 --max-inflight 1 --csv /tmp/ra_test.csv" 2>&1 | tail -12
   echo "   (FlexRIC xApp with the same RUN path: aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/xapp_flexric/README.md)"
   ;;
 core) bash $D/scripts/core.sh "${2:-status}" ;;
@@ -147,5 +173,5 @@ build-l1)
   docker run --rm --cpuset-cpus $CPUS -e BUILD_DIR=$BUILD_DIR -e FULL=${FULL:-0} -e JOBS=${JOBS:-} -v $T:/opt/nvidia/cuBB -v $D/scripts:/opt/dgist/scripts:ro -w /opt/nvidia/cuBB -u root $AERIAL_IMAGE bash /opt/dgist/scripts/build_l1.sh "$@" 2>&1 | tee $OUT/build_l1_$(date +%m%d_%H%M).log | tail -15
   ;;
 build-oai) [ "${ALL_CPUS:-0}" = 1 ] && export BUILD_CPUS=0-$(( $(nproc --all) - 1 )); bash $D/scripts/build_oai_image.sh ;;
-*) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

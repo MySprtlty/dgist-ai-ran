@@ -40,9 +40,21 @@ def main():
     ap.add_argument("--rntis", action="store_true", help="print VA_RNTIS=.. NONVA_RNTIS=.. for xapp.sh")
     ap.add_argument("--va-imsis", default=os.environ.get("VA_IMSIS", ""), help="comma list: the two VA phones' IMSIs (stable across re-attach)")
     ap.add_argument("--nonva-imsis", default=os.environ.get("NONVA_IMSIS", ""), help="comma list: the two non-VA phones' IMSIs")
-    ap.add_argument("--since", default="12 hours ago", help="journal window for the IMSI mapping")
+    ap.add_argument("--since", default=None, help="journal window for the IMSI mapping (default: since the running gNB container started, else 12 hours ago)")
     ap.add_argument("--window", type=int, default=3000, help="lines of each service log to classify UE IPs")
     a = ap.parse_args()
+    if a.since is None:
+        # RAN_UE_NGAP_IDs restart from 1 with every gNB run, so an older journal entry with the same id would mislabel a phone (seen 2026-11-12 after many restarts):
+        # look only at registrations since the running gNB container started
+        started = sh("docker inspect -f '{{.State.StartedAt}}' dgist-gnb 2>/dev/null").strip()
+        a.since = "12 hours ago"
+        if started:
+            try:
+                from datetime import datetime, timezone
+                t = datetime.fromisoformat(started.replace("Z", "+00:00")[:26] + "+00:00" if "." in started else started.replace("Z", "+00:00"))
+                a.since = t.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
 
     gnb = sh("docker logs --tail 20000 dgist-gnb 2>&1") or sh("sudo -n docker logs --tail 20000 dgist-gnb 2>&1")
     # gNB UE id -> RNTI (latest RRCSetupComplete per id), and the live stats line per RNTI

@@ -12,6 +12,7 @@
 #                                with a new RNTI (the lab xApp needs all four RNTIs it was started with; otherwise it HOLDs). The monitor
 #                                xApp, if running, is restarted too (its service labels are also start-time RNTIs).
 #   stop | restart | status | logs | trace [n]  (last n decisions with the dApp fields) | dapp (feed check) | compute (the compute file)
+#   moni power [SEC]                       per-UE UL power table (ue_power.py: RSRP, PCMAX, PH, UE Ptx, PRBs it can afford vs the grants it gets, MCS/BLER/SNR)
 #   moni [start|stop|status|logs] [VA NONVA]   the lab's read-only monitor xApp (xapp_ul_input_moni): per-second UE/service UL figures,
 #                                text log ./log/moni_log/; no sub-command = foreground (Ctrl-C). Runs beside the PPO xApp (both are RIC clients)
 # settings: .env PPO_BUNDLE_NAME, PPO_GPU_SOURCE (19-input bundle), PPO_DAPP, PPO_MIN_PRBS, FLEXRIC_BUILD, FLEXRIC_SM_DIR | logs: runs/xapp/
@@ -130,8 +131,9 @@ moni)   # the lab's read-only monitor xApp (MAC 142 + Slice 145): per-second UE/
     echo "   pid $(mpid) | $(grep -m1 'Text log' $MLOG | cut -c1-140) | follow: $0 moni logs  or  ./logs.sh moni" ;;
   stop) malive && { kill -TERM $(mpid) 2>/dev/null; sleep 2; kill -KILL $(mpid) 2>/dev/null; echo "   monitor stopped: $(grep 'Log saved' $R/moni.log 2>/dev/null | tail -1)"; } || echo "monitor not running"; rm -f $MPIDF ;;
   status) malive && echo "monitor: running (pid $(mpid)) | display log $(readlink -f $R/moni.log) | text log $(ls -t $D/log/moni_log/ul_input_*.log 2>/dev/null | head -1)" || echo "monitor: stopped"; ls -t $D/log/moni_log/*.log 2>/dev/null | head -3 | sed 's/^/   /' ;;
+  power) shift; [ -f $R/rntis.txt ] && . $R/rntis.txt; VA_RNTIS=${VA_RNTIS:-} NONVA_RNTIS=${NONVA_RNTIS:-} python3 $D/ue_power.py --watch ${1:-2} --log "${@:2}" ;;   # per-UE UL power picture (RSRP, PCMAX, PH, Ptx, affordable PRB vs grants, MCS/BLER/SNR), CSV -> log/moni_log/ue_power_*.csv
   logs) f=$(readlink -f $R/moni.log 2>/dev/null); [ -r "$f" ] || { echo "!! cannot read $f ($(stat -c %U "$f" 2>/dev/null)-owned - started with sudo? fix: sudo chown -R nvidia:nvidia $D/runs $D/log) or no monitor started yet ($0 moni start)"; exit 1; }; malive || echo "(monitor not running - showing the last log)"; tail -n 30 -f $f ;;
-  *) echo "usage: $0 moni [start|stop|status|logs] [VA1,VA2 NV1,NV2]   (no sub-command = foreground, Ctrl-C to stop)"; exit 2 ;;
+  *) echo "usage: $0 moni [start|stop|status|logs|power [SEC]] [VA1,VA2 NV1,NV2]   (no sub-command = foreground, Ctrl-C to stop; power = ue_power.py table every SEC s)"; exit 2 ;;
   esac ;;
 *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

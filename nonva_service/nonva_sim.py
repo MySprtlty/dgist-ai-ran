@@ -7,6 +7,7 @@
   python3 nonva_sim.py --ue ue1 --count 100 --fps 20 --image test_frames/hd_1280x720_q80.jpg
 """
 import argparse
+import http.client
 import json
 import ssl
 import statistics
@@ -14,17 +15,46 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
 
 CTX = ssl._create_unverified_context()
+CONN = {}
+
+
+class HTTPError(Exception):
+    def __init__(self, code, body):
+        super().__init__(f"HTTP {code}")
+        self.code, self.body = code, body
+
+    def read(self):
+        return self.body
 
 
 def do(url, data=None, headers=None, method=None, timeout=10.0):
-    req = Request(url, data=data, method=method or ("POST" if data is not None else "GET"), headers=headers or {})
-    with urlopen(req, context=CTX, timeout=timeout) as r:
-        return json.loads(r.read())
+    """one keep-alive connection per server, as a phone browser holds it. (Until 2026-11-12 this opened a connection per request; the service
+    then kept one socket open for every uploaded frame and ran out of file descriptors after about 1000 frames.)"""
+    p = urlsplit(url)
+    key = (p.scheme, p.netloc)
+    path = p.path + ("?" + p.query if p.query else "")
+    for attempt in (0, 1):
+        try:
+            c = CONN.get(key)
+            if c is None:
+                c = CONN[key] = (http.client.HTTPSConnection(p.hostname, p.port or 443, context=CTX, timeout=timeout) if p.scheme == "https"
+                                 else http.client.HTTPConnection(p.hostname, p.port or 80, timeout=timeout))
+            c.request(method or ("POST" if data is not None else "GET"), path, body=data, headers=headers or {})
+            r = c.getresponse()
+            body = r.read()
+            break
+        except (http.client.HTTPException, OSError):
+            c = CONN.pop(key, None)                 # the server closes an idle connection after a few seconds: reconnect once
+            if c is not None:
+                c.close()
+            if attempt:
+                raise
+    if r.status >= 400:
+        raise HTTPError(r.status, body)
+    return json.loads(body)
 
 
 def form(url, fields):
@@ -71,7 +101,7 @@ def main():
         s = form(f"{u}/start_session", {"clock_offset_ms": offset, "sync_rtt_ms": rtt, "ue_id": a.ue, "clock_sync_time_ms": sync_ms})
     except HTTPError as e:
         sys.exit(f"start_session failed ({e.code}): {e.read().decode()[:200]}  (is {a.ue} still streaming? stop it or use the other UE)")
-    except URLError as e:
+    except OSError as e:
         sys.exit(f"cannot reach {u}: {e}")
     sid, tok = s["session_id"], s["session_token"]
     form(f"{u}/startup_metrics", {"session_id": sid, "session_token": tok, "session_start_time_ms": 5.0, "total_startup_time_ms": sync_ms + 5.0})
@@ -91,7 +121,7 @@ def main():
             ul.append(float(r["ul_latency_ms"]))
             if not a.quiet and (i % 20 == 0 or i == 1):
                 print(f"[{a.ue}] #{i:4d} ul {r['ul_latency_ms']:.1f} ms")
-        except (HTTPError, URLError, OSError) as e:
+        except (HTTPError, http.client.HTTPException, OSError, ValueError) as e:
             errors += 1
             if errors <= 3:
                 print(f"[{a.ue}] #{i} error: {e}")

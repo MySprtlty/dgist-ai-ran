@@ -3,6 +3,8 @@
 #   The phone (COTS UE) opens https://10.45.0.1:8000/ and sends 4K camera frames at 5 req/s per UE; this service forwards every frame
 #   as one RUN request (model 26x, QoS deadline 200 ms) to the dApp agent inside the L1 container (TCP 9810) and returns the agent's
 #   reply (result figures + detections) to the phone, which draws the boxes and logs the UL / AI / DL latency split.
+#   Base-station viewer (2026-11-11): https://<host>:8000/viewer shows each UE's latest frame + boxes; the picture is updated only when
+#   UL (measured) + AI (measured) + DL (fixed .env VA_VIEWER_DL_MS) <= VA_DEADLINE_MS, so QoS misses show as a frozen picture.
 #   Code: va_service/ (hsw yolo_service + dapp_backend.py; the hsw original is in va_service/upstream_hsw/). Doc: va_service/README.md
 # commands
 #   start [local]        activate va_service/yolo_env and start uvicorn (HTTPS, certs/server.*) in the background
@@ -27,6 +29,7 @@ pid() { cat $PIDF 2>/dev/null; }
 alive() { [ -n "$(pid)" ] && kill -0 $(pid) 2>/dev/null; }
 port_open() { (echo > /dev/tcp/127.0.0.1/$1) 2>/dev/null; }
 ue_ip() { ip -br addr show ogstun 2>/dev/null | awk '{print $3}' | cut -d/ -f1 | grep . || echo "10.45.0.1(ogstun down)"; }
+lan_ip() { hostname -I 2>/dev/null | tr " " "\n" | grep -E "^10\.150\." | head -1 | grep . || hostname -I 2>/dev/null | awk '{print $1}'; }   # the host LAN address a PC browser uses for /viewer
 need_up() { alive && port_open $PORT || { echo "VA service not running: $0 start"; exit 1; }; }
 make_frame() {
   mkdir -p $V/test_frames
@@ -64,7 +67,8 @@ start)
   (cd $V && set +u && . $VENV/bin/activate && { nohup uvicorn app:app --host 0.0.0.0 --port $PORT --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt > $LOG 2>&1 < /dev/null & echo $! > $PIDF; })
   for i in $(seq 1 90); do port_open $PORT && break; alive || break; sleep 1; done
   if port_open $PORT; then
-    echo "   up: https://$(ue_ip):$PORT/  (the phone needs va_service/certs/ca.crt installed, or accept the warning) | log $LOG"
+    echo "   up: phone https://$(ue_ip):$PORT/  (the phone needs va_service/certs/ca.crt installed, or accept the warning) | log $LOG"
+    echo "   viewer (base station, the latest QoS-met frame + boxes per UE): https://$(lan_ip):$PORT/viewer  (one UE: /viewer/ue1) - also from a UE at https://$(ue_ip):$PORT/viewer"
     $VENV/bin/python $V/va_status.py --port $PORT --short
   else echo "!! did not come up - log tail:"; tail -20 $LOG; exit 1; fi ;;
 stop)
@@ -76,6 +80,7 @@ stop)
 restart) bash $0 stop; bash $0 start "${2:-}" ;;
 status)
   if alive; then echo "VA service: running (pid $(pid)), port $PORT $(port_open $PORT && echo open || echo CLOSED), log $(readlink -f $R/uvicorn.log 2>/dev/null)"; else echo "VA service: stopped"; fi
+  echo "viewer: https://$(lan_ip):$PORT/viewer (PC on the lab LAN) | https://$(ue_ip):$PORT/viewer (from a UE)"
   echo "dApp agent port $AGENT_PORT: $(port_open $AGENT_PORT && echo open || echo closed) | ogstun: $(ue_ip) | L1 container: $(docker ps --format '{{.Names}} ({{.Status}})' 2>/dev/null | grep dgist-l1 || echo not running)"
   alive && port_open $PORT && $VENV/bin/python $V/va_status.py --port $PORT
   ls -t $D/runs/va_service_log/*.log 2>/dev/null | head -3 | sed 's/^/last CSV: /' ;;

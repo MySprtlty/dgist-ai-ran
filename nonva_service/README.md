@@ -6,7 +6,7 @@ hsw 연구실의 두-슬라이스 실험에서 **VA가 아닌 쪽 UE**가 쓰는
 쓴다(hsw PPO xApp이 `live_1/live_2`로 읽음; VA 쪽은 `yolo_1/yolo_2`).
 
 ```
-전화기(UE2)  https://10.45.0.1:8001/  → Start Camera → Start Streaming (UE1/UE2 선택)
+전화기(UE2)  https://10.45.0.1:8001/  → Start Camera 또는 Video File → Start Streaming (UE1/UE2 선택)
              POST /start_session(clock_offset, ue_id) → POST /upload_frame(frame_id, upload_start_ms, JPEG) × 20/s → POST /stop_session → CSV
 보는 쪽      https://10.45.0.1:8001/viewer/ue2  (호스트 PC 브라우저나 다른 UE; /video_feed MJPEG)
 ```
@@ -15,7 +15,7 @@ hsw 연구실의 두-슬라이스 실험에서 **VA가 아닌 쪽 UE**가 쓰는
 
 | 변수 | 기본값 | 뜻 |
 |---|---|---|
-| `NONVA_WIDTH` × `NONVA_HEIGHT` | 1280 × 720 | 전화기 카메라 요청 해상도 |
+| `NONVA_WIDTH` × `NONVA_HEIGHT` | 1280 × 720 | 전화기 카메라 요청 해상도. 동영상 파일 소스의 프레임도 이 크기로 변환해 보낸다 |
 | `NONVA_FPS` | 20 | 업로드 속도 (전송 주기 50 ms) |
 | `NONVA_JPEG_QUALITY` | 0.80 | 프레임 JPEG 품질 (720p q0.80 ≈ 200 KB → 20 fps면 약 33 Mbps) |
 | `NONVA_VIEWER_FPS` | 20 | `/viewer` 중계 속도 |
@@ -31,11 +31,20 @@ hsw 연구실의 두-슬라이스 실험에서 **VA가 아닌 쪽 UE**가 쓰는
 ```
 venv는 `../va_service/yolo_env`를 같이 쓴다(fastapi/uvicorn/pillow/pynvml만 필요). 인증서는 hsw 것 그대로(CN 10.45.0.1, `certs/ca.crt`).
 
+## 동영상 파일 소스 · 전체 화면 (전화기 페이지, 2026-11-12)
+
+VA 페이지와 같은 기능이다(`../va_service/README.md`의 같은 절). `Video File`로 폰에 저장된 동영상을 고르면 카메라 대신 그 영상을 `NONVA_FPS`로 올린다
+(반복·무음 재생; 파일은 폰 안에서만 읽으므로 **하향 트래픽이 없다**). 파일 프레임은 화면비를 유지한 채(남는 곳은 검은 띠) `NONVA_WIDTH × NONVA_HEIGHT`로
+변환해 보내므로 **UL 부하는 카메라 모드와 같은 설정을 따른다**(파일이 4K여도 720p로 올라간다). `Full Screen`은 영상만 화면 전체에 띄운다
+(나가기 = `Exit Full Screen`). 카메라로 돌아가려면 `Start Camera`, 끄려면 `Stop Camera / Video`. 서버 코드는 바뀌지 않았다.
+확인(11-12, 헤드리스 Chromium, 시험 서버 1280×720·20 fps): 4:3 파일과 세로 파일 → 수신 1280×720, 20.0~20.3 fps, 전체 화면, 카메라 모드는 원본 페이지와 같음.
+실제 폰 확인은 아직.
+
 ## 파일
 
 | 파일 | 내용 |
 |---|---|
-| `app.py` | hsw `app.py` + 설정의 환경변수화, 로그 디렉터리(`../runs/nonva_service_log/`), `service_common` 경로, `GET /nonva/status`. 동작 변경 없음 (차이: `../docs/patches/nonva_service_dgist.patch`) |
+| `app.py` | hsw `app.py` + 설정의 환경변수화, 로그 디렉터리(`../runs/nonva_service_log/`), `service_common` 경로, `GET /nonva/status`. 서버 동작 변경 없음; 전화기 페이지에 동영상 파일 소스·전체 화면 추가(2026-11-12, 위 절) (차이: `../docs/patches/nonva_service_dgist.patch`) |
 | `nonva_sim.py`, `nonva_status.py` | 전화기 대역 시험 클라이언트, 상태 출력 (`nonva.sh test/status`) |
 | `service_common/`, `certs/` | hsw 그대로 |
 | `test_frames/hd_1280x720_q80.jpg` | `nonva.sh make-frame`이 만든 시험 프레임 |

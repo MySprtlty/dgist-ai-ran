@@ -33,12 +33,15 @@ export DAPP_SIZER_MODEL=$SDK/cuPHY-CP/dapp_hook/estimator/sm_model.txt
 export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80} DAPP_TENANT_FB_GUARD=0 DAPP_TENANT_LAYOUT=union
 export DAPP_TENANT_CPU=${DAPP_TENANT_CPU:-45} DAPP_AGENT_CPU=${DAPP_AGENT_CPU:-46} DAPP_AGENT_PORT=${DAPP_AGENT_PORT:-9810}
 export DAPP_AGENT_GRAPH_CHUNK=${DAPP_AGENT_GRAPH_CHUNK:-3} DAPP_AGENT_CHUNK_AHEAD=${DAPP_AGENT_CHUNK_AHEAD:-2} DAPP_AGENT_QOS=${DAPP_AGENT_QOS:-1}
-export DAPP_TENANT_LOG=/tmp/dapp_tenant.log DAPP_TENANT_CSV=/tmp/dapp_tenant_slots.csv
+export DAPP_TENANT_LOG=/tmp/dapp_tenant.log
+# per-slot CSV (one line per 0.5 ms slot: gap offered to YOLO, SMs of the in-flight inference, queue, wall clock) -> runs/<name>/dapp_tenant_slots.csv,
+# ~5 MB per minute; tools/slotmap_render.py turns it into the GPU slot-map video. .env DAPP_SLOT_CSV=0 switches it off.
+export DAPP_TENANT_CSV=$([ "${DAPP_SLOT_CSV:-1}" = 1 ] && echo /tmp/dapp_tenant_slots.csv)
 export DAPP_INPUT=${DAPP_INPUT:-4k}
 if [ "$DAPP_INPUT" = fhd ]; then   # the batch-3 FHD engine set + FHD warm-up frames (the tenant defaults are the 4K set models/full26<m> and 4K frames)
   export DAPP_TENANT_MODELS=$(c=""; for m in n s m l x; do printf "%s26%s=%s" "$c" $m $M/fhd26$m; c=,; done)
   export DAPP_AGENT_WARMUP=$M/imgfhd/fhd_0_q85.jpg,$M/imgfhd/fhd_1_q85.jpg
-  export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80}   # the FHD ladder (.env; 26s/26l sm80 = sm72-tactic engines, see build_yolo_engines.sh)
+  export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}   # the FHD ladder (.env; 26s/26l sm80 = sm72-tactic engines, see build_yolo_engines.sh)
 fi
 [ -n "${PRACH_FORCE_THR0:-}" ] && export CUPHY_PRACH_FORCE_THR0=$PRACH_FORCE_THR0
 rm -f $PHYLOG /tmp/dapp_tenant.log /tmp/dapp_tenant_slots.csv

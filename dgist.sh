@@ -74,6 +74,9 @@ check() {
     [ -r $D/config/baseline_cuphy_config/cuphycontroller_$BASELINE_L1_CONFIG.yaml ] || { echo "!! config/baseline_cuphy_config/cuphycontroller_$BASELINE_L1_CONFIG.yaml missing (copy of the lab config dir + the fitted yaml)"; ok=0; }
     [ -x $T/$BUILD_DIR/cuPHY-CP/dapp_hook/dapp_tenant_main ] || { echo "!! $BUILD_DIR/cuPHY-CP/dapp_hook/dapp_tenant_main missing ($0 build-l1)"; ok=0; }
     ls $T/cuPHY-CP/dapp_hook/models/migfhd26${VA_MODEL#26}/seg00_sm*.engine > /dev/null 2>&1 || { echo "!! Baseline engine models/migfhd26${VA_MODEL#26}/seg00_sm<N>.engine missing (scripts/build_yolo_engines_mig.sh ${VA_MODEL#26} after MIG on)"; ok=0; }
+    if [ "${VA_MODEL_SELECT:-0}" = 1 ]; then local wt i=0 w nb=""; IFS=, read -r -a wt <<< "${VA_MODEL_WEIGHTS:-}"   # rule-based model selection: the other models need a Baseline engine too
+      for m in n s m l x; do w=${wt[$i]:-0}; w=${w// /}; i=$((i + 1)); case "$w" in ''|*[!0-9]*) continue ;; esac; [ "$w" -gt 0 ] && ! ls $T/cuPHY-CP/dapp_hook/models/migfhd26$m/seg00_sm*.engine > /dev/null 2>&1 && nb="$nb $m"; done
+      [ -z "$nb" ] || echo "   note: VA_MODEL_SELECT=1 but no Baseline engine for:$nb - those requests run as ${VA_MODEL:-26x} (scripts/build_yolo_engines_mig.sh$nb after MIG on)"; fi
   else
   [ "$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null)" = Disabled ] || { echo "!! GPU MIG mode is not Disabled (./all.sh mode ours / sudo -n scripts/mig.sh off)"; ok=0; }
   [ -x $T/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf ] || { echo "!! L1 binary $BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf missing ($0 build-l1)"; ok=0; }
@@ -118,7 +121,7 @@ slotmap)
 up)
   NAME=${2:-dgist_$(date +%m%d_%H%M)}; RUN=$OUT/$NAME
   [ -f $CUR ] && { echo "!! a run is registered as current ($(cat $CUR)): $0 down first"; exit 1; }
-  if [ "$MODE" = baseline ]; then echo "== $NAME [BASELINE]: vanilla cuBB 25-3 L1 ($BASELINE_TREE, config $BASELINE_L1_CONFIG) on MIG 4g + naive YOLO ${VA_MODEL:-26x} (whole MIG 3g instance) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
+  if [ "$MODE" = baseline ]; then echo "== $NAME [BASELINE]: vanilla cuBB 25-3 L1 ($BASELINE_TREE, config $BASELINE_L1_CONFIG) on MIG 4g + naive YOLO ${VA_MODEL:-26x}$([ "${VA_MODEL_SELECT:-0}" = 1 ] && echo " + the VA_MODEL_WEIGHTS models that have an engine") (whole MIG 3g instance) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
   else echo "== $NAME [OURS]: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"; fi
   [ "$TG" = 1 ] && echo "   + traffic generator: 5 RU-emulator cells with testMAC in the l1 container (L1 cells 0-4, config $TGC, initial load ${TRAFFIC_LOAD:-low}); the phones' cell is L1 cell $PC$( [ "$MODE" = baseline ] && echo '; the L1 is OUR build with every dApp feature off (the vanilla tree has no tools for this layout)' || echo "; PUSCH profiles ${TG_PUSCH_PROFILES:-16,24,32,40,48,56,64,72,88,104}")"
   check || { echo "precheck failed"; exit 1; }

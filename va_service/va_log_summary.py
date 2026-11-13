@@ -16,7 +16,7 @@ def summ(f):
     if len(rows) < 20: return None
     g = lambda c: [float(r[c]) for r in rows if r.get(c) not in (None, "", "None")]
     o = dict(n=len(rows), span="%s-%s UTC" % (rows[0]["timestamp"][11:19], rows[-1]["timestamp"][11:19]), img="%sx%s" % (rows[0]["image_width"], rows[0]["image_height"]),
-             kb=st.mean(g("frame_size_kb")), fps=st.mean(g("actual_fps")), model=rows[0].get("dapp_model", "?"), sm=st.mean(g("dapp_sm")) if g("dapp_sm") else 0,
+             kb=st.mean(g("frame_size_kb")), fps=st.mean(g("actual_fps")), model=rows[0].get("dapp_model", "?") if len({r.get("dapp_model") for r in rows}) == 1 else "mix", sm=st.mean(g("dapp_sm")) if g("dapp_sm") else 0,
              qos=100.0 * sum(float(r["qos_met"]) for r in rows) / len(rows))
     for c in ["e2e_latency_ms", "ul_latency_ms", "ai_latency_ms", "dl_latency_ms", "dapp_wait_ms", "dapp_decode_ms", "dapp_infer_ms"]:
         v = g(c); o[c] = (st.mean(v), pct(v, 0.5), pct(v, 0.9), pct(v, 0.99)) if v else (-1, -1, -1, -1)

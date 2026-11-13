@@ -19,7 +19,12 @@ c, b = s["config"], s["backend"]
 w = b.get("welcome") or {}
 print(f"   backend: {b['backend']} | agent {b.get('agent', '-')} {'connected' if b.get('connected') else 'NOT connected'}"
       f"{' (models ' + ' '.join(w.get('models', [])) + ', gpu_sm ' + str(w.get('gpu_sm')) + ', tdd ' + str(w.get('tdd')) + ')' if w else ''}"
-      f" | model {c['model']} QoS {c['deadline_ms']} ms | last_error: {b.get('last_error')}")
+      f" | model {'rule (VA_MODEL_SELECT=1)' if c.get('model_select') else c['model']} QoS {c['deadline_ms']} ms | last_error: {b.get('last_error')}")
+sel = b.get("select")
+if sel:    # rule-based model selection: requests per block and what has been sent so far
+    print(f"   model selection: per {sel['block']} requests " + " ".join(f"{m} {n}" for m, n in sel["weights"].items())
+          + f" (random order) | sent so far ({sel['requests']}): " + " ".join(f"{m} {n}" for m, n in sel["sent"].items())
+          + (f" | NOT loaded by the agent: {' '.join(sel['missing'])} -> {sel['replaced']} request(s) sent as {sel['fallback']}" if sel["missing"] else ""))
 if a.short:
     sys.exit(0)
 print(f"   config: {c['target_fps']:g} req/s per UE, inflight<={c['max_inflight']}, camera {c['camera'][0]}x{c['camera'][1]} JPEG q{c['jpeg_quality']:g}, "

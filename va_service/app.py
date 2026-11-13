@@ -10,7 +10,13 @@ Settings come from the environment (_dgist/.env, exported by va.sh):
   VA_BACKEND=dapp|local  VA_MODEL=26x  VA_DEADLINE_MS=200  VA_TARGET_FPS=5  VA_CAMERA_WIDTH=3840  VA_CAMERA_HEIGHT=2160
   VA_JPEG_QUALITY=0.90  VA_MAX_INFLIGHT=4  VA_AGENT=127.0.0.1:9810  VA_LOG_DIR=<_dgist>/runs/va_service_log  VA_VERBOSE=0
   VA_FILE_WIDTH=1920  VA_FILE_HEIGHT=1080   (phone page, video-file source: the size every frame of a file is converted to)
+  VA_MODEL_SELECT=0|1  VA_MODEL_WEIGHTS=10,10,10,10,60   (rule-based model selection, model_select.py: requests per block for
+                                                          26n,26s,26m,26l,26x in a random order; off = every frame asks for VA_MODEL)
+  VA_VIEWER_FIT=1   (viewer pages, 2026-11-14: the panes size themselves to the window so that all of them are on the screen at once)
 Run (va.sh start):  uvicorn app:app --host 0.0.0.0 --port 8000 --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt
+2026-11-14: the phone page (video-file source) got "Restart Video" and a start at a chosen clock time - both happen on the phone alone, no
+request is sent for them. The non-VA panes of /viewer show the non-VA service's QoS verdict (the UL latency of a frame against its
+NONVA_DEADLINE_MS) and keep the picture while frames miss it, as the VA panes do.
 """
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -52,7 +58,7 @@ def _env(name, default, cast=str):
 
 
 VA_BACKEND = _env("VA_BACKEND", "dapp")                 # dapp = DGIST agent in the L1 process | local = hsw original (ultralytics here)
-VA_MODEL = _env("VA_MODEL", "26x")                      # the one dApp model every frame asks for
+VA_MODEL = _env("VA_MODEL", "26x")                      # the dApp model every frame asks for (VA_MODEL_SELECT=1: the model that replaces one the agent lacks)
 VA_DEADLINE_MS = _env("VA_DEADLINE_MS", 200, int)       # QoS: RUN qos.deadline_ms, and the per-frame E2E target judged on the phone
 VA_AGENT = _env("VA_AGENT", "127.0.0.1:9810")           # dApp agent (TCP; the dgist-l1 container runs with network host)
 VA_VERBOSE = _env("VA_VERBOSE", 0, int)                 # 1 = one console line per frame
@@ -81,6 +87,18 @@ VA_VIEWER_QOS_FREEZE = _env("VA_VIEWER_QOS_FREEZE", 1, int)  # 1 = a missed resu
 VA_VIEWER_BADGE = _env("VA_VIEWER_BADGE", 1, int)       # 1 = the viewer shows a "QoS miss, picture held" badge, held time and a dimmed picture while frozen; 0 = it just stops
 VA_VIEWER_NONVA = _env("VA_VIEWER_NONVA", 1, int)       # 1 = /viewer also shows the two non-VA UEs (their MJPEG relay from the non-VA service, stats via /nonva_stats); /viewer/va = VA only
 NONVA_PORT = _env("NONVA_PORT", 8001, int)             # the non-VA service (same host) whose /video_feed and /receiver_stats the 4-UE viewer uses
+# DGIST 2026-11-14: the viewer pages fit themselves to the window: every pane is on the screen at once (no scrolling), the pictures as large as that
+# allows. The page chooses the grid (4 panes: 2 x 2), the place of the figures (under or beside the picture) and the picture height. 0 = as before
+VA_VIEWER_FIT = _env("VA_VIEWER_FIT", 1, int)
+# viewer recording (2026-11-13): "전체 녹화" / "녹화 종료" in the viewer's header and "녹화 시작" / "녹화 종료" on every pane. The viewer's browser
+# records each pane's picture area as shown (frame + boxes + QoS badge, fitted into 1920x1080) and saves one H.264 MP4 per pane. The server
+# and the UEs take no part: no extra uplink or downlink traffic, no server CPU.
+VA_VIEWER_REC = _env("VA_VIEWER_REC", 1, int)           # 1 = record buttons on the viewer pages (the non-VA panes then read the relay with fetch() into a canvas); 0 = the page as before
+VA_VIEWER_REC_FPS = min(60, max(1, _env("VA_VIEWER_REC_FPS", 30, int)))   # frame rate of the files, constant (the UEs send 15 fps; 30 keeps every source frame)
+VA_VIEWER_REC_MBPS = min(50.0, max(0.5, _env("VA_VIEWER_REC_MBPS", 6.0, float)))   # H.264 target bit rate per pane; 6 Mbit/s = at most about 45 MB per minute and pane
+VA_VIEWER_REC_MAX_MIN = max(0.0, _env("VA_VIEWER_REC_MAX_MIN", 20.0, float))   # a recording stops and saves itself after this many minutes (the browser holds it until then); 0 = no limit
+VA_VIEWER_REC_BADGE = _env("VA_VIEWER_REC_BADGE", 1, int)   # 1 = the files show the QoS badge, the dimmed frozen picture and the waiting text as the screen does; 0 = picture and boxes only
+VA_VIEWER_REC_PREFIX = "".join(c for c in _env("VA_VIEWER_REC_PREFIX", os.environ.get("DEMO_MODE") or "") if c.isascii() and (c.isalnum() or c in "-_"))[:32]   # file names <prefix>_va_ue1_<date>_<time>.mp4; default = .env DEMO_MODE (ours | baseline)
 
 MODEL_PATH = _env("VA_LOCAL_MODEL", str(HERE / "yolo26x.pt"))   # local backend only
 DEVICE = 0
@@ -96,10 +114,18 @@ CLOCK_SYNC_BEST_SAMPLES = 5
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from dapp_backend import make_backend   # noqa: E402
+import model_select                     # noqa: E402
 
-print(f"VA service: backend {VA_BACKEND}, model {VA_MODEL}, QoS deadline {VA_DEADLINE_MS} ms, {TARGET_FPS:g} req/s per UE, "
+# rule-based model selection (.env VA_MODEL_SELECT / VA_MODEL_WEIGHTS, dApp backend only): None = every frame asks for VA_MODEL
+selector = model_select.from_env(fallback=VA_MODEL, log=lambda m: print(f"[VA] {m}", flush=True)) if VA_BACKEND == "dapp" else None
+VA_MODEL_PAGE = "mix" if selector else VA_MODEL                                  # phone page text (as long as a model name: the page does not grow)
+VA_MODEL_VIEW = f"{selector.label()} 규칙 선택" if selector else VA_MODEL       # viewer header
+
+print(f"VA service: backend {VA_BACKEND}, model {('rule ' + selector.label() + ' per ' + str(selector.block) + ' requests, else ' + VA_MODEL) if selector else VA_MODEL}, "
+      f"QoS deadline {VA_DEADLINE_MS} ms, {TARGET_FPS:g} req/s per UE, "
       f"camera {CAMERA_WIDTH}x{CAMERA_HEIGHT} JPEG q{JPEG_QUALITY:g}, agent {VA_AGENT}", flush=True)
-backend = make_backend(VA_BACKEND, agent=VA_AGENT, model=VA_MODEL, deadline_ms=VA_DEADLINE_MS, local_model_path=MODEL_PATH, device=DEVICE)
+backend = make_backend(VA_BACKEND, agent=VA_AGENT, model=VA_MODEL, deadline_ms=VA_DEADLINE_MS, local_model_path=MODEL_PATH, device=DEVICE,
+                       selector=selector)
 
 # GPU-wide NVML metrics (not per-UE). Initialized once at startup.
 pynvml.nvmlInit()
@@ -227,12 +253,14 @@ def _page(s):
     """fill the configuration placeholders of the page (camera size, rate, in-flight cap, JPEG quality, QoS, backend, model)"""
     for k, v in (("__CAMERA_WIDTH__", CAMERA_WIDTH), ("__CAMERA_HEIGHT__", CAMERA_HEIGHT), ("__TARGET_FPS__", f"{TARGET_FPS:g}"),
                  ("__MAX_INFLIGHT__", MAX_INFLIGHT), ("__JPEG_QUALITY__", f"{JPEG_QUALITY:g}"), ("__QOS_DEADLINE_MS__", VA_DEADLINE_MS),
-                 ("__VA_BACKEND__", VA_BACKEND), ("__VA_MODEL__", VA_MODEL),
+                 ("__VA_BACKEND__", VA_BACKEND), ("__VA_MODEL__", VA_MODEL_PAGE), ("__VA_MODEL_VIEW__", VA_MODEL_VIEW),
                  ("__VA_TRACK__", VA_TRACK), ("__VA_QOS_DROP_MISSED__", VA_QOS_DROP_MISSED), ("__VA_DISPLAY_CONF__", f"{VA_DISPLAY_CONF:g}"),
                  ("__VA_TRACK_TTL_MS__", VA_TRACK_TTL_MS), ("__VA_ENCODE_WORKERS__", VA_ENCODE_WORKERS),
                  ("__VA_FILE_WIDTH__", VA_FILE_WIDTH), ("__VA_FILE_HEIGHT__", VA_FILE_HEIGHT),
                  ("__VA_VIEWER_DL_MS__", f"{VA_VIEWER_DL_MS:g}"), ("__VA_VIEWER_QOS_FREEZE__", VA_VIEWER_QOS_FREEZE), ("__VA_VIEWER_BADGE__", VA_VIEWER_BADGE),
-                 ("__VA_VIEWER_NONVA__", VA_VIEWER_NONVA), ("__NONVA_PORT__", NONVA_PORT)):
+                 ("__VA_VIEWER_REC__", VA_VIEWER_REC), ("__VA_VIEWER_REC_FPS__", VA_VIEWER_REC_FPS), ("__VA_VIEWER_REC_MBPS__", f"{VA_VIEWER_REC_MBPS:g}"),
+                 ("__VA_VIEWER_REC_MAX_MIN__", f"{VA_VIEWER_REC_MAX_MIN:g}"), ("__VA_VIEWER_REC_BADGE__", VA_VIEWER_REC_BADGE), ("__VA_VIEWER_REC_PREFIX__", VA_VIEWER_REC_PREFIX),
+                 ("__VA_VIEWER_NONVA__", VA_VIEWER_NONVA), ("__NONVA_PORT__", NONVA_PORT), ("__VA_VIEWER_FIT__", VA_VIEWER_FIT)):
         s = s.replace(k, str(v))
     return s
 
@@ -359,6 +387,48 @@ h1 {
     display: block;
 }
 
+/* DGIST 2026-11-14: video-file source: restart button and schedule note laid over the picture in full screen */
+#fsRestart {
+    display: none;
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 5;
+    margin: 0;
+    padding: 6px 12px;
+    font-size: 16px;
+    color: white;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    border-radius: 6px;
+}
+
+#stage.filesrc:fullscreen #fsRestart {
+    display: block;
+}
+
+#fsSched {
+    display: none;
+    position: absolute;
+    left: 8px;
+    bottom: 8px;
+    z-index: 5;
+    padding: 4px 10px;
+    font-size: 14px;
+    color: white;
+    background: rgba(0, 0, 0, 0.45);
+    border-radius: 6px;
+    pointer-events: none;
+}
+
+#stage:fullscreen #fsSched.show {
+    display: block;
+}
+
+#schedTime {
+    font-size: 18px;
+    padding: 6px;
+}
 button {
     font-size: 18px;
     margin: 5px;
@@ -408,6 +478,12 @@ button {
 <button id="fsExit" onclick="exitFullscreen()">
     Exit Full Screen
 </button>
+<!-- DGIST 2026-11-14: shown over the picture in full screen: restart of a video file, note of a scheduled start -->
+<button id="fsRestart" onclick="restartVideo()">
+    Restart Video
+</button>
+
+<div id="fsSched"></div>
 
 </div>
 
@@ -438,6 +514,24 @@ button {
 <button onclick="enterFullscreen()">
     Full Screen
 </button>
+<!-- DGIST 2026-11-14: video-file source: play the file again from its first frame, now or at a chosen clock time (on the phone only:
+     no request is sent, nothing is downloaded) -->
+<button onclick="restartVideo()">
+    Restart Video
+</button>
+
+<p>
+Start video at:
+<input type="time" id="schedTime">
+<button onclick="scheduleVideoStart()">Set</button>
+<button onclick="cancelVideoStart()">Cancel</button>
+<br>
+Scheduled start: <strong id="schedStatus">Not set</strong>
+<br>
+Last video start: <strong id="schedLast">-</strong>
+<br>
+Clock: <strong id="schedClock">-</strong>
+</p>
 
 <br><br>
 
@@ -1283,11 +1377,142 @@ document.addEventListener("visibilitychange", () => {
     wakeLockUpdate();
     if (document.visibilityState === "visible" && fileUrl !== null) {     // a file paused while the page was hidden plays on
         const video = document.getElementById("camera");
-        if (video.paused) video.play().catch(() => {});
+        if (video.paused && !schedPrerolled) video.play().catch(() => {});
     }
 });
 document.getElementById("camera").addEventListener("loadedmetadata", updateStage);
 document.getElementById("camera").addEventListener("resize", updateStage);      // the camera frame turns with the phone
+// =====================================================
+// DGIST 2026-11-14: video-file source - play the file again from its first frame, either now ("Restart Video") or at a chosen
+// clock time ("Start video at"). The clock is the base station's once this page has synchronised with it (Start VA does that; it is
+// the offset the latency figures use) and this phone's own clock before, so phones set to the same time start together. All of it
+// happens on the phone: no request is sent and nothing is downloaded for it; the VA session goes on unchanged while the file starts over.
+// =====================================================
+
+const SCHED_PREROLL_MS = 700;      // this long before the chosen time the file is stopped on its first frame, so that it starts on time
+let schedTargetMs = null;          // chosen start time, ms since the epoch; null = nothing scheduled
+let schedPrerolled = false;        // the file is waiting on its first frame
+let schedResumeAt = 0;             // position the pre-roll left (a cancel goes back to it)
+let schedPreUrl = null;            // the file the pre-roll stopped (another file chosen meanwhile is not waiting)
+let schedFireTimer = null;
+let schedNote = "";                // outcome of the last schedule
+let schedNoteAt = 0;
+let schedLast = "";                // the last start from the first frame: when, and what asked for it
+
+function schedNowMs() { return clockSynced ? Date.now() + clockOffsetMs : Date.now(); }
+function schedPad(n) { return (n < 10 ? "0" : "") + n; }
+function schedClockText(ms, withMs) {
+    const d = new Date(ms);
+    return schedPad(d.getHours()) + ":" + schedPad(d.getMinutes()) + ":" + schedPad(d.getSeconds())
+        + (withMs ? "." + String(d.getMilliseconds()).padStart(3, "0") : "");
+}
+function schedLeftText(ms) {
+    if (ms < 10000) return (Math.max(0, ms) / 1000).toFixed(1) + " s";
+    const s = Math.ceil(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h > 0) return h + " h " + schedPad(m) + " min";
+    return m > 0 ? m + " min " + schedPad(s % 60) + " s" : s + " s";
+}
+
+// the file from its first frame; false when the source is not a file
+function restartVideoNow() {
+    if (fileUrl === null) return false;
+    const video = document.getElementById("camera");
+    try { video.currentTime = 0; } catch (e) {}
+    video.play().catch(() => {});
+    return true;
+}
+
+function restartVideo() {
+    if (fileUrl === null) { alert("Restart Video works with a video file: choose one with the Video File button first."); return; }
+    if (schedPrerolled && fileUrl === schedPreUrl) return;      // the scheduled start is less than a second away and does the same
+    restartVideoNow();
+    schedLast = schedClockText(schedNowMs(), true) + " (Restart Video button)";
+    schedShow();
+}
+
+function schedDisarm() {
+    if (schedFireTimer !== null) { clearTimeout(schedFireTimer); schedFireTimer = null; }
+    if (schedPrerolled && fileUrl !== null && fileUrl === schedPreUrl) {      // the file goes on from where the pre-roll took it
+        const video = document.getElementById("camera");
+        try { video.currentTime = schedResumeAt; } catch (e) {}
+        video.play().catch(() => {});
+    }
+    schedPrerolled = false;
+    schedTargetMs = null;
+}
+
+function scheduleVideoStart() {
+    const value = document.getElementById("schedTime").value;
+    if (!value) { alert("Choose the start time first."); return; }
+    const part = value.split(":").map(Number);
+    schedDisarm();
+    const now = schedNowMs(), d = new Date(now);
+    d.setHours(part[0], part[1], part.length > 2 ? part[2] : 0, 0);
+    let target = d.getTime();
+    if (target <= now) target += 86400000;      // that time has passed today: the same time tomorrow
+    schedTargetMs = target;
+    schedNote = "";
+    schedTick();
+}
+
+function cancelVideoStart() {
+    if (schedTargetMs === null) return;
+    schedDisarm();
+    schedNote = "Cancelled"; schedNoteAt = Date.now();
+    schedShow();
+}
+
+function schedFire() {
+    schedFireTimer = null;
+    if (schedTargetMs === null) return;
+    const left = schedTargetMs - schedNowMs();
+    if (left > 2) { schedFireTimer = setTimeout(schedFire, left > 12 ? left - 8 : 1); return; }      // woken early (or the clock was synchronised meanwhile): wait for the rest
+    const target = schedTargetMs, video = document.getElementById("camera"), ready = schedPrerolled && fileUrl === schedPreUrl;
+    schedTargetMs = null; schedPrerolled = false; schedNoteAt = Date.now();
+    if (fileUrl === null) { schedNote = "Skipped at " + schedClockText(target, false) + ": no video file was chosen"; schedShow(); return; }
+    if (!ready || video.currentTime > 0.05) { try { video.currentTime = 0; } catch (e) {} }
+    video.play().then(() => {
+        const at = schedNowMs();
+        schedLast = schedClockText(at, true) + " (scheduled for " + schedClockText(target, false) + ", playing " + Math.round(at - target) + " ms after it)";
+        schedNote = "Started at " + schedClockText(target, false); schedNoteAt = Date.now(); schedShow();
+    }, error => {
+        schedNote = "Could not start at " + schedClockText(target, false) + ": " + (error && (error.message || error)); schedNoteAt = Date.now(); schedShow();
+    });
+}
+
+function schedShow() {
+    const now = schedNowMs(), note = document.getElementById("fsSched");
+    document.getElementById("stage").classList.toggle("filesrc", fileUrl !== null);
+    let text = schedNote || "Not set", over = "";
+    if (schedTargetMs !== null) {
+        const left = schedTargetMs - now, day = new Date(schedTargetMs).getDate() !== new Date(now).getDate() ? " tomorrow" : "";
+        text = schedClockText(schedTargetMs, false) + day + ", in " + schedLeftText(left) + (fileUrl === null ? " (no video file chosen yet)" : "");
+        over = "Video starts at " + schedClockText(schedTargetMs, false) + day + ", in " + schedLeftText(left);
+    } else if (schedNote && Date.now() - schedNoteAt < 3000) over = schedNote;
+    document.getElementById("schedStatus").innerText = text;
+    document.getElementById("schedLast").innerText = schedLast || "-";
+    const diff = Math.round(now - Date.now());
+    document.getElementById("schedClock").innerText = schedClockText(now, false) + (clockSynced
+        ? " (base station clock; this phone's clock is " + Math.abs(diff) + " ms " + (diff >= 0 ? "behind" : "ahead") + ")"
+        : " (this phone's clock; the base station's clock after Start VA)");
+    note.innerText = over; note.className = over ? "show" : "";
+}
+
+function schedTick() {      // every 200 ms: the status lines, the pre-roll and the timer of the start itself
+    if (schedTargetMs !== null) {
+        const left = schedTargetMs - schedNowMs();
+        if (left <= SCHED_PREROLL_MS && !schedPrerolled && fileUrl !== null) {
+            const video = document.getElementById("camera");
+            schedResumeAt = video.currentTime; schedPrerolled = true; schedPreUrl = fileUrl;
+            video.pause();
+            try { video.currentTime = 0; } catch (e) {}
+        }
+        if (left <= 1000 && schedFireTimer === null) schedFireTimer = setTimeout(schedFire, Math.max(0, left - 8));
+    }
+    schedShow();
+}
+setInterval(schedTick, 200);
+schedTick();
 
 
 // =====================================================
@@ -1465,7 +1690,7 @@ async function startVA() {
     if (fileUrl !== null) {      // DGIST: a file that was paused (page in the background) plays again
 
         const fileVideo = document.getElementById("camera");
-        if (fileVideo.paused) { try { await fileVideo.play(); } catch (e) {} }
+        if (fileVideo.paused && !schedPrerolled) { try { await fileVideo.play(); } catch (e) {} }
     }
 
 
@@ -2933,6 +3158,7 @@ main { display:grid; grid-template-columns:repeat(auto-fit, minmax(460px, 1fr));
 .stage { position:relative; background:#000; aspect-ratio:16/9; overflow:hidden; }
 .stage canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
 .stage.frozen.dim canvas { filter:saturate(.7) brightness(.8); }
+.stage.frozen.dim img { filter:saturate(.7) brightness(.8); }
 .badge { position:absolute; top:12px; left:12px; display:none; flex-direction:column; gap:2px; padding:8px 12px; border-radius:10px;
          background:rgba(255,77,94,.92); color:#fff; font-weight:700; font-size:15px; box-shadow:0 4px 18px rgba(0,0,0,.45); }
 .badge.show { display:flex; }
@@ -2951,16 +3177,52 @@ main { display:grid; grid-template-columns:repeat(auto-fit, minmax(460px, 1fr));
 main.four { grid-template-columns:repeat(2, minmax(0, 1fr)); }
 @media (max-width:1000px) { main.four { grid-template-columns:1fr; } }
 .metrics.four { grid-template-columns:repeat(4, 1fr); }
+.metrics.five { grid-template-columns:repeat(5, 1fr); }
 .hint { position:absolute; left:12px; bottom:12px; display:none; padding:6px 10px; border-radius:8px; background:rgba(11,15,20,.8); color:var(--muted); font-size:12px; }
 .hint.show { display:block; }
+.stage canvas.fit { object-fit:contain; }
+/* DGIST 2026-11-14, fit to the window (VA_VIEWER_FIT): every pane on the screen at once. fitLayout() chooses the grid, the place of the figures (under the
+   picture, or beside it: class side) and the picture height from the window size and writes them to the variables of main.fitv */
+main.fitv { --sh:360px; --sw:640px; --pw:642px; --cols:2; --mcols:1; grid-template-columns:repeat(var(--cols), var(--pw)); justify-content:center; }
+main.fitv .stage { aspect-ratio:auto; height:var(--sh); }
+main.fitv .top, main.fitv .foot { flex-wrap:nowrap; }
+main.fitv .top .ue, main.fitv .foot div, main.fitv .m .k { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+main.fitv .topr, main.fitv .chip { flex-shrink:0; }
+main.fitv.side .pane { display:grid; grid-template-columns:var(--sw) minmax(0, 1fr); grid-template-rows:auto var(--sh) auto; }
+main.fitv.side .top, main.fitv.side .foot { grid-column:1 / 3; }
+main.fitv.side .metrics { grid-template-columns:repeat(var(--mcols), minmax(0, 1fr)); grid-auto-rows:1fr; border-top:0; border-left:1px solid var(--line); }
+main.fitv.side .m { display:flex; flex-direction:column; justify-content:center; }
+main.fitv.side .m:last-child:nth-child(odd) { grid-column:1 / -1; }
+.topr { display:flex; align-items:center; gap:8px; }
+.recbar { margin-left:auto; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.recstat { color:var(--muted); font-size:13px; font-variant-numeric:tabular-nums; }
+.rb { display:inline-flex; align-items:center; gap:6px; font:inherit; font-size:13px; font-weight:600; padding:4px 11px; border-radius:999px; border:1px solid var(--line);
+      background:#1b2634; color:var(--text); cursor:pointer; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.rb:hover:not(:disabled) { border-color:var(--muted); }
+.rb:disabled { opacity:.45; cursor:default; }
+.rb i { width:9px; height:9px; border-radius:50%; background:var(--bad); }
+.rb.stop i, .rb.on i { border-radius:2px; }
+.rb.on { background:rgba(255,77,94,.16); border-color:var(--bad); color:var(--bad); }
+.recbar .rb { font-size:14px; padding:6px 14px; }
+#recFiles { display:none; margin:0 20px 20px; padding:10px 14px; background:var(--card); border:1px solid var(--line); border-radius:14px; font-size:13px; }
+#recFiles.show { display:block; }
+.rfh { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding-bottom:8px; }
+.rfh b { font-size:14px; }
+.rfh span { color:var(--muted); flex:1; min-width:200px; }
+.rf { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:7px 0; border-top:1px solid var(--line); }
+.rf a { color:var(--accent); font-weight:600; text-decoration:none; }
+.rf a:hover { text-decoration:underline; }
+.rf span { color:var(--muted); flex:1; min-width:200px; font-variant-numeric:tabular-nums; }
+.rfn { color:var(--muted); padding:6px 0; border-top:1px solid var(--line); }
 </style>
 </head>
 <body>
 <header>
   <h1>VA 서비스 · 기지국 뷰어</h1>
-  <div class="sub">VA: UE 카메라 → 5G 상향 → cuPHY 안의 YOLO(__VA_MODEL__) → 검출 결과. QoS __QOS_DEADLINE_MS__ ms = 상향(실측) + 추론(실측) + 하향 __VA_VIEWER_DL_MS__ ms(고정), 미달 결과는 화면을 갱신하지 않음. non-VA: 720p 영상 중계(추론 없음).</div>
+  <div class="sub">VA: UE 카메라 → 5G 상향 → cuPHY 안의 YOLO(__VA_MODEL_VIEW__) → 검출 결과. QoS __QOS_DEADLINE_MS__ ms = 상향(실측) + 추론(실측) + 하향 __VA_VIEWER_DL_MS__ ms(고정), 미달 결과는 화면을 갱신하지 않음. non-VA: 720p 영상 중계(추론 없음)<span id="nvSub"></span>.</div>
 </header>
 <main id="panes"></main>
+<section id="recFiles"></section>
 <script>
 const DEADLINE_MS = __QOS_DEADLINE_MS__, DL_MS = __VA_VIEWER_DL_MS__, DISPLAY_CONF = __VA_DISPLAY_CONF__, TARGET_FPS = __TARGET_FPS__;
 const FREEZE = __VA_VIEWER_QOS_FREEZE__ ? true : false, BADGE = __VA_VIEWER_BADGE__ ? true : false;
@@ -2968,6 +3230,9 @@ const pathParts = location.pathname.split("/").filter(Boolean);   // ["viewer"] 
 const SHOW_NONVA = __VA_VIEWER_NONVA__ ? true : false, NONVA_PORT = __NONVA_PORT__;
 const UES = pathParts.length > 1 && pathParts[1] !== "va" ? [pathParts[1]] : ["ue1", "ue2"];
 const NV_UES = (pathParts.length > 1 || !SHOW_NONVA) ? [] : ["ue1", "ue2"];
+const REC = __VA_VIEWER_REC__ ? true : false, REC_FPS = __VA_VIEWER_REC_FPS__, REC_MBPS = __VA_VIEWER_REC_MBPS__, REC_MAX_MIN = __VA_VIEWER_REC_MAX_MIN__;   // recording: see "recording" below
+const REC_BADGE = __VA_VIEWER_REC_BADGE__ ? true : false, REC_PREFIX = "__VA_VIEWER_REC_PREFIX__";
+const FIT = __VA_VIEWER_FIT__ ? true : false;   // every pane on one screen: fitLayout() below
 const PALETTE = ["#7aa2ff", "#ffb547", "#27c57a", "#ff6b9d", "#4dd4e0", "#c084fc", "#f97316", "#a3e635"];
 const colorCache = {};
 function colorOf(name) {
@@ -2995,8 +3260,10 @@ function makePane(ue) {
     const foot = el("div", "foot"); const footL = el("div", "", "-"); const footR = el("div", "", "-"); foot.appendChild(footL); foot.appendChild(footR);
     pane.appendChild(top); pane.appendChild(stage); pane.appendChild(metrics); pane.appendChild(foot);
     document.getElementById("panes").appendChild(pane);
-    return { ue, chip, stage, canvas, ctx: canvas.getContext("2d"), badge, badgeMain, badgeSub, wait, tiles, footL, footR,
-             meta: null, lastDrawAt: 0, draws: [], seq: 0, stat: 0, connected: false };
+    const p = { ue, chip, stage, canvas, ctx: canvas.getContext("2d"), badge, badgeMain, badgeSub, wait, tiles, footL, footR,
+                meta: null, lastDrawAt: 0, draws: [], seq: 0, stat: 0, connected: false };
+    recAttach(p, "va", top);
+    return p;
 }
 
 function draw(p, bmp, meta) {
@@ -3015,6 +3282,7 @@ function draw(p, bmp, meta) {
         g.fillStyle = "#0b0f14"; g.textBaseline = "middle"; g.fillText(label, x + 6 * s, ly + th / 2);
     }
     const now = performance.now(); p.lastDrawAt = now; p.draws.push(now); while (p.draws.length && p.draws[0] < now - 1000) p.draws.shift();
+    recPic(p);
 }
 
 function applyMeta(p, meta) {
@@ -3075,60 +3343,545 @@ async function loop(p) {
     }
 }
 
-// non-VA panes: the non-VA service's MJPEG relay (same host, port NONVA_PORT) in an <img>, statistics through /nonva_stats/<ue> (proxied here)
+// non-VA panes: the non-VA service's MJPEG relay (same host, port NONVA_PORT) in an <img> - with REC read by nonvaStream() and painted on a
+// canvas -, statistics through /nonva_stats/<ue> (proxied here)
 function makeNonvaPane(ue) {
     const pane = el("div", "pane");
     const top = el("div", "top"); const title = el("div", "ue", "non-VA " + ue); title.appendChild(el("span", "", "720p 영상 중계 · 추론 없음"));
     const chip = el("div", "chip", "대기"); top.appendChild(title); top.appendChild(chip);
-    const stage = el("div", "stage"); const img = document.createElement("img"); img.alt = ""; stage.appendChild(img);
+    const stage = el("div", "stage"); const img = document.createElement("img"); img.alt = "";
+    const canvas = document.createElement("canvas"); canvas.className = "fit"; canvas.width = 1280; canvas.height = 720; stage.appendChild(REC ? canvas : img);
+    const badge = el("div", "badge"); const badgeMain = el("div", "", ""); const badgeSub = el("small", "", ""); badge.appendChild(badgeMain); badge.appendChild(badgeSub); stage.appendChild(badge);   // QoS badge as on the VA panes (nvTick)
     const wait = el("div", "wait show", "UE 대기 중"); stage.appendChild(wait);
     const hint = el("div", "hint", "영상이 안 보이면 https://" + location.hostname + ":" + NONVA_PORT + "/viewer/" + ue + " 를 한 번 열어 인증서를 수락하세요"); stage.appendChild(hint);
-    const metrics = el("div", "metrics four"); const tiles = {};
-    for (const [k, label] of [["fps", "수신 fps"], ["mbps", "상향 Mbps"], ["kb", "프레임 KB"], ["ul", "상향 지연 (UL)"]]) {
-        const t = el("div", "m"); t.appendChild(el("div", "k", label)); const v = el("div", "v", "-"); t.appendChild(v); tiles[k] = { box: t, v: v }; metrics.appendChild(t);
+    const metrics = el("div", "metrics five"); const tiles = {};
+    for (const [k, label] of [["fps", "수신 fps"], ["mbps", "상향 Mbps"], ["kb", "프레임 KB"], ["ul", "상향 지연 (UL)"], ["pct", "QoS 충족률 (최근 100)"]]) {
+        const t = el("div", "m"); const kEl = el("div", "k", label); t.appendChild(kEl); const v = el("div", "v", "-"); t.appendChild(v); tiles[k] = { box: t, v: v, k: kEl }; metrics.appendChild(t);
     }
     const foot = el("div", "foot"); const footL = el("div", "", "-"); const footR = el("div", "", "non-VA 서비스 :" + NONVA_PORT); foot.appendChild(footL); foot.appendChild(footR);
     pane.appendChild(top); pane.appendChild(stage); pane.appendChild(metrics); pane.appendChild(foot);
     document.getElementById("panes").appendChild(pane);
-    const p = { ue, chip, stage, img, wait, hint, tiles, footL, active: false, connected: false, loaded: false, srcSetAt: 0, retryAt: 0, lastFrameId: -1, lastChangeAt: 0 };
+    const p = { ue, chip, stage, img, wait, hint, tiles, footL, active: false, connected: false, loaded: false, srcSetAt: 0, retryAt: 0, lastFrameId: -1, lastChangeAt: 0,
+                canvas, ctx: canvas.getContext("2d"), imgMode: !REC, abort: null, fails: 0, streamed: false,
+                badge, badgeMain, badgeSub, q: null, qAt: 0, lastPicAt: 0, statsOk: false, gone: false, relayFps: 15, waitNone: false };   // q = QoS state from the non-VA service (nvQos)
     img.onload = () => { p.loaded = true; };
     img.onerror = () => { p.loaded = false; p.connected = false; };
+    recAttach(p, "nonva", top);
     return p;
 }
 function nonvaFeed(p) {   // (re)open the MJPEG relay; a new UE session gets a new stream
     const now = Date.now(); if (now < p.retryAt) return;
     p.retryAt = now + 2000; p.connected = true; p.loaded = false; p.srcSetAt = now;
-    p.img.src = "https://" + location.hostname + ":" + NONVA_PORT + "/video_feed?session_id=" + encodeURIComponent(p.ue) + "&t=" + now;
+    const url = "https://" + location.hostname + ":" + NONVA_PORT + "/video_feed?session_id=" + encodeURIComponent(p.ue) + "&t=" + now;
+    if (p.imgMode) p.img.src = url; else nonvaStream(p, url);
+}
+// REC: the relay is read with fetch() and painted on a canvas - a picture an <img> takes from another origin cannot be copied into a recording.
+// Still one stream per pane, the same bytes the <img> took. Parts: "--frame", headers with Content-Length, an empty line, the JPEG.
+async function nonvaStream(p, url) {
+    if (p.abort) p.abort.abort();
+    const ac = p.abort = new AbortController(), dec = new TextDecoder("latin1");
+    let buf = new Uint8Array(1 << 20), len = 0, next = null, busy = false, got = false;
+    const paint = async () => {   // one decode at a time; of the frames that arrive meanwhile only the newest is kept
+        if (busy) return;
+        busy = true;
+        while (next) {
+            const item = next; next = null;
+            try {
+                const bmp = await createImageBitmap(new Blob([item.jpeg], { type: "image/jpeg" }));
+                if (p.abort === ac) { const c = p.canvas; if (c.width !== bmp.width || c.height !== bmp.height) { c.width = bmp.width; c.height = bmp.height; } p.ctx.drawImage(bmp, 0, 0); p.loaded = true; p.streamed = true; p.lastPicAt = item.at; recPic(p); }
+                bmp.close();
+            } catch (e) {}
+        }
+        busy = false;
+    };
+    try {
+        const r = await fetch(url, { cache: "no-store", signal: ac.signal });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        got = true;   // readable from this page, also when no part follows (2026-11-14: a session whose frames all miss the deadline sends none)
+        const rd = r.body.getReader();
+        while (true) {
+            const { done, value } = await rd.read();
+            if (done) break;
+            if (len + value.length > buf.length) { const b = new Uint8Array(Math.max(2 * buf.length, len + value.length)); b.set(buf.subarray(0, len)); buf = b; }
+            buf.set(value, len); len += value.length;
+            while (true) {
+                let h = -1;
+                for (let i = 0; i + 3 < len; i++) if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) { h = i; break; }
+                if (h < 0) break;
+                const head = dec.decode(buf.subarray(0, h)), m = /content-length:[ ]*([0-9]+)/i.exec(head), end = h + 4 + (m ? Number(m[1]) : 0);
+                if (len < end) break;
+                if (m) {   // 2026-11-14: every part carries the QoS state of the non-VA service (X-NV-Meta; absent with an older service)
+                    let meta = null; const x = /x-nv-meta:[ ]*([ -~]+)/i.exec(head);
+                    if (x) { try { meta = JSON.parse(x[1]); } catch (e) {} }
+                    if (meta) nvQos(p, meta);
+                    if (!meta || meta.pic !== false) {   // "pic": false = the held frame once more, sent for the verdict alone
+                        next = { jpeg: buf.slice(h + 4, end), at: performance.now() - (meta && meta.held_ms ? meta.held_ms : 0) }; paint();
+                    }
+                }
+                buf.copyWithin(0, end, len); len -= end;
+            }
+        }
+    } catch (e) {}
+    if (p.abort !== ac) return;
+    p.abort = null; p.connected = false;   // ended (UE stopped, new session) or failed: nonvaLoop opens it again
+    if (got) p.fails = 0;
+    else if (++p.fails >= 3 && !p.streamed) {   // never readable from this page (non-VA service older than this page, or its certificate not accepted yet): show it in an <img> as before, without recording
+        p.imgMode = true; p.recOff = true; p.stage.replaceChild(p.img, p.canvas);
+        if (p.rec) recStop([p]);
+        recNote("non-VA " + p.ue + ": 영상 중계를 이 페이지에서 직접 읽지 못해 이 칸은 녹화할 수 없습니다. https://" + location.hostname + ":" + NONVA_PORT + "/viewer/" + p.ue + " 를 열어 인증서를 수락했는지, non-VA 서비스를 다시 시작했는지(./nonva.sh restart) 확인한 뒤 새로 고치세요.");
+        recUi();
+    }
 }
 async function nonvaLoop(p) {
     while (true) {
         try {
             const r = await fetch("/nonva_stats/" + encodeURIComponent(p.ue) + "?t=" + Date.now(), { cache: "no-store" });
             const d = await r.json();
+            p.gone = false;
             if (d.ok) {
-                const wasActive = p.active; p.active = !!d.active;
+                const wasActive = p.active; p.active = !!d.active; p.statsOk = true; p.relayFps = d.viewer_target_fps || 15;
                 if (d.frame_id !== p.lastFrameId) { p.lastFrameId = d.frame_id; p.lastChangeAt = Date.now(); }
                 p.tiles.fps.v.textContent = fmt(d.receive_fps, 1); p.tiles.mbps.v.textContent = fmt(d.receive_mbps, 1);
-                p.tiles.kb.v.textContent = fmt(d.frame_size_kb); p.tiles.ul.v.textContent = fmt(d.ul_latency_ms); if (!p.tiles.ul.v.querySelector("small")) p.tiles.ul.v.appendChild(el("small", "", "ms"));
-                p.footL.textContent = "프레임 #" + d.frame_id + " · 중계 " + fmt(d.viewer_target_fps) + " fps";
+                p.tiles.kb.v.textContent = fmt(d.frame_size_kb);
+                if (d.qos) nvQos(p, d.qos);
+                else { p.tiles.ul.v.textContent = fmt(d.ul_latency_ms); p.tiles.ul.v.appendChild(el("small", "", "ms")); }   // a non-VA service older than this page: no verdict
+                const q = p.q;
+                p.footL.textContent = "프레임 #" + d.frame_id + " · 중계 " + fmt(d.viewer_target_fps) + " fps" + (q ? " · 충족 " + q.met + " · 미달 " + q.missed + (q.stale ? " · 순서 뒤짐 " + q.stale : "") : "");
                 if (p.active && (!wasActive || !p.connected)) nonvaFeed(p);
-                p.chip.textContent = p.active ? "송출 중" : (d.frame_id > 0 ? "UE 정지" : "대기"); p.chip.className = "chip" + (p.active ? " ok" : "");
-                p.wait.className = "wait" + (p.active || d.frame_id > 0 ? "" : " show");
-                p.hint.className = "hint" + (p.active && p.connected && !p.loaded && Date.now() - p.srcSetAt > 4000 ? " show" : "");
+                if (!q) { p.chip.textContent = p.active ? "송출 중" : (d.frame_id > 0 ? "UE 정지" : "대기"); p.chip.className = "chip" + (p.active ? " ok" : ""); }   // with a verdict the chip is nvTick's
+                const none = !!(q && q.freeze && q.shown_seq === 0 && q.qseq > 0);   // frames arrive, but none has met the deadline yet: there is no picture to show
+                p.wait.className = "wait" + (none || !(p.active || d.frame_id > 0) ? " show" : "");
+                p.wait.textContent = none ? "QoS를 충족한 프레임이 아직 없습니다" : "UE 대기 중"; p.waitNone = none;
+                p.hint.className = "hint" + (!none && p.active && !p.loaded && (p.fails >= 2 || (p.connected && Date.now() - p.srcSetAt > 4000)) ? " show" : "");
             } else {
-                p.chip.textContent = "non-VA 서비스 없음"; p.chip.className = "chip bad"; p.wait.className = "wait show"; p.wait.textContent = "non-VA 세션 없음";
+                p.statsOk = false; p.chip.textContent = "non-VA 서비스 없음"; p.chip.className = "chip bad"; p.wait.className = "wait show"; p.wait.textContent = "non-VA 세션 없음";
             }
-        } catch (e) { p.chip.textContent = "연결 끊김"; p.chip.className = "chip bad"; }
+        } catch (e) { p.gone = true; p.chip.textContent = "연결 끊김"; p.chip.className = "chip bad"; }
         await new Promise(res => setTimeout(res, 1000));
     }
 }
+// QoS of the non-VA panes (2026-11-14). The non-VA service judges every frame - its measured UL latency against NONVA_DEADLINE_MS - and relays only
+// the frames that met it, so the picture stands still while frames miss. Its state comes with every part of the relay (X-NV-Meta) and with the
+// statistics (once a second; the only source when the relay is shown in an <img>); the newer one is kept.
+let nvSubDone = false;
+function nvQos(p, q) {
+    if (p.q && q.sid === p.q.sid && q.qseq < p.q.qseq) return;
+    p.q = q; p.qAt = performance.now();
+    const t = p.tiles;
+    t.ul.k.textContent = "상향 지연 / " + q.deadline_ms + " ms";
+    t.ul.v.textContent = fmt(q.ul_ms); t.ul.v.appendChild(el("small", "", "ms"));
+    t.ul.box.className = "m " + (q.verdict === "met" ? "ok" : (q.verdict === "missed" ? "bad" : ""));
+    t.pct.v.textContent = q.met_pct === null || q.met_pct === undefined ? "-" : fmt(q.met_pct, 0) + "%";
+    t.pct.box.className = "m " + (q.met_pct === null || q.met_pct === undefined ? "" : (q.met_pct >= 90 ? "ok" : (q.met_pct < 70 ? "bad" : "")));
+    if (!nvSubDone) { nvSubDone = true; document.getElementById("nvSub").textContent = ", QoS " + q.deadline_ms + " ms = 상향(실측)" + (q.freeze ? ", 미달 프레임은 화면을 갱신하지 않음" : ""); }
+}
+function nvTick() {   // every 100 ms: badge, dimmed picture and chip of the non-VA panes, the way tick() does it for the VA panes
+    const now = performance.now();
+    for (const p of nvPanes) {
+        const q = p.q;
+        if (!q) continue;   // nothing received yet, or a non-VA service without the verdict: nonvaLoop sets the chip
+        const pic = p.imgMode ? q.shown_seq > 0 : p.lastPicAt > 0;
+        if (p.waitNone && q.shown_seq > 0) { p.waitNone = false; p.wait.className = "wait"; }   // the first frame that met the deadline is here: do not wait for the next statistics
+        const held = !pic ? 0 : (p.imgMode ? q.held_ms + (now - p.qAt) : now - p.lastPicAt);
+        const active = p.active && p.statsOk && !p.gone;
+        const missed = active && q.verdict === "missed" && !!q.freeze;   // the UE is sending, its frames arrive too late
+        const stalled = pic && held > Math.max(1000, q.deadline_ms + 3000 / Math.max(1, p.relayFps)) + (p.imgMode ? 1500 : 0);   // no new picture for a while (in an <img> the age comes with the statistics, once a second)
+        const frozen = missed || stalled;
+        p.stage.className = "stage" + (frozen ? " frozen" : "") + (BADGE ? " dim" : "");
+        if (BADGE && frozen && pic) {
+            p.badge.className = "badge show" + (missed ? "" : " grey");
+            if (missed) {
+                p.badgeMain.textContent = "QoS 미달 · 화면 유지 " + (held / 1000).toFixed(2) + " s";
+                p.badgeSub.textContent = (q.ul_ms === null ? "UL 측정 불가" : "UL " + fmt(q.ul_ms) + " ms > " + q.deadline_ms + " ms") + " · 연속 " + q.streak + "회";
+            } else {
+                p.badgeMain.textContent = (active ? "갱신 없음" : "UE 송신 없음") + " · " + (held / 1000).toFixed(1) + " s";
+                p.badgeSub.textContent = active ? "새 프레임이 아직 없습니다" : (p.lastChangeAt ? "마지막 프레임 " + ((Date.now() - p.lastChangeAt) / 1000).toFixed(0) + " s 전" : "");
+            }
+        } else p.badge.className = "badge";
+        if (p.gone) { p.chip.textContent = "연결 끊김"; p.chip.className = "chip bad"; }
+        else if (!p.statsOk) { p.chip.textContent = "non-VA 서비스 없음"; p.chip.className = "chip bad"; }
+        else if (!p.active) { p.chip.textContent = p.lastFrameId > 0 ? "UE 정지" : "대기"; p.chip.className = "chip"; }
+        else if (q.verdict === "missed") { p.chip.textContent = q.freeze ? "QoS 미달 · 정지" : "QoS 미달"; p.chip.className = "chip bad"; }
+        else { p.chip.textContent = "QoS 충족 · 실시간"; p.chip.className = "chip ok"; }
+    }
+}
 
+// ---- recording (2026-11-13) --------------------------------------------------------------------------------------------------------------
+// "전체 녹화" / "녹화 시작" record a pane as its picture area shows it - the frame with its boxes (VA) or the relayed video (non-VA), fitted
+// into 1920x1080 with black bars, plus the QoS badge / dimming / waiting text (REC_BADGE) - one file per pane. Everything happens in this
+// browser and off this page's thread: each recording has a Web Worker that gets a copy of the pane's canvas whenever the pane draws a new
+// picture (recPic) and the overlay state whenever it changes (recOv), puts a frame on every slot of a fixed REC_FPS grid (the previous frame
+// again while nothing changed), encodes H.264 with WebCodecs and writes a plain MP4 (index in front, no fragments), the form players, editors
+// and slide tools open. The server and the UEs take no part: recording adds no uplink and no downlink traffic. Without WebCodecs H.264 the
+// browser's own MediaRecorder is used on this thread instead (its MP4 is fragmented; WebM as the last resort) and the file list says so.
+const REC_W = 1920, REC_H = 1080, REC_TS = 90000, REC_FONT = getComputedStyle(document.body).fontFamily;   // REC_TS: MP4 time scale, ticks per second
+const recPanes = [], recs = [], recFiles = [], recNotes = [];   // panes with a record button | recordings in progress | finished files | messages
+let recEngine = null, recWorkerUrl = null, recUiAt = 0, recAllBtn = null, recStopBtn = null, recStat = null;
+const recNow = () => performance.timeOrigin + performance.now();   // ms on one clock for this page and its workers
+
+// MP4 writer: ftyp, moov (one H.264 video track, one sample per chunk), mdat
+function mp4Str(s) { const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
+function mp4U32() { const a = new Uint8Array(4 * arguments.length), v = new DataView(a.buffer); for (let i = 0; i < arguments.length; i++) v.setUint32(4 * i, arguments[i] >>> 0); return a; }
+function mp4U16() { const a = new Uint8Array(2 * arguments.length), v = new DataView(a.buffer); for (let i = 0; i < arguments.length; i++) v.setUint16(2 * i, arguments[i]); return a; }
+function mp4Box(type) {   // size, type, then the byte arrays given
+    let n = 8; for (let i = 1; i < arguments.length; i++) n += arguments[i].length;
+    const a = new Uint8Array(n); new DataView(a.buffer).setUint32(0, n); a.set(mp4Str(type), 4);
+    let o = 8; for (let i = 1; i < arguments.length; i++) { a.set(arguments[i], o); o += arguments[i].length; }
+    return a;
+}
+function mp4Table(head, vals, wide) {   // version/flags 0, the head words, then one 32-bit (wide: 64-bit) word per value
+    const w = wide ? 8 : 4, a = new Uint8Array(4 + 4 * head.length + w * vals.length), v = new DataView(a.buffer);
+    let o = 4; for (const h of head) { v.setUint32(o, h); o += 4; }
+    for (const x of vals) { if (wide) { v.setUint32(o, Math.floor(x / 4294967296)); v.setUint32(o + 4, x >>> 0); } else v.setUint32(o, x); o += w; }
+    return a;
+}
+function mp4Moov(r, dataAt, wide) {   // r: sizes, durs (REC_TS ticks), keys (sample numbers from 1), desc (avcC payload), color | dataAt: file offset of the first sample
+    const n = r.sizes.length, now = Math.floor(Date.now() / 1000) + 2082844800, unity = mp4U32(0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000);
+    let total = 0; const runs = [];
+    for (const d of r.durs) { total += d; if (runs.length && runs[runs.length - 1] === d) runs[runs.length - 2]++; else runs.push(1, d); }
+    const offs = new Array(n); let o = dataAt; for (let i = 0; i < n; i++) { offs[i] = o; o += r.sizes[i]; }
+    const c = r.color, colr = c ? [mp4Box("colr", mp4Str("nclx"), mp4U16(c[0], c[1], c[2]), new Uint8Array([c[3] ? 0x80 : 0]))] : [];
+    const avc1 = mp4Box("avc1", new Uint8Array(6), mp4U16(1, 0, 0), mp4U32(0, 0, 0), mp4U16(REC_W, REC_H), mp4U32(0x480000, 0x480000, 0), mp4U16(1), new Uint8Array(32), mp4U16(0x18, 0xffff),
+                        mp4Box("avcC", r.desc), ...colr, mp4Box("pasp", mp4U32(1, 1)));
+    const stbl = mp4Box("stbl", mp4Box("stsd", mp4U32(0, 1), avc1), mp4Box("stts", mp4Table([runs.length / 2], runs)), mp4Box("stss", mp4Table([r.keys.length], r.keys)),
+                        mp4Box("stsc", mp4U32(0, 1, 1, 1, 1)), mp4Box("stsz", mp4Table([0, n], r.sizes)), mp4Box(wide ? "co64" : "stco", mp4Table([n], offs, wide)));
+    const minf = mp4Box("minf", mp4Box("vmhd", mp4U32(1), mp4U16(0, 0, 0, 0)), mp4Box("dinf", mp4Box("dref", mp4U32(0, 1), mp4Box("url ", mp4U32(1)))), stbl);
+    const mdia = mp4Box("mdia", mp4Box("mdhd", mp4U32(0, now, now, REC_TS, total), mp4U16(0x55c4, 0)),
+                        mp4Box("hdlr", mp4U32(0, 0), mp4Str("vide"), mp4U32(0, 0, 0), mp4Str("VideoHandler"), new Uint8Array(1)), minf);
+    const trak = mp4Box("trak", mp4Box("tkhd", mp4U32(3, now, now, 1, 0, total, 0, 0), mp4U16(0, 0, 0, 0), unity, mp4U32(REC_W << 16, REC_H << 16)), mdia);
+    return mp4Box("moov", mp4Box("mvhd", mp4U32(0, now, now, REC_TS, total, 0x10000), mp4U16(0x100, 0), mp4U32(0, 0), unity, mp4U32(0, 0, 0, 0, 0, 0, 2)), trak);
+}
+function mp4File(r, forceWide) {   // -> Blob; 64-bit chunk offsets and mdat size only past 4 GB
+    let bytes = 0; for (const s of r.sizes) bytes += s;
+    const ftyp = mp4Box("ftyp", mp4Str("isom"), mp4U32(0x200), mp4Str("isomiso2avc1mp41"));
+    const wide = !!forceWide || bytes + 16 * r.sizes.length + 65536 > 0xffffffff, head = wide ? 16 : 8;
+    const moov = mp4Moov(r, ftyp.length + mp4Moov(r, 0, wide).length + head, wide);
+    const mdat = new Uint8Array(head), v = new DataView(mdat.buffer); mdat.set(mp4Str("mdat"), 4);
+    if (wide) { v.setUint32(0, 1); v.setUint32(8, Math.floor((bytes + 16) / 4294967296)); v.setUint32(12, (bytes + 16) >>> 0); } else v.setUint32(0, bytes + 8);
+    return new Blob([ftyp, moov, mdat].concat(r.parts), { type: "video/mp4" });
+}
+
+function recPicture(g, src, dim) {   // the pane's picture fitted into 1920x1080; dim = the pane shows it frozen (.stage.frozen.dim)
+    const k = Math.min(REC_W / src.width, REC_H / src.height), w = Math.round(src.width * k), h = Math.round(src.height * k), x = (REC_W - w) >> 1, y = (REC_H - h) >> 1;
+    g.fillStyle = "#000"; g.fillRect(0, 0, REC_W, REC_H);
+    const filter = dim && typeof g.filter === "string";
+    if (filter) g.filter = "saturate(.7) brightness(.8)";
+    g.drawImage(src, x, y, w, h);
+    if (filter) g.filter = "none"; else if (dim) { g.fillStyle = "rgba(0,0,0,.2)"; g.fillRect(x, y, w, h); }
+}
+function recLayer(g, ov, font) {   // what the pane lays over its picture: the badge at twice its size (a pane is about 960 px wide on the screen), the waiting text
+    if (ov.badge) {
+        const a = ov.badge.a, b = ov.badge.b, fa = "700 30px " + font, fb = "500 24px " + font;
+        g.font = fa; const wa = g.measureText(a).width; g.font = fb; const wb = b ? g.measureText(b).width : 0;
+        g.fillStyle = ov.badge.grey ? "rgba(31,42,54,.92)" : "rgba(255,77,94,.92)"; roundRect(g, 24, 24, Math.max(wa, wb) + 48, b ? 104 : 68, 20); g.fill();
+        g.fillStyle = ov.badge.grey ? "#e6edf3" : "#fff"; g.textBaseline = "middle"; g.font = fa; g.fillText(a, 48, 59);
+        if (b) { g.globalAlpha = .92; g.font = fb; g.fillText(b, 48, 99); g.globalAlpha = 1; }
+    }
+    if (ov.wait) {
+        g.fillStyle = "rgba(11,15,20,.6)"; g.fillRect(0, 0, REC_W, REC_H);
+        g.fillStyle = "#8b98a5"; g.font = "400 30px " + font; g.textBaseline = "middle"; g.textAlign = "center"; g.fillText(ov.wait, REC_W / 2, REC_H / 2); g.textAlign = "left";
+    }
+}
+function recWorker() {   // the body of a recording's Web Worker (recWorkerSrc): messages init, pic, ov, stop in; stat, max, done out
+    const base = new OffscreenCanvas(REC_W, REC_H), bg = base.getContext("2d", { alpha: false }), canvas = new OffscreenCanvas(REC_W, REC_H), g = canvas.getContext("2d", { alpha: false });
+    const r = { n: -1, keyN: -1e9, frames: 0, held: 0, bytes: 0, sizes: [], ts: [], keys: [], parts: [], cur: [], curBytes: 0, desc: null, color: null, error: null };
+    let t0 = 0, enc = null, src = null, ov = {}, picDirty = false, dirty = false, last = null, timer = 0, stopSlot = -1, done = false, statAt = 0, maxSent = false;
+    const now = () => performance.timeOrigin + performance.now();
+    const group = () => { if (r.curBytes) { r.parts.push(new Blob(r.cur)); r.cur = []; r.curBytes = 0; } };   // one Blob per key-frame group: the browser can keep large Blobs out of RAM
+    const color = cs => {   // the stream's colour description as the code points of the MP4 'colr' box (ISO/IEC 23091-2)
+        const P = { bt709: 1, bt470bg: 5, smpte170m: 6 }, T = { bt709: 1, smpte170m: 6, "iec61966-2-1": 13 }, M = { rgb: 0, bt709: 1, bt470bg: 5, smpte170m: 6 };
+        return (cs && cs.primaries in P && cs.transfer in T && cs.matrix in M) ? [P[cs.primaries], T[cs.transfer], M[cs.matrix], !!cs.fullRange] : null;
+    };
+    const output = (chunk, meta) => {   // chunks arrive in presentation order (WebCodecs encoders do not reorder frames)
+        const d = meta && meta.decoderConfig && meta.decoderConfig.description;
+        if (d && !r.desc) { r.desc = new Uint8Array(d.buffer ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength) : d.slice(0)); r.color = color(meta.decoderConfig.colorSpace); }
+        const b = new Uint8Array(chunk.byteLength); chunk.copyTo(b);
+        if (chunk.type === "key") { group(); r.keys.push(r.sizes.length + 1); }
+        r.cur.push(b); r.curBytes += b.length; r.bytes += b.length; r.sizes.push(b.length); r.ts.push(Math.round(chunk.timestamp * REC_TS / 1e6));
+    };
+    const finish = async () => {   // -> done: the file ends with slot stopSlot (the same for every recording stopped together)
+        if (done) return;
+        done = true; clearInterval(timer);
+        let blob = null;
+        try { if (enc && enc.state === "configured") await enc.flush(); } catch (e) { if (!r.error) r.error = e.message || String(e); }
+        try { if (enc && enc.state !== "closed") enc.close(); } catch (e) {}
+        const end = Math.max(r.n + 1, stopSlot);
+        try {
+            if (r.sizes.length && r.desc) {
+                group();
+                const endT = Math.round(end * REC_TS / REC_FPS);   // the last frame stays until the end
+                r.durs = r.ts.map((t, i) => Math.max(1, (i + 1 < r.ts.length ? r.ts[i + 1] : endT) - t));
+                blob = mp4File(r);
+            }
+        } catch (e) { if (!r.error) r.error = e.message || String(e); }
+        postMessage({ t: "done", blob, secs: end / REC_FPS, frames: r.frames, held: r.held, error: r.error });
+    };
+    const fail = e => { if (!r.error) r.error = (e && e.message) || String(e); finish(); };
+    const tick = () => {   // every few ms: the frame of the grid slot that has begun
+        if (done) return;
+        const t = now(), n = Math.floor((t - t0) * REC_FPS / 1000);
+        if (stopSlot >= 0 && n >= stopSlot) { finish(); return; }
+        if (t - statAt >= 100) { statAt = t; postMessage({ t: "stat", n: r.n, frames: r.frames, held: r.held, bytes: r.bytes }); }
+        if (!src || n <= r.n) return;
+        if (REC_MAX_MIN > 0 && t - t0 >= REC_MAX_MIN * 60000) { if (!maxSent) { maxSent = true; postMessage({ t: "max" }); } return; }
+        if (enc.encodeQueueSize > 2) return;   // the encoder is behind: no frame for this slot, the previous one stays on (counted in held)
+        try {
+            const ts = r.n < 0 ? 0 : Math.round(n * 1e6 / REC_FPS), key = n - r.keyN >= 2 * REC_FPS;   // the first frame starts the file
+            let f;
+            if (dirty || !last) {
+                const plain = !ov.badge && !ov.wait;
+                if (picDirty) { recPicture(bg, src, !!ov.dim); picDirty = false; }
+                if (!plain) { g.drawImage(base, 0, 0); recLayer(g, ov, REC_FONT); }
+                f = new VideoFrame(plain ? base : canvas, { timestamp: ts }); dirty = false;
+            } else f = new VideoFrame(last, { timestamp: ts });   // nothing changed since the last slot
+            if (key) r.keyN = n;
+            enc.encode(f, { keyFrame: key });
+            if (last) last.close();
+            last = f;
+        } catch (e) { fail(e); return; }
+        if (r.n >= 0) r.held += n - r.n - 1;
+        r.n = n; r.frames++;
+    };
+    onmessage = e => {
+        const m = e.data;
+        if (m.t === "pic") { if (src) src.close(); src = m.bmp; picDirty = dirty = true; }
+        else if (m.t === "ov") { if (!!m.ov.dim !== !!ov.dim) picDirty = true; ov = m.ov; dirty = true; }
+        else if (m.t === "stop") { stopSlot = Math.max(1, Math.floor((m.end - t0) * REC_FPS / 1000)); tick(); }
+        else if (m.t === "init") {
+            t0 = m.t0;
+            try { enc = new VideoEncoder({ output, error: fail }); enc.configure(m.config); } catch (x) { fail(x); return; }
+            timer = setInterval(tick, Math.max(4, Math.floor(250 / REC_FPS)));
+        }
+    };
+}
+function recWorkerSrc() {   // the worker's script: the constants and functions it uses, as text
+    const C = { REC_W, REC_H, REC_TS, REC_FPS, REC_MAX_MIN, REC_FONT };
+    return Object.keys(C).map(k => "const " + k + " = " + JSON.stringify(C[k]) + ";").join(" ") +
+           [mp4Str, mp4U32, mp4U16, mp4Box, mp4Table, mp4Moov, mp4File, roundRect, recPicture, recLayer, recWorker].map(String).join("; ") + "; recWorker();";
+}
+
+function recConfig(codec) { return { codec, width: REC_W, height: REC_H, bitrate: Math.round(REC_MBPS * 1e6), framerate: REC_FPS, latencyMode: "quality", avc: { format: "avc" } }; }
+async function recProbe() {   // -> how this browser can record, or null
+    const force = new URLSearchParams(location.search).get("rec");   // ?rec=mr | webm picks a fallback on purpose (tests)
+    if (!force && window.VideoEncoder && window.VideoFrame && window.Worker && window.OffscreenCanvas) {
+        const lv = REC_FPS > 30 ? "2a" : "28";   // H.264 level 4.0 carries 1080p30, 4.2 1080p60
+        for (const codec of ["avc1.6400" + lv, "avc1.4d00" + lv, "avc1.42e0" + lv]) {   // High / Main / Constrained Baseline profile
+            try { if ((await VideoEncoder.isConfigSupported(recConfig(codec))).supported) return { kind: "wc", codec, ext: "mp4", label: "H.264 MP4" }; } catch (e) {}
+        }
+    }
+    if (window.MediaRecorder && HTMLCanvasElement.prototype.captureStream) {
+        for (const [mime, ext, label] of [["video/mp4;codecs=avc1", "mp4", "H.264 MP4 (조각 MP4)"],
+                                          ["video/webm;codecs=vp9", "webm", "WebM (MP4 미지원 브라우저)"], ["video/webm", "webm", "WebM (MP4 미지원 브라우저)"]]) {
+            if (force === "webm" && ext !== "webm") continue;
+            if (MediaRecorder.isTypeSupported(mime)) return { kind: "mr", mime, ext, label };
+        }
+    }
+    return null;
+}
+function recOverlay(p) {   // what the pane lays over its picture right now, as plain data (read from the page: the recording shows what the screen shows)
+    const ov = { dim: false, badge: null, wait: null };
+    if (!REC_BADGE) return ov;
+    ov.dim = p.stage.classList.contains("frozen") && p.stage.classList.contains("dim");
+    if (p.badge && p.badge.classList.contains("show")) ov.badge = { grey: p.badge.classList.contains("grey"), a: p.badgeMain.textContent, b: p.badgeSub.textContent };
+    if (p.wait.classList.contains("show")) ov.wait = p.wait.textContent;
+    return ov;
+}
+function recOv(r) { const ov = recOverlay(r.p), sig = JSON.stringify(ov); if (sig !== r.ovSig) { r.ovSig = sig; r.w.postMessage({ t: "ov", ov }); } }
+function recPic(p) {   // called when a pane has drawn a new picture: a copy of its canvas goes to the pane's recording
+    const r = p.rec;
+    if (!r) return;
+    if (r.mr) { if (!r.stopping) recMrFrame(r); return; }
+    if (r.snap) { r.again = true; return; }   // one copy at a time
+    r.snap = true;
+    createImageBitmap(p.canvas).then(bmp => { r.snap = false; r.w.postMessage({ t: "pic", bmp }, [bmp]); if (r.again) { r.again = false; recPic(p); } }, () => { r.snap = false; });
+}
+function recOpenWc(r) {
+    if (!recWorkerUrl) recWorkerUrl = URL.createObjectURL(new Blob([recWorkerSrc()], { type: "text/javascript" }));
+    const w = r.w = new Worker(recWorkerUrl);
+    r.done = new Promise(res => { r.finish = res; });
+    w.onmessage = e => {
+        const m = e.data;
+        if (m.t === "stat") { r.n = m.n; r.frames = m.frames; r.held = m.held; r.bytes = m.bytes; recOv(r); if (performance.now() - recUiAt > 500) recUi(); }   // also the pace of the overlay check: messages keep coming in a hidden tab
+        else if (m.t === "max") { recNote("최대 녹화 시간 " + REC_MAX_MIN + "분에 도달해 자동으로 저장했습니다 (.env VA_VIEWER_REC_MAX_MIN)"); recStop([r.p]); }
+        else if (m.t === "done") { r.finish(m); if (!r.stopping) recStop([r.p]); }   // not asked to stop: the encoder failed, what it has is saved
+    };
+    w.onerror = e => { r.finish({ blob: null, error: (e && e.message) || "worker error" }); if (!r.stopping) recStop([r.p]); };
+    w.postMessage({ t: "init", t0: r.t0, config: recConfig(recEngine.codec) });
+}
+function recOpenMr(r) {   // fallback on this thread: MediaRecorder takes a frame whenever the pane changes (it stamps the frames itself)
+    r.canvas = document.createElement("canvas"); r.canvas.width = REC_W; r.canvas.height = REC_H; r.g = r.canvas.getContext("2d", { alpha: false });
+    const s = r.stream = r.canvas.captureStream(0); r.track = s.getVideoTracks()[0];
+    r.mr = new MediaRecorder(s, { mimeType: recEngine.mime, videoBitsPerSecond: Math.round(REC_MBPS * 1e6) });
+    r.mr.ondataavailable = e => { if (e.data && e.data.size) { r.parts.push(e.data); r.bytes += e.data.size; } };
+    r.mr.onerror = e => { r.error = (e.error && e.error.message) || "MediaRecorder error"; recStop([r.p]); };
+    recMrFrame(r); r.mr.start(1000);
+    r.timer = setInterval(() => {
+        if (r.stopping) return;
+        const now = recNow();
+        if (REC_MAX_MIN > 0 && now - r.t0 >= REC_MAX_MIN * 60000) { recNote("최대 녹화 시간 " + REC_MAX_MIN + "분에 도달해 자동으로 저장했습니다 (.env VA_VIEWER_REC_MAX_MIN)"); recStop([r.p]); return; }
+        if (JSON.stringify(recOverlay(r.p)) !== r.ovSig || now - r.frameAt >= 1000) recMrFrame(r);
+        if (performance.now() - recUiAt > 500) recUi();
+    }, 100);
+}
+function recMrFrame(r) {
+    const ov = recOverlay(r.p); r.ovSig = JSON.stringify(ov);
+    recPicture(r.g, r.p.canvas, ov.dim); recLayer(r.g, ov, REC_FONT);
+    (r.track.requestFrame ? r.track : r.stream).requestFrame();
+    r.frames++; r.frameAt = recNow(); r.n = Math.floor((r.frameAt - r.t0) * REC_FPS / 1000);
+}
+function recStart(list) {   // one start instant and one name stamp for all of them: the files of a "전체 녹화" line up frame by frame
+    if (!recEngine) return;
+    const t0 = recNow(), d = new Date(), z = x => String(x).padStart(2, "0");
+    const stamp = d.getFullYear() + z(d.getMonth() + 1) + z(d.getDate()) + "_" + z(d.getHours()) + z(d.getMinutes()) + z(d.getSeconds());
+    for (const p of list) {
+        if (p.rec || p.recOff) continue;
+        const r = { p, t0, name: (REC_PREFIX ? REC_PREFIX + "_" : "") + p.kind + "_" + p.ue + "_" + stamp + "." + recEngine.ext,
+                    n: -1, frames: 0, held: 0, bytes: 0, stopping: false, error: null, parts: [], ovSig: "", snap: false, again: false, frameAt: 0, w: null, mr: null };
+        try { if (recEngine.kind === "wc") recOpenWc(r); else recOpenMr(r); }
+        catch (e) { if (r.w) r.w.terminate(); recNote(p.kind + " " + p.ue + ": 녹화를 시작하지 못했습니다 (" + (e.message || e) + ")"); continue; }
+        p.rec = r; recs.push(r);
+        if (r.w) { recOv(r); recPic(p); }
+    }
+    recUi();
+}
+async function recFinish(r) {   // -> the finished file or null
+    let m;
+    if (r.w) {
+        m = await Promise.race([r.done, new Promise(res => setTimeout(() => res({ blob: null, error: "인코더가 응답하지 않습니다" }), 30000))]);
+        r.w.terminate();
+    } else {
+        recMrFrame(r); await new Promise(res => setTimeout(res, 150));   // the last picture, and time for the recorder to take it
+        clearInterval(r.timer);
+        await new Promise(res => { r.mr.onstop = res; try { r.mr.stop(); } catch (e) { res(); } });
+        r.track.stop();
+        m = { blob: r.parts.length ? new Blob(r.parts, { type: recEngine.mime.split(";")[0] }) : null, secs: (recNow() - r.t0) / 1000, frames: r.frames, held: 0 };
+    }
+    if (m.error && !r.error) r.error = m.error;
+    return m.blob && { name: r.name, blob: m.blob, url: URL.createObjectURL(m.blob), secs: m.secs, frames: m.frames, held: m.held, label: recEngine.label, cfr: !!r.w };   // cfr: a frame on every slot (MediaRecorder: one per change)
+}
+async function recStop(list) {
+    const rs = [], end = recNow() + 120;   // a moment ahead: every worker gets the message before its clock reaches that slot, so the files end together
+    for (const p of list) if (p.rec && !p.rec.stopping) { const r = p.rec; r.stopping = true; rs.push(r); if (r.w) r.w.postMessage({ t: "stop", end }); }
+    if (!rs.length) return;
+    recUi();
+    const files = await Promise.all(rs.map(recFinish)), fresh = [];
+    rs.forEach((r, i) => {
+        recs.splice(recs.indexOf(r), 1); r.p.rec = null;
+        if (files[i]) { recFiles.push(files[i]); fresh.push(files[i]); }
+        if (!files[i] || r.error) recNote(r.name + ": " + (files[i] ? "인코더 오류로 일찍 끝났습니다" : "저장할 프레임이 없습니다") + (r.error ? " (" + r.error + ")" : ""));
+    });
+    recUi(); recList();
+    fresh.forEach((f, i) => setTimeout(() => recSave(f), 400 * i));   // downloads one after another; the links stay in the list below
+}
+function recSave(f) { const a = document.createElement("a"); a.href = f.url; a.download = f.name; a.style.display = "none"; document.body.appendChild(a); a.click(); a.remove(); }
+function recNote(text) {   // a line under the file list (the same text once per moment: four panes reach the time limit together)
+    const line = new Date().toTimeString().slice(0, 8) + " " + text;
+    if (recNotes[recNotes.length - 1] === line) return;
+    recNotes.push(line); while (recNotes.length > 6) recNotes.shift();
+    recList();
+}
+function recClock(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0"); }
+function recSize(b) { return b >= 1e9 ? (b / 1e9).toFixed(2) + " GB" : (b / 1e6).toFixed(1) + " MB"; }
+function recButton(label) { const b = el("button", "rb"); b.type = "button"; b.appendChild(el("i", "")); b.lab = el("span", "", label); b.appendChild(b.lab); return b; }
+function recUi() {
+    if (!recAllBtn) return;
+    recUiAt = performance.now(); const now = recNow(); let on = 0, busy = 0, bytes = 0, off = 0, t0 = now;
+    for (const p of recPanes) {
+        const r = p.rec, b = p.recBtn;
+        if (p.recOff) { off++; b.className = "rb"; b.disabled = true; b.lab.textContent = "녹화 불가"; }
+        else if (!r) { b.className = "rb"; b.disabled = !recEngine; b.lab.textContent = "녹화 시작"; }
+        else if (r.stopping) { busy++; b.className = "rb"; b.disabled = true; b.lab.textContent = "저장 중…"; }
+        else { on++; bytes += r.bytes; t0 = Math.min(t0, r.t0); b.className = "rb on"; b.disabled = false; b.lab.textContent = "녹화 종료 " + recClock(now - r.t0); }
+    }
+    recAllBtn.disabled = !recEngine || on + busy + off === recPanes.length; recStopBtn.disabled = on === 0; recStopBtn.className = "rb stop" + (on ? " on" : "");
+    recStat.textContent = on ? "녹화 중 " + on + "/" + (recPanes.length - off) + " · " + recClock(now - t0) + " · " + recSize(bytes) : (busy ? "저장 중…" : (recEngine ? "" : "이 브라우저는 녹화를 지원하지 않습니다"));
+}
+function recList() {
+    const box = document.getElementById("recFiles"); box.className = recFiles.length || recNotes.length ? "show" : ""; box.textContent = "";
+    const head = el("div", "rfh"); head.appendChild(el("b", "", "녹화 파일")); head.appendChild(el("span", "", "이 탭의 메모리에 있습니다. 탭을 닫거나 새로 고치기 전에 내려받으세요."));
+    if (recFiles.length) {
+        const all = el("button", "rb", "모두 다운로드"); all.type = "button"; all.onclick = () => recFiles.forEach((f, i) => setTimeout(() => recSave(f), 400 * i)); head.appendChild(all);
+    }
+    const clr = el("button", "rb", "목록 비우기"); clr.type = "button"; clr.onclick = () => { for (const f of recFiles) URL.revokeObjectURL(f.url); recFiles.length = 0; recNotes.length = 0; recList(); }; head.appendChild(clr);
+    box.appendChild(head);
+    for (const f of recFiles) {
+        const row = el("div", "rf"), a = el("a", "", f.name); a.href = f.url; a.download = f.name; row.appendChild(a);
+        row.appendChild(el("span", "", recClock(f.secs * 1000) + " · " + recSize(f.blob.size) + " · " + REC_W + "x" + REC_H + " · " + (f.cfr ? REC_FPS + " fps" : "가변 프레임률") + " · " + f.label + " · 프레임 " + f.frames + (f.held ? " (건너뜀 " + f.held + ")" : "")));
+        const del = el("button", "rb", "삭제"); del.type = "button"; del.onclick = () => { URL.revokeObjectURL(f.url); recFiles.splice(recFiles.indexOf(f), 1); recList(); }; row.appendChild(del);
+        box.appendChild(row);
+    }
+    for (const t of recNotes) box.appendChild(el("div", "rfn", t));
+}
+function recAttach(p, kind, top) {   // the pane's own record button, left of its status chip
+    p.kind = kind; p.rec = null;
+    if (!REC) return;
+    const right = el("div", "topr"); top.replaceChild(right, p.chip); p.recBtn = recButton("녹화 시작"); p.recBtn.disabled = true; right.appendChild(p.recBtn); right.appendChild(p.chip);
+    p.recBtn.onclick = () => { if (p.rec) recStop([p]); else recStart([p]); };
+    recPanes.push(p);
+}
+async function recInit() {   // header buttons: all panes at once
+    if (!REC || !recPanes.length) return;
+    const bar = el("div", "recbar"); recStat = el("span", "recstat", ""); recAllBtn = recButton("전체 녹화"); recStopBtn = recButton("녹화 종료"); recStopBtn.classList.add("stop");
+    recAllBtn.onclick = () => recStart(recPanes); recStopBtn.onclick = () => recStop(recPanes);
+    bar.appendChild(recStat); bar.appendChild(recAllBtn); bar.appendChild(recStopBtn); document.querySelector("header").appendChild(bar);
+    recAllBtn.disabled = true; recStopBtn.disabled = true;
+    recEngine = await recProbe();
+    if (recEngine && recEngine.kind !== "wc") recNote("이 브라우저는 H.264 인코더(WebCodecs)를 쓸 수 없어 " + recEngine.label + " 형식으로 저장합니다. Chrome 또는 Edge 최신판을 권장합니다.");
+    window.addEventListener("beforeunload", e => { if (recs.length) { e.preventDefault(); e.returnValue = ""; } });
+    recUi();
+}
+
+// fit to the window (2026-11-14, VA_VIEWER_FIT): every pane on the screen at once and the pictures as large as that allows. Of the grids with full
+// rows (4 panes: 2 x 2, 4 x 1, 1 x 4) and the places for the figures (under the picture, or beside it in one or two columns) the combination with the
+// tallest picture is taken; the picture stays 16:9. The sizes go to CSS variables of <main> (main.fitv); a window too small for it keeps the old layout.
+const FIT_SIDE_W = 176, FIT_MIN_H = 200, FIT_MIN_W = 900;   // one column of figures beside the picture [px]; smallest picture height and window width the fit is used for
+let fitKey = "";
+function fitLayout(again) {
+    if (!FIT) return;
+    const main = document.getElementById("panes"), all = Array.from(main.children), n = all.length;
+    if (!n) return;
+    const W = document.documentElement.clientWidth, H = window.innerHeight, head = Math.ceil(document.querySelector("header").getBoundingClientRect().height);
+    const key = W + " " + H + " " + head + " " + n;
+    if (key === fitKey) return;
+    fitKey = key;
+    main.classList.add("fitv"); main.classList.remove("side");   // the heights below are read with the figures under the picture
+    const cs = getComputedStyle(main), px = v => parseFloat(v) || 0;
+    const padX = px(cs.paddingLeft) + px(cs.paddingRight), padY = px(cs.paddingTop) + px(cs.paddingBottom), gapX = px(cs.columnGap), gapY = px(cs.rowGap);
+    let bar = 0, fig = 0, tile = 0, tiles = 0;   // top + foot, the row of figures, one figure, figures per pane
+    for (const pane of all) {
+        const m = pane.querySelector(".metrics");
+        bar = Math.max(bar, pane.querySelector(".top").offsetHeight + pane.querySelector(".foot").offsetHeight);
+        fig = Math.max(fig, m.offsetHeight); tile = Math.max(tile, m.firstChild.offsetHeight); tiles = Math.max(tiles, m.children.length);
+    }
+    let best = null;
+    const take = (cols, mc, sh) => { if (!best || sh > best.sh + 0.5) best = { cols, mc, sh }; };
+    for (let cols = 1; cols <= n; cols++) {
+        if (n % cols) continue;
+        const rows = n / cols, w = (W - padX - (cols - 1) * gapX) / cols - 2, h = (H - head - padY - (rows - 1) * gapY - 1) / rows - 2 - bar;   // room for picture + figures in one pane
+        take(cols, 0, Math.min(h - fig, w * 9 / 16));
+        for (const mc of [1, 2]) {
+            const sh = Math.min(h, (w - mc * FIT_SIDE_W) * 9 / 16);
+            if (sh >= Math.ceil(tiles / mc) * (tile + 1)) take(cols, mc, sh);
+        }
+    }
+    if (!best || best.sh < FIT_MIN_H || W < FIT_MIN_W) { main.classList.remove("fitv"); return; }
+    const sh = Math.floor(best.sh), sw = Math.floor(sh * 16 / 9);
+    main.style.setProperty("--sh", sh + "px"); main.style.setProperty("--sw", sw + "px"); main.style.setProperty("--pw", (sw + best.mc * FIT_SIDE_W + 2) + "px");
+    main.style.setProperty("--cols", best.cols); main.style.setProperty("--mcols", best.mc || 1);
+    main.classList.toggle("side", best.mc > 0);
+    if (!again && document.documentElement.clientWidth !== W) fitLayout(true);   // the scroll bar went away with the fit: once more with the full width
+}
 if (NV_UES.length) document.getElementById("panes").className = "four";   // 2 x 2 when the non-VA panes are shown
 const panes = UES.map(makePane);
 panes.forEach(loop);
 const nvPanes = NV_UES.map(makeNonvaPane);
 nvPanes.forEach(nonvaLoop);
 setInterval(tick, 100);
+setInterval(nvTick, 100);
+recInit();
+fitLayout();
+window.addEventListener("resize", () => fitLayout());
+setInterval(fitLayout, 500);   // the header changes height with the recording buttons and notes
 </script>
 </body>
 </html>
@@ -3191,7 +3944,7 @@ async def detect_frame(
     frame_id: int | None = Form(None),            # DGIST dashboard: the phone's frame number (the one its /telemetry/result carries)
     request: Request = None,
 ):
-    """one camera frame: JPEG in -> RUN to the dApp agent (model VA_MODEL, qos.deadline_ms VA_DEADLINE_MS) -> its reply out.
+    """one camera frame: JPEG in -> RUN to the dApp agent (model VA_MODEL or the selector's choice, qos.deadline_ms VA_DEADLINE_MS) -> its reply out.
     Timestamps t1..t4 keep the hsw meaning: AI time = ai_start..ai_end = the whole RUN round trip to the agent (queue wait +
     GPU decode + inference + socket), Server Other = everything else in this process."""
     try:
@@ -3280,7 +4033,7 @@ async def detect_frame(
         "gpu_memory_used_gb": gpu_memory_used_gb,
         # DGIST additions
         "backend": VA_BACKEND,
-        "model": VA_MODEL,
+        "model": (dapp or {}).get("model", VA_MODEL) if selector else VA_MODEL,     # the model of THIS frame (same field, same length)
         "qos_deadline_ms": VA_DEADLINE_MS,
         "ue_id": ue_id,
         "dapp": dapp,
@@ -3516,12 +4269,14 @@ async def va_status():
             ue[u] = {k: row.get(k) for k in ("active", "status", "latency_ms", "frame_id", "failures")}
     return {
         "service": "va",
-        "config": {"backend": VA_BACKEND, "model": VA_MODEL, "deadline_ms": VA_DEADLINE_MS, "target_fps": TARGET_FPS,
+        "config": {"backend": VA_BACKEND, "model": "auto" if selector else VA_MODEL, "model_fixed": VA_MODEL,
+                   "model_select": bool(selector), "model_weights": selector.snapshot()["weights"] if selector else None,
+                   "deadline_ms": VA_DEADLINE_MS, "target_fps": TARGET_FPS,
                    "max_inflight": MAX_INFLIGHT, "camera": [CAMERA_WIDTH, CAMERA_HEIGHT], "file_frame": [VA_FILE_WIDTH, VA_FILE_HEIGHT], "jpeg_quality": JPEG_QUALITY,
                    "agent": VA_AGENT, "log_dir": str(LOG_DIR), "telemetry_dir": str(telemetry.directory)},
         "backend": backend.status(),
         "ue": ue,
-        "viewer": {"on": VA_VIEWER, "dl_ms": VA_VIEWER_DL_MS, "freeze": VA_VIEWER_QOS_FREEZE,
+        "viewer": {"on": VA_VIEWER, "dl_ms": VA_VIEWER_DL_MS, "freeze": VA_VIEWER_QOS_FREEZE, "fit": VA_VIEWER_FIT,
                    "ue": {u: {k: st.meta(time.time_ns() / 1_000_000.0, False)[k] for k in ("seq", "verdict", "results", "met", "missed", "failed", "met_pct", "active", "kb", "req_s", "mbps")}
                           for u, st in viewers.items()}},
     }

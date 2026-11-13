@@ -1,7 +1,7 @@
 #!/bin/bash
 # va.sh - the VA (video analytics) service of the 1-cell demo, run from /home/nvidia/_dgist (nvidia account, no sudo)
 #   The phone (COTS UE) opens https://10.45.0.1:8000/ and sends 4K camera frames at 5 req/s per UE; this service forwards every frame
-#   as one RUN request (model 26x, QoS deadline 200 ms) to the dApp agent inside the L1 container (TCP 9810) and returns the agent's
+#   as one RUN request (model VA_MODEL or, with VA_MODEL_SELECT=1, a model drawn by the VA_MODEL_WEIGHTS rule; QoS deadline 200 ms) to the dApp agent inside the L1 container (TCP 9810) and returns the agent's
 #   reply (result figures + detections) to the phone, which draws the boxes and logs the UL / AI / DL latency split.
 #   Base-station viewer (2026-11-11): https://<host>:8000/viewer shows each UE's latest frame + boxes; the picture is updated only when
 #   UL (measured) + AI (measured) + DL (fixed .env VA_VIEWER_DL_MS) <= VA_DEADLINE_MS, so QoS misses show as a frozen picture.
@@ -62,7 +62,7 @@ start)
   port_open $AGENT_PORT || echo "   note: dApp agent port $AGENT_PORT closed (L1 not up: ./dgist.sh up) - frames fail with agent_unreachable until it is"
   ip -br addr show ogstun 2>/dev/null | grep -q 10.45.0.1 || echo "   note: ogstun 10.45.0.1 is down (core off: ./core.sh up) - a UE cannot reach the service"
   LOG=$R/uvicorn_$(date +%m%d_%H%M%S).log; ln -sfn $LOG $R/uvicorn.log
-  echo "== VA service start $(date +%T): backend ${VA_BACKEND:-dapp}, model ${VA_MODEL:-26x}, QoS ${VA_DEADLINE_MS:-200} ms, ${VA_TARGET_FPS:-5} req/s per UE, ${VA_CAMERA_WIDTH:-3840}x${VA_CAMERA_HEIGHT:-2160} JPEG q${VA_JPEG_QUALITY:-0.90}, port $PORT"
+  echo "== VA service start $(date +%T): backend ${VA_BACKEND:-dapp}, model $([ "${VA_MODEL_SELECT:-0}" = 1 ] && echo "rule ${VA_MODEL_WEIGHTS:-unset} (requests per block for 26n,26s,26m,26l,26x)" || echo ${VA_MODEL:-26x}), QoS ${VA_DEADLINE_MS:-200} ms, ${VA_TARGET_FPS:-5} req/s per UE, ${VA_CAMERA_WIDTH:-3840}x${VA_CAMERA_HEIGHT:-2160} JPEG q${VA_JPEG_QUALITY:-0.90}, port $PORT"
   # the braces matter: '&' must background only uvicorn (not the whole && list), so $! is uvicorn's pid and nothing keeps our stdout open
   (cd $V && set +u && . $VENV/bin/activate && { nohup uvicorn app:app --host 0.0.0.0 --port $PORT --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt > $LOG 2>&1 < /dev/null & echo $! > $PIDF; })
   for i in $(seq 1 90); do port_open $PORT && break; alive || break; sleep 1; done

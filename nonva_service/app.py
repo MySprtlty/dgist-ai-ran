@@ -7,6 +7,10 @@ NONVA_FPS 20, NONVA_JPEG_QUALITY 0.80, NONVA_VIEWER_FPS 20), the page JS constan
 <_dgist>/runs/nonva_service_log (NONVA_LOG_DIR), service_common/ lives next to this file, GET /nonva/status added. Run: nonva.sh start
 2026-11-12: the phone page can take a video file stored on the phone as the source instead of the camera (frames scaled to
 NONVA_WIDTH x NONVA_HEIGHT, aspect kept; read locally, nothing is downloaded) and has a full-screen button.
+2026-11-14: QoS for the viewers. A frame whose measured UL latency is above NONVA_DEADLINE_MS (250) missed the deadline; the MJPEG relay
+then keeps the last frame that met it (NONVA_VIEWER_QOS_FREEZE=1, the rule of the VA viewer) and reports the verdict in the part header
+X-NV-Meta and in /receiver_stats ("qos"); /viewer shows a badge over the held picture. The phone page (video-file source) got "Restart
+Video" and a start at a chosen clock time; both happen on the phone alone. Nothing new is sent to a phone: the upload reply is unchanged.
 (uvicorn app:app --host 0.0.0.0 --port 8001 --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt). Original: upstream_hsw/app.py
 """
 from fastapi import (
@@ -31,7 +35,10 @@ import csv
 import time
 import os
 import logging
+import json
+import math
 import warnings
+from urllib.parse import urlsplit
 warnings.filterwarnings("ignore", message=r"(?s).*on_event is deprecated")   # FastAPI 0.141 still accepts @app.on_event (hsw code)
 
 
@@ -47,6 +54,10 @@ JPEG_QUALITY = float(os.environ.get("NONVA_JPEG_QUALITY") or 0.80)
 
 VIEWER_FPS = float(os.environ.get("NONVA_VIEWER_FPS") or 20)             # MJPEG relay rate to the /viewer page
 VIEWER_INTERVAL = 1.0 / VIEWER_FPS
+# DGIST 2026-11-14: QoS of this service for the viewers = the measured UL latency of a frame against this deadline. A frame that missed it
+# does not replace the picture the viewers get (1; 0 = every frame is relayed as before and only the verdict is reported)
+NONVA_DEADLINE_MS = float(os.environ.get("NONVA_DEADLINE_MS") or 250)
+NONVA_VIEWER_QOS_FREEZE = int(os.environ.get("NONVA_VIEWER_QOS_FREEZE") or 1)
 
 CLOCK_SYNC_SAMPLES = 30
 CLOCK_SYNC_BEST_SAMPLES = 5
@@ -162,6 +173,21 @@ class UESession:
     clock_sync_time_ms: float = 0.0
     session_start_time_ms: float = 0.0
     total_startup_time_ms: float = 0.0
+    # DGIST 2026-11-14: QoS verdict and the picture the viewers get (qos_update)
+    qos_sid: int = field(default_factory=lambda: int(time.time() * 1000))   # tells the sessions of one UE apart
+    qos_seq: int = 0                  # frames judged
+    qos_verdict: str = "none"         # met | missed | none (verdict of the latest frame)
+    qos_ul_ms: float | None = None    # its UL latency; None = not measurable (no usable send time)
+    qos_met: int = 0
+    qos_missed: int = 0
+    qos_streak: int = 0               # misses in a row
+    qos_stale: int = 0                # frames not shown because a newer capture was on the screen already
+    qos_recent: deque = field(default_factory=lambda: deque(maxlen=100))   # verdicts of the last 100 frames
+    shown_frame: bytes | None = None  # JPEG the viewers get, exactly as the phone sent it
+    shown_frame_id: int = 0
+    shown_seq: int = 0                # picture changes
+    shown_time: float = 0.0           # time.monotonic() of the last picture change
+    shown_capture_ms: float = 0.0     # send time of the shown frame (server clock)
 
 sessions: dict[str, UESession] = {}
 VALID_UE_IDS = {"ue1", "ue2"}
@@ -191,6 +217,36 @@ def get_receive_stats(session: UESession):
     fps = (len(session.recent_frames) - 1) / duration
     mbps = sum(size for _, size in session.recent_frames) * 8 / duration / 1_000_000
     return fps, mbps
+def qos_update(session: UESession, frame: bytes, frame_id: int, capture_ms: float, ul_ms: float | None):
+    """DGIST 2026-11-14: verdict of one uploaded frame for the viewers - the rule of the VA viewer (va_service ViewerState.update): the
+    status changes with every frame, the picture only with a frame that met the deadline (NONVA_VIEWER_QOS_FREEZE)"""
+    met = ul_ms is not None and ul_ms <= NONVA_DEADLINE_MS      # a frame without a usable send time counts as missed
+    session.qos_seq += 1
+    session.qos_ul_ms = ul_ms
+    if met:
+        session.qos_verdict = "met"; session.qos_met += 1; session.qos_streak = 0
+    else:
+        session.qos_verdict = "missed"; session.qos_missed += 1; session.qos_streak += 1
+    session.qos_recent.append(met)
+    if met or not NONVA_VIEWER_QOS_FREEZE:
+        if not math.isfinite(capture_ms):
+            capture_ms = session.shown_capture_ms
+        if capture_ms < session.shown_capture_ms:
+            session.qos_stale += 1            # an older capture arrived after a newer one was shown: keep the newer picture
+        else:
+            session.shown_frame, session.shown_frame_id = frame, frame_id
+            session.shown_capture_ms, session.shown_time = capture_ms, time.monotonic()
+            session.shown_seq += 1
+
+def qos_state(session: UESession) -> dict:
+    """what a viewer needs to show the verdict: X-NV-Meta header of every MJPEG part, "qos" in /receiver_stats"""
+    ul, recent = session.qos_ul_ms, session.qos_recent
+    return {"sid": session.qos_sid, "qseq": session.qos_seq, "verdict": session.qos_verdict,
+            "ul_ms": round(ul, 1) if ul is not None else None, "deadline_ms": NONVA_DEADLINE_MS, "freeze": NONVA_VIEWER_QOS_FREEZE,
+            "streak": session.qos_streak, "met": session.qos_met, "missed": session.qos_missed, "stale": session.qos_stale,
+            "met_pct": round(100.0 * sum(recent) / len(recent), 1) if recent else None,
+            "shown_frame_id": session.shown_frame_id, "shown_seq": session.shown_seq,
+            "held_ms": round((time.monotonic() - session.shown_time) * 1000.0) if session.shown_seq else None}
 
 # =====================================================
 # iPhone Sender Page
@@ -277,6 +333,48 @@ video {
     display: block;
 }
 
+/* DGIST 2026-11-14: video-file source: restart button and schedule note laid over the picture in full screen */
+#fsRestart {
+    display: none;
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 5;
+    margin: 0;
+    padding: 6px 12px;
+    font-size: 16px;
+    color: white;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    border-radius: 6px;
+}
+
+#stage.filesrc:fullscreen #fsRestart {
+    display: block;
+}
+
+#fsSched {
+    display: none;
+    position: absolute;
+    left: 8px;
+    bottom: 8px;
+    z-index: 5;
+    padding: 4px 10px;
+    font-size: 14px;
+    color: white;
+    background: rgba(0, 0, 0, 0.45);
+    border-radius: 6px;
+    pointer-events: none;
+}
+
+#stage:fullscreen #fsSched.show {
+    display: block;
+}
+
+#schedTime {
+    font-size: 18px;
+    padding: 6px;
+}
 button {
     font-size: 18px;
     margin: 5px;
@@ -324,6 +422,12 @@ __NONVA_WIDTH__x__NONVA_HEIGHT__ / __NONVA_FPS__ FPS / JPEG Quality __NONVA_JPEG
 <button id="fsExit" onclick="exitFullscreen()">
     Exit Full Screen
 </button>
+<!-- DGIST 2026-11-14: shown over the picture in full screen: restart of a video file, note of a scheduled start -->
+<button id="fsRestart" onclick="restartVideo()">
+    Restart Video
+</button>
+
+<div id="fsSched"></div>
 
 </div>
 
@@ -361,6 +465,24 @@ __NONVA_WIDTH__x__NONVA_HEIGHT__ / __NONVA_FPS__ FPS / JPEG Quality __NONVA_JPEG
 <button onclick="enterFullscreen()">
     Full Screen
 </button>
+<!-- DGIST 2026-11-14: video-file source: play the file again from its first frame, now or at a chosen clock time (on the phone only:
+     no request is sent, nothing is downloaded) -->
+<button onclick="restartVideo()">
+    Restart Video
+</button>
+
+<p>
+Start video at:
+<input type="time" id="schedTime">
+<button onclick="scheduleVideoStart()">Set</button>
+<button onclick="cancelVideoStart()">Cancel</button>
+<br>
+Scheduled start: <strong id="schedStatus">Not set</strong>
+<br>
+Last video start: <strong id="schedLast">-</strong>
+<br>
+Clock: <strong id="schedClock">-</strong>
+</p>
 
 
 <br><br>
@@ -812,9 +934,140 @@ document.addEventListener("visibilitychange", () => {
     wakeLockUpdate();
     if (document.visibilityState === "visible" && fileUrl !== null) {     // a file paused while the page was hidden plays on
         const video = document.getElementById("camera");
-        if (video.paused) video.play().catch(() => {});
+        if (video.paused && !schedPrerolled) video.play().catch(() => {});
     }
 });
+// =====================================================
+// DGIST 2026-11-14: video-file source - play the file again from its first frame, either now ("Restart Video") or at a chosen
+// clock time ("Start video at"). The clock is the base station's once this page has synchronised with it (Start Streaming does that; it is
+// the offset the latency figures use) and this phone's own clock before, so phones set to the same time start together. All of it
+// happens on the phone: no request is sent and nothing is downloaded for it; the streaming goes on unchanged while the file starts over.
+// =====================================================
+
+const SCHED_PREROLL_MS = 700;      // this long before the chosen time the file is stopped on its first frame, so that it starts on time
+let schedTargetMs = null;          // chosen start time, ms since the epoch; null = nothing scheduled
+let schedPrerolled = false;        // the file is waiting on its first frame
+let schedResumeAt = 0;             // position the pre-roll left (a cancel goes back to it)
+let schedPreUrl = null;            // the file the pre-roll stopped (another file chosen meanwhile is not waiting)
+let schedFireTimer = null;
+let schedNote = "";                // outcome of the last schedule
+let schedNoteAt = 0;
+let schedLast = "";                // the last start from the first frame: when, and what asked for it
+
+function schedNowMs() { return clockSynced ? clientNowMs() + clockOffsetMs : Date.now(); }
+function schedPad(n) { return (n < 10 ? "0" : "") + n; }
+function schedClockText(ms, withMs) {
+    const d = new Date(ms);
+    return schedPad(d.getHours()) + ":" + schedPad(d.getMinutes()) + ":" + schedPad(d.getSeconds())
+        + (withMs ? "." + String(d.getMilliseconds()).padStart(3, "0") : "");
+}
+function schedLeftText(ms) {
+    if (ms < 10000) return (Math.max(0, ms) / 1000).toFixed(1) + " s";
+    const s = Math.ceil(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h > 0) return h + " h " + schedPad(m) + " min";
+    return m > 0 ? m + " min " + schedPad(s % 60) + " s" : s + " s";
+}
+
+// the file from its first frame; false when the source is not a file
+function restartVideoNow() {
+    if (fileUrl === null) return false;
+    const video = document.getElementById("camera");
+    try { video.currentTime = 0; } catch (e) {}
+    video.play().catch(() => {});
+    return true;
+}
+
+function restartVideo() {
+    if (fileUrl === null) { alert("Restart Video works with a video file: choose one with the Video File button first."); return; }
+    if (schedPrerolled && fileUrl === schedPreUrl) return;      // the scheduled start is less than a second away and does the same
+    restartVideoNow();
+    schedLast = schedClockText(schedNowMs(), true) + " (Restart Video button)";
+    schedShow();
+}
+
+function schedDisarm() {
+    if (schedFireTimer !== null) { clearTimeout(schedFireTimer); schedFireTimer = null; }
+    if (schedPrerolled && fileUrl !== null && fileUrl === schedPreUrl) {      // the file goes on from where the pre-roll took it
+        const video = document.getElementById("camera");
+        try { video.currentTime = schedResumeAt; } catch (e) {}
+        video.play().catch(() => {});
+    }
+    schedPrerolled = false;
+    schedTargetMs = null;
+}
+
+function scheduleVideoStart() {
+    const value = document.getElementById("schedTime").value;
+    if (!value) { alert("Choose the start time first."); return; }
+    const part = value.split(":").map(Number);
+    schedDisarm();
+    const now = schedNowMs(), d = new Date(now);
+    d.setHours(part[0], part[1], part.length > 2 ? part[2] : 0, 0);
+    let target = d.getTime();
+    if (target <= now) target += 86400000;      // that time has passed today: the same time tomorrow
+    schedTargetMs = target;
+    schedNote = "";
+    schedTick();
+}
+
+function cancelVideoStart() {
+    if (schedTargetMs === null) return;
+    schedDisarm();
+    schedNote = "Cancelled"; schedNoteAt = Date.now();
+    schedShow();
+}
+
+function schedFire() {
+    schedFireTimer = null;
+    if (schedTargetMs === null) return;
+    const left = schedTargetMs - schedNowMs();
+    if (left > 2) { schedFireTimer = setTimeout(schedFire, left > 12 ? left - 8 : 1); return; }      // woken early (or the clock was synchronised meanwhile): wait for the rest
+    const target = schedTargetMs, video = document.getElementById("camera"), ready = schedPrerolled && fileUrl === schedPreUrl;
+    schedTargetMs = null; schedPrerolled = false; schedNoteAt = Date.now();
+    if (fileUrl === null) { schedNote = "Skipped at " + schedClockText(target, false) + ": no video file was chosen"; schedShow(); return; }
+    if (!ready || video.currentTime > 0.05) { try { video.currentTime = 0; } catch (e) {} }
+    video.play().then(() => {
+        const at = schedNowMs();
+        schedLast = schedClockText(at, true) + " (scheduled for " + schedClockText(target, false) + ", playing " + Math.round(at - target) + " ms after it)";
+        schedNote = "Started at " + schedClockText(target, false); schedNoteAt = Date.now(); schedShow();
+    }, error => {
+        schedNote = "Could not start at " + schedClockText(target, false) + ": " + (error && (error.message || error)); schedNoteAt = Date.now(); schedShow();
+    });
+}
+
+function schedShow() {
+    const now = schedNowMs(), note = document.getElementById("fsSched");
+    document.getElementById("stage").classList.toggle("filesrc", fileUrl !== null);
+    let text = schedNote || "Not set", over = "";
+    if (schedTargetMs !== null) {
+        const left = schedTargetMs - now, day = new Date(schedTargetMs).getDate() !== new Date(now).getDate() ? " tomorrow" : "";
+        text = schedClockText(schedTargetMs, false) + day + ", in " + schedLeftText(left) + (fileUrl === null ? " (no video file chosen yet)" : "");
+        over = "Video starts at " + schedClockText(schedTargetMs, false) + day + ", in " + schedLeftText(left);
+    } else if (schedNote && Date.now() - schedNoteAt < 3000) over = schedNote;
+    document.getElementById("schedStatus").innerText = text;
+    document.getElementById("schedLast").innerText = schedLast || "-";
+    const diff = Math.round(now - Date.now());
+    document.getElementById("schedClock").innerText = schedClockText(now, false) + (clockSynced
+        ? " (base station clock; this phone's clock is " + Math.abs(diff) + " ms " + (diff >= 0 ? "behind" : "ahead") + ")"
+        : " (this phone's clock; the base station's clock after Start Streaming)");
+    note.innerText = over; note.className = over ? "show" : "";
+}
+
+function schedTick() {      // every 200 ms: the status lines, the pre-roll and the timer of the start itself
+    if (schedTargetMs !== null) {
+        const left = schedTargetMs - schedNowMs();
+        if (left <= SCHED_PREROLL_MS && !schedPrerolled && fileUrl !== null) {
+            const video = document.getElementById("camera");
+            schedResumeAt = video.currentTime; schedPrerolled = true; schedPreUrl = fileUrl;
+            video.pause();
+            try { video.currentTime = 0; } catch (e) {}
+        }
+        if (left <= 1000 && schedFireTimer === null) schedFireTimer = setTimeout(schedFire, Math.max(0, left - 8));
+    }
+    schedShow();
+}
+setInterval(schedTick, 200);
+schedTick();
 
 
 // =====================================================
@@ -975,7 +1228,7 @@ async function startStreaming() {
     if (fileUrl !== null) {      // DGIST: a file that was paused (page in the background) plays again
 
         const fileVideo = document.getElementById("camera");
-        if (fileVideo.paused) { try { await fileVideo.play(); } catch (e) {} }
+        if (fileVideo.paused && !schedPrerolled) { try { await fileVideo.play(); } catch (e) {} }
     }
 
 
@@ -1634,6 +1887,42 @@ body {
     background: black;
     border: 1px solid #555;
 }
+/* DGIST 2026-11-14: QoS badge over the held picture (a frame above the UL deadline does not replace it) */
+#liveWrap {
+    position: relative;
+    max-width: 1280px;
+}
+
+#liveWrap.frozen #liveFrame {
+    filter: saturate(.7) brightness(.8);
+}
+
+#qosBadge {
+    display: none;
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    padding: 8px 14px;
+    font-weight: bold;
+    font-size: 18px;
+    color: white;
+    background: rgba(200, 30, 30, 0.9);
+    border-radius: 6px;
+}
+
+#qosBadge.show {
+    display: block;
+}
+
+#qosBadge.grey {
+    background: rgba(60, 70, 80, 0.92);
+}
+
+#qosBadge small {
+    display: block;
+    font-weight: normal;
+    font-size: 13px;
+}
 
 .info-box {
     margin-top: 15px;
@@ -1669,9 +1958,12 @@ Viewer Output:
      MJPEG Video
      ================================================= -->
 
+<div id="liveWrap">
 <img id="liveFrame"
      src=""
      alt="Waiting for video stream...">
+<div id="qosBadge"><span id="qosBadgeMain"></span><small id="qosBadgeSub"></small></div>
+</div>
 
 
 <!-- =================================================
@@ -1735,6 +2027,41 @@ Viewer Target FPS:
 </div>
 
 
+<!-- =================================================
+     QoS (DGIST 2026-11-14): UL latency of every frame against the deadline
+     ================================================= -->
+
+<div class="info-box">
+
+
+<h2>QoS</h2>
+
+
+<p>
+Deadline (UL latency):
+<strong id="qosDeadline">
+-
+</strong>
+</p>
+
+
+<p>
+Latest Frame:
+<strong id="qosVerdict">
+-
+</strong>
+</p>
+
+
+<p>
+Met / Missed:
+<strong id="qosCounts">
+-
+</strong>
+</p>
+
+
+</div>
 <!-- =================================================
      Streaming Latency
      ================================================= -->
@@ -1851,6 +2178,7 @@ async function refreshStats() {
 
         const data =
             await response.json();
+        qosTake(data);      // DGIST 2026-11-14
 
         if (data.frame_id !== lastFrameId) {
             lastFrameId = data.frame_id;
@@ -1956,6 +2284,49 @@ setInterval(
 refreshStats();
 
 
+// =====================================================
+// DGIST 2026-11-14: QoS verdict. The service compares the measured UL latency of every frame with its deadline (NONVA_DEADLINE_MS) and
+// relays only the frames that met it, so the picture stands still while frames miss it; the badge says for how long.
+// =====================================================
+
+let qos = null;
+let qosAt = 0;
+let qosActive = false;
+let qosFps = 20;
+
+function qosTake(data) {
+    if (!data.qos) return;
+    qos = data.qos;
+    qosAt = performance.now();
+    qosActive = !!data.active;
+    qosFps = data.viewer_target_fps || 20;
+    document.getElementById("qosDeadline").innerText = qos.deadline_ms + " ms" + (qos.freeze ? " (a frame above it does not replace the picture)" : "");
+    document.getElementById("qosVerdict").innerText = qos.verdict === "none" ? "-"
+        : (qos.verdict === "met" ? "Met" : "MISSED") + (qos.ul_ms === null ? "" : " (UL " + qos.ul_ms.toFixed(1) + " ms)")
+          + (qos.streak > 0 ? ", " + qos.streak + " in a row" : "");
+    document.getElementById("qosCounts").innerText = qos.met + " / " + qos.missed
+        + (qos.met_pct === null ? "" : " (last 100 frames: " + qos.met_pct.toFixed(1) + " % met)") + (qos.stale ? ", out of order " + qos.stale : "");
+}
+
+function qosPaint() {
+    let main = "", sub = "", grey = false;
+    if (qos && qos.shown_seq > 0) {
+        const held = qos.held_ms + (performance.now() - qosAt);
+        if (qosActive && qos.verdict === "missed" && qos.freeze) {
+            main = "QoS miss - picture held " + (held / 1000).toFixed(2) + " s";
+            sub = (qos.ul_ms === null ? "UL latency unknown" : "UL " + Math.round(qos.ul_ms) + " ms > " + qos.deadline_ms + " ms") + ", " + qos.streak + " in a row";
+        } else if (held > Math.max(1000, qos.deadline_ms + 3000 / Math.max(1, qosFps))) {
+            main = (qosActive ? "No update - " : "UE not sending - ") + (held / 1000).toFixed(1) + " s";
+            grey = true;
+        }
+    }
+    document.getElementById("liveWrap").className = main ? "frozen" : "";
+    document.getElementById("qosBadge").className = main ? (grey ? "show grey" : "show") : "";
+    document.getElementById("qosBadgeMain").innerText = main;
+    document.getElementById("qosBadgeSub").innerText = sub;
+}
+
+setInterval(qosPaint, 100);
 </script>
 
 
@@ -2081,6 +2452,10 @@ async def upload_frame(
     session.latest_frame = frame_data
     session.latest_frame_id = frame_id
     session.latest_frame_size = frame_size
+    # DGIST 2026-11-14: QoS verdict for the viewers = this frame's measured UL latency against NONVA_DEADLINE_MS; a frame that missed it
+    # does not replace the picture they get. The reply to the phone below is unchanged.
+    qos_update(session, frame_data, frame_id, upload_start_ms + session.clock_offset_ms,
+               ul_latency_ms if math.isfinite(raw_ul_latency_ms) else None)
     update_receive_stats(session, frame_size)
     receive_fps, receive_mbps = get_receive_stats(session)
     gpu_util_percent, gpu_memory_used_gb = read_gpu_metrics()
@@ -2133,32 +2508,50 @@ async def stop_session(session_id: str, session_token: str):
             "records": len(session.records), "session_id": session_id}
 
 async def mjpeg_generator(session_id: str):
+    # DGIST 2026-11-14: relays the frame the QoS rule lets through (session.shown_frame: with NONVA_VIEWER_QOS_FREEZE only frames that met
+    # the deadline) - never more parts than before. Every part carries the verdict in an X-NV-Meta header; when the verdict changes
+    # without a new picture (the first miss after a met frame), the held frame is sent once more ("pic": false) so that a viewer
+    # reading the stream learns it at once.
     session = get_session(session_id)
-    last_sent_id = -1
+    last_seq = 0
+    last_verdict = None
     try:
         while sessions.get(session_id) is session:
-            if not session.active and session.latest_frame_id == last_sent_id:
-                break
-            frame = session.latest_frame
-            frame_id = session.latest_frame_id
-            if frame is None or frame_id == last_sent_id:
+            frame = session.shown_frame
+            seq = session.shown_seq
+            verdict = session.qos_verdict
+            new_pic = frame is not None and seq != last_seq
+            if not new_pic and (frame is None or verdict == last_verdict):
+                if not session.active:
+                    break
                 await asyncio.sleep(VIEWER_INTERVAL)
                 continue
-            last_sent_id = frame_id
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                   + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+            last_seq = seq
+            last_verdict = verdict
+            meta = qos_state(session)
+            meta["pic"] = new_pic
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode()
+                   + b"\r\nX-NV-Meta: " + json.dumps(meta, separators=(",", ":")).encode("ascii")
+                   + b"\r\n\r\n" + frame + b"\r\n")
             await asyncio.sleep(VIEWER_INTERVAL)
     except asyncio.CancelledError:
         return
 
 @app.get("/video_feed")
-async def video_feed(session_id: str):
+async def video_feed(session_id: str, request: Request):
     get_session(session_id)
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate",
+               "Pragma": "no-cache"}
+    # the VA service's 4-UE viewer (same host, other port) reads this stream with fetch() to paint and record it (2026-11-13): a page served
+    # from this host may read it; any other origin gets no CORS header (an <img> shows the stream without one, as before)
+    origin = request.headers.get("origin") or ""
+    if origin and urlsplit(origin).hostname and urlsplit(origin).hostname == request.url.hostname:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
     return StreamingResponse(
         mjpeg_generator(session_id),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate",
-                 "Pragma": "no-cache"},
+        headers=headers,
     )
 
 @app.get("/receiver_stats")
@@ -2178,6 +2571,7 @@ async def receiver_stats(session_id: str):
         "e2e_latency_ms": session.latest_ul_latency_ms,
         "clock_offset_ms": session.clock_offset_ms,
         "sync_rtt_ms": session.sync_rtt_ms,
+        "qos": qos_state(session),      # DGIST 2026-11-14: verdict against NONVA_DEADLINE_MS for the viewers
     }
 
 
@@ -2205,9 +2599,11 @@ async def nonva_status():
     return {
         "service": "nonva",
         "config": {"width": TARGET_WIDTH, "height": TARGET_HEIGHT, "fps": TARGET_FPS, "jpeg_quality": JPEG_QUALITY,
-                   "viewer_fps": VIEWER_FPS, "log_dir": str(LOG_DIR), "telemetry_dir": str(telemetry.directory)},
+                   "viewer_fps": VIEWER_FPS, "deadline_ms": NONVA_DEADLINE_MS, "viewer_qos_freeze": NONVA_VIEWER_QOS_FREEZE,
+                   "log_dir": str(LOG_DIR), "telemetry_dir": str(telemetry.directory)},
         "sessions": {sid: {"active": s.active, "frames": len(s.records), "latest_frame_id": s.latest_frame_id,
-                           "latest_frame_kb": round(s.latest_frame_size / 1024.0, 1), "latest_ul_latency_ms": s.latest_ul_latency_ms}
+                           "latest_frame_kb": round(s.latest_frame_size / 1024.0, 1), "latest_ul_latency_ms": s.latest_ul_latency_ms,
+                           "qos": qos_state(s)}
                      for sid, s in sessions.items()},
         "ue": ue,
     }

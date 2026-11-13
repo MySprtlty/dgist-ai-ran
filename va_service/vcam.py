@@ -10,6 +10,7 @@ so the VA service's own connection (role "va") is untouched.
 Status: one line every --report seconds on stdout and a JSON snapshot every second in --status (per camera and total: offered,
 sent, skipped, success, fail by reason, achieved req/s, RUN round trip p50/p90/p99 over the last 60 s, 'met' = success within
 --deadline). --dry-run exercises the pacing without an agent (simulated 17 ms latency).
+Model: --model, else the .env rule (VA_MODEL_SELECT=1 + VA_MODEL_WEIGHTS, model_select.py - a sequence of its own), else VA_MODEL.
 
 usage: vcam.py --cams N [--fps 10] [--model 26x] [--deadline 200] [--inflight 4] [--frames DIR] [--agent 127.0.0.1:9810]
                [--status runs/vcam/status.json] [--duration SEC] [--report 5] [--dry-run]        (vcam.sh start|stop|status)
@@ -34,7 +35,8 @@ def load_frames(d):
 
 
 class Cam:
-    def __init__(self, idx, frames, fps, inflight, deadline, model, agent, dry, lock):
+    def __init__(self, idx, frames, fps, inflight, deadline, model, agent, dry, lock, selector=None):
+        self.selector = selector            # model_select.ModelSelector shared by the cameras (None = self.model for every frame)
         self.idx, self.frames, self.fps, self.cap, self.deadline, self.model, self.agent, self.dry = idx, frames, fps, inflight, deadline, model, agent, dry
         self.q = queue.Queue(maxsize=max(1, inflight))
         self.pos = (idx * 7) % len(frames)
@@ -71,7 +73,8 @@ class Cam:
                 time.sleep(0.017 + random.random() * 0.004); r = {"status": "success", "sm": 80, "infer_ms": 14.5}
             else:
                 try:
-                    r = self.agent.run(fr, model=self.model, qos={"deadline_ms": self.deadline, "priority": 0}, want_dets=False, timeout=5.0)
+                    r = self.agent.run(fr, model=self.selector.pick() if self.selector else self.model,
+                                       qos={"deadline_ms": self.deadline, "priority": 0}, want_dets=False, timeout=5.0)
                 except OSError as exc:
                     r = {"status": "fail", "reason": f"io:{type(exc).__name__}"}
             ms = (time.monotonic() - t0) * 1000.0
@@ -101,11 +104,16 @@ class Cam:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cams", type=int, required=True); ap.add_argument("--fps", type=float, default=10.0)
-    ap.add_argument("--model", default=os.environ.get("VA_MODEL", "26x")); ap.add_argument("--deadline", type=int, default=int(os.environ.get("VA_DEADLINE_MS", 200)))
+    ap.add_argument("--model", default=None); ap.add_argument("--deadline", type=int, default=int(os.environ.get("VA_DEADLINE_MS", 200)))
     ap.add_argument("--inflight", type=int, default=4); ap.add_argument("--frames", default=str(HERE / "vcam_frames"))
     ap.add_argument("--agent", default=os.environ.get("VA_AGENT", "127.0.0.1:9810")); ap.add_argument("--status", default=str(DGIST / "runs" / "vcam" / "status.json"))
     ap.add_argument("--duration", type=float, default=0); ap.add_argument("--report", type=float, default=5); ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
+    selector = None
+    if a.model is None:     # no explicit model: the .env rule if it is on, VA_MODEL otherwise
+        import model_select
+        a.model = os.environ.get("VA_MODEL", "26x")
+        selector = model_select.from_env(fallback=a.model, log=lambda m: print(f"[vcam] {m}", flush=True))
     frames, names = load_frames(a.frames)
     agent = None
     if not a.dry_run:
@@ -117,14 +125,18 @@ def main():
         if w is None:
             sys.exit("!! no welcome from the dApp agent")
         print(f"[vcam] agent {a.agent}: models {w.get('models')} gpu_sm {w.get('gpu_sm')}", flush=True)
+        missing = selector.set_available(w.get("models")) if selector else []
+        if missing:
+            print(f"[vcam] warning: model selection - the agent has not loaded {' '.join(missing)}; their share is sent as {a.model}", flush=True)
     lock = threading.Lock()
-    cams = [Cam(i + 1, frames, a.fps, a.inflight, a.deadline, a.model, agent, a.dry_run, lock) for i in range(a.cams)]
+    cams = [Cam(i + 1, frames, a.fps, a.inflight, a.deadline, a.model, agent, a.dry_run, lock, selector) for i in range(a.cams)]
+    mdl = f"rule {selector.label()}" if selector else a.model
     threads = []
     for c in cams:
         threads.append(threading.Thread(target=c.pace, daemon=True, name=f"pace{c.idx}"))
         for k in range(max(1, a.inflight)):
             threads.append(threading.Thread(target=c.work, daemon=True, name=f"work{c.idx}.{k}"))
-    print(f"[vcam] {a.cams} camera(s) x {a.fps:g} fps = {a.cams * a.fps:g} req/s offered | model {a.model} deadline {a.deadline} ms inflight {a.inflight} | "
+    print(f"[vcam] {a.cams} camera(s) x {a.fps:g} fps = {a.cams * a.fps:g} req/s offered | model {mdl} deadline {a.deadline} ms inflight {a.inflight} | "
           f"{len(frames)} frames from {a.frames} ({sum(len(f) for f in frames) / len(frames) / 1024:.0f} KB mean){' | DRY RUN' if a.dry_run else ''}", flush=True)
     for t in threads: t.start()
     stop = threading.Event()
@@ -135,7 +147,8 @@ def main():
         while not stop.is_set() and (a.duration <= 0 or time.monotonic() - t0 < a.duration):
             time.sleep(1.0)
             snaps = [c.snapshot() for c in cams]
-            tot = {"cams": a.cams, "fps": a.fps, "model": a.model, "deadline_ms": a.deadline, "inflight": a.inflight, "dry_run": a.dry_run,
+            tot = {"cams": a.cams, "fps": a.fps, "model": mdl, "models_sent": selector.snapshot()["sent"] if selector else None,
+                   "deadline_ms": a.deadline, "inflight": a.inflight, "dry_run": a.dry_run,
                    "offered": sum(s["offered"] for s in snaps), "sent": sum(s["sent"] for s in snaps), "skipped": sum(s["skipped"] for s in snaps),
                    "success": sum(s["success"] for s in snaps), "met": sum(s["met"] for s in snaps),
                    "fail": dict(sum((collections.Counter(s["fail"]) for s in snaps), collections.Counter())),

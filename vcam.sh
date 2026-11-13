@@ -3,7 +3,7 @@
 #   N FHD JPEG streams go straight to the dApp agent (TCP 9810, role "vcam") on the same RUN path as the phones' frames, so only the
 #   GPU request rate rises; the cell, the phones and the VA service's own agent connection are untouched. Open loop: each camera
 #   offers its fps whatever the latency is (inflight cap like the phone page, skipped frames counted).
-#   start <N> [fps] [model]   start N cameras (fps default VCAM_FPS=10, model default VA_MODEL) -> runs/vcam/vcam.log, runs/vcam/status.json
+#   start <N> [fps] [model]   start N cameras (fps default VCAM_FPS=10; model default: the VA_MODEL_WEIGHTS rule if VA_MODEL_SELECT=1, else VA_MODEL) -> runs/vcam/vcam.log, runs/vcam/status.json
 #   stop | restart <N> ...    stop removes the load within a second
 #   status                    offered/sent/skipped/fail, achieved req/s, RUN round trip p50/p90/p99, met-% (success within VA_DEADLINE_MS)
 #   logs                      follow runs/vcam/vcam.log
@@ -22,11 +22,11 @@ alive() { [ -n "$(pid)" ] && kill -0 $(pid) 2>/dev/null; }
 case "${1:-status}" in
 start)
   alive && { echo "vcam already running (pid $(pid)) - $0 status | $0 stop"; exit 0; }
-  N=${2:?usage: $0 start <N cameras> [fps] [model]}; FPS=${3:-${VCAM_FPS:-10}}; M=${4:-${VA_MODEL:-26x}}
+  N=${2:?usage: $0 start <N cameras> [fps] [model]}; FPS=${3:-${VCAM_FPS:-10}}; M=${4:-}; ML=${M:-$([ "${VA_MODEL_SELECT:-0}" = 1 ] && echo "rule ${VA_MODEL_WEIGHTS:-unset}" || echo ${VA_MODEL:-26x})}
   (echo > /dev/tcp/127.0.0.1/${DAPP_AGENT_PORT:-9810}) 2>/dev/null || { echo "!! dApp agent port ${DAPP_AGENT_PORT:-9810} closed (L1 not up)"; exit 1; }
   LOG=$R/vcam_$(date +%m%d_%H%M%S).log; ln -sfn $LOG $R/vcam.log
-  echo "== vcam start $(date +%T): $N cameras x $FPS fps = $(python3 -c "print($N*$FPS)") req/s, model $M, deadline ${VA_DEADLINE_MS:-200} ms, inflight ${VCAM_INFLIGHT:-4}, frames $FR"
-  { nohup $VENV/bin/python $V/vcam.py --cams $N --fps $FPS --model $M --deadline ${VA_DEADLINE_MS:-200} --inflight ${VCAM_INFLIGHT:-4} --frames $FR --agent ${VA_AGENT:-127.0.0.1:9810} --status $R/status.json > $LOG 2>&1 < /dev/null & echo $! > $PIDF; }
+  echo "== vcam start $(date +%T): $N cameras x $FPS fps = $(python3 -c "print($N*$FPS)") req/s, model $ML, deadline ${VA_DEADLINE_MS:-200} ms, inflight ${VCAM_INFLIGHT:-4}, frames $FR"
+  { nohup $VENV/bin/python $V/vcam.py --cams $N --fps $FPS ${M:+--model $M} --deadline ${VA_DEADLINE_MS:-200} --inflight ${VCAM_INFLIGHT:-4} --frames $FR --agent ${VA_AGENT:-127.0.0.1:9810} --status $R/status.json > $LOG 2>&1 < /dev/null & echo $! > $PIDF; }
   sleep 2; alive && { head -2 $LOG | cut -c1-160; echo "   log $LOG | $0 status | $0 stop"; } || { echo "!! did not start:"; tail -5 $LOG; rm -f $PIDF; exit 1; } ;;
 stop)
   alive || { echo "vcam not running"; rm -f $PIDF; exit 0; }

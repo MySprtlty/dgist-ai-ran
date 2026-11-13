@@ -31,6 +31,25 @@ def get(url, timeout=3):
         return None
 
 
+def cell_line():
+    """last per-second L1 line of the phones' cell. With the 5-cell traffic generator (the L1 container runs l1_entrypoint_tg.sh) the L1 has 6 cells and the
+    phones' cell is L1 cell 5; its line then comes from the tail of the host-side console log - the full L1 log grows by GBs per hour and is not searched."""
+    if cell_line.tg is None:
+        cell_line.tg = "l1_entrypoint_tg" in subprocess.run(["docker", "inspect", "-f", "{{join .Config.Cmd \" \"}}", "dgist-l1"], capture_output=True, text=True).stdout
+    if not cell_line.tg:
+        return subprocess.run("docker exec dgist-l1 bash -c \"grep -E '\\] Cell +0 \\| DL' /tmp/phy.log | tail -1\" 2>/dev/null", shell=True, capture_output=True, text=True).stdout
+    try:
+        f = D / "runs" / (D / "runs" / "current_run").read_text().strip() / "l1_console.log"
+        out = subprocess.run(["tail", "-n", "4000", str(f)], capture_output=True, text=True, errors="replace").stdout
+    except OSError:
+        return ""
+    ls = [x for x in out.splitlines() if re.search(r"\] Cell +5 \| DL", x)]
+    return ls[-1] if ls else ""
+
+
+cell_line.tg = None
+
+
 def rntis():
     p = D / "runs" / "xapp" / "rntis.txt"
     if p.exists():
@@ -98,7 +117,7 @@ def main():
             for r in va.split(","): svc[r] = "VA"
             for r in nv.split(","): svc[r] = "nonVA"
             radio = {row[0]: row for row in ue_power.table(ue_r, gr, svc, ue_power.conf())}
-            cell = subprocess.run("docker exec dgist-l1 bash -c \"grep -E '\\] Cell +0 \\| DL' /tmp/phy.log | tail -1\" 2>/dev/null", shell=True, capture_output=True, text=True).stdout
+            cell = cell_line()
             m = re.search(r"UL +([0-9.]+) Mbps", cell); cell_ul = float(m.group(1)) if m else None
             # VA UEs: viewer order ue1, ue2 <-> VA_RNTIS order (xapp.sh maps VA_IMSIS order = ue1, ue2)
             va_list = va.split(","); nv_list = nv.split(",")

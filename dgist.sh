@@ -17,6 +17,7 @@
 #   nonva start|stop|status|test     non-VA live-streaming service of the other phone (nonva_service/, no inference) = ./nonva.sh
 #   ric start|stop|status|build      FlexRIC nearRT-RIC of this package                                  = ./ric.sh
 #   xapp start|stop|status|rntis    hsw GPU-aware PPO slicing xApp + dApp feed                          = ./xapp.sh
+#   tgen on|off|load <level>|status  5-cell traffic generator (RU emulator + testMAC in dgist-l1), load low|mid|high|auto at run time = ./tgen.sh
 #   all up|down|status               everything in order                                                 = ./all.sh
 #   logs <target>                    readable live logs                                                  = ./logs.sh
 #   build-l1 [ninja targets]         incremental build of ./aerial-cuda-accelerated-ran/$BUILD_DIR in a throwaway Aerial container (FULL=1 reconfigures)
@@ -24,6 +25,9 @@
 # settings: .env | env: NO_CORE=1 (skip the Open5GS check), ALL_CPUS=1 (builds on every core)
 # modes (.env DEMO_MODE, 2026-11-12): ours = this L1 on the whole GPU (default) | baseline = the researchers' vanilla cuBB 25-3 on MIG 4g + a naive
 #   YOLO server on MIG 3g (docker-compose.baseline.yaml, containers dgist-l1 + dgist-yolo); switch with ./all.sh mode baseline|ours (MIG: sudo -n scripts/mig.sh)
+# traffic generator (.env TRAFFIC_GEN=1, 2026-11-13, both modes): the l1 container also runs the RU emulator + testMAC for 5 emulator cells
+#   (L1 cells 0-4, NIC loop aerial02 <-> aerial03) and the phones' Benetel cell becomes L1 cell 5 (docker-compose.tgen[.baseline].yaml,
+#   scripts/l1_entrypoint_tg.sh, config/tgen/); Baseline then runs OUR build with every dApp feature off on MIG 4g. Switch: ./tgen.sh on|off
 set -u
 [ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
@@ -43,7 +47,19 @@ ran_procs() { ps -eo stat,comm --no-headers | awk '$1 !~ /^Z/ && $2 ~ /^(phy_mai
 core_up() { pgrep -x open5gs-amfd > /dev/null && ip -br addr show ogstun 2>/dev/null | grep -q '10.45.0.1'; }
 port_open() { (echo > /dev/tcp/127.0.0.1/$DAPP_AGENT_PORT) 2>/dev/null; }
 mps_on() { pgrep -f "nvidia-cuda-mps-serve[r]" > /dev/null; }
-gnb_started() { in_l1 "grep -qE 'START.req received|Received START.request' $PHYLOG"; }
+gnb_started() { if [ "$TG" = 1 ]; then grep -qE "Cell +$PC Received START.request" $(clog) 2>/dev/null; else in_l1 "grep -qE 'START.req received|Received START.request' $PHYLOG"; fi; }
+# traffic generator: .env TRAFFIC_GEN decides for 'up' / 'check'; while an L1 container runs, its entrypoint tells which layout is live
+TG=${TRAFFIC_GEN:-0}; TGTV=${TRAFFIC_GEN_TV_DIR:-/data/dgist_tgen/testVectors}; TGLOG=${TRAFFIC_GEN_LOG_DIR:-/data/dgist_tgen/log}
+if c_up $L1C; then docker inspect -f '{{join .Config.Cmd " "}}' $L1C 2>/dev/null | grep -q l1_entrypoint_tg && TG=1 || TG=0; fi
+# Baseline L1 label: the researchers' vanilla build, or - with the traffic generator - our build with every dApp feature off (the vanilla tree has no hybrid 6-cell support)
+BL1='vanilla L1'; [ "$TG" = 1 ] && BL1='L1 (our build, dApp features off, 6 cells)'
+PC=0; DT=40   # L1 cell index of the phones' cell, compose stop timeout
+if [ "$TG" = 1 ]; then PC=5; DT=90   # emulator cells 0-4 come first; stop order testMAC -> L1 -> RU emulator + log collection
+  [ "$MODE" = baseline ] && COMPOSE="$COMPOSE -f docker-compose.tgen.baseline.yaml" || COMPOSE="docker compose -f docker-compose.yaml -f docker-compose.tgen.yaml"
+  [ "$MODE" = baseline ] && TGC=${TG_BASELINE_L1_CONFIG:-dgist_tgbase} || TGC=${TG_L1_CONFIG:-dgist_tg}
+fi
+clog() { echo $OUT/$(cat $CUR 2>/dev/null || echo manual)/l1_console.log; }   # host copy of the L1 console: CON/WRN/ERR/FATAL lines + the per-second lines of every cell
+tg_cells() { local n; n=$(grep -oE 'Cell +[0-4] Received START.request' $(clog) 2>/dev/null | sort -u | wc -l); echo ${n:-0}; }   # emulator cells that got their START.request
 ue_counts() { local L=$1; echo "RA $(grep -c 'initiating RA procedure' $L) RRC $(grep -c RRCSetupComplete $L) PDU $(grep -c 'Added PDU Session' $L) RA-fail $(grep -cE 'RA failed|Contention Resolution timer expired' $L)"; }
 
 check() {
@@ -68,6 +84,16 @@ check() {
   want=3840x2160; [ "${DAPP_INPUT:-4k}" = fhd ] && want=1920x1080; have=${VA_CAMERA_WIDTH:-3840}x${VA_CAMERA_HEIGHT:-2160}
   [ "$have" = "$want" ] || echo "   note: DAPP_INPUT=${DAPP_INPUT:-4k} expects $want frames but .env VA_CAMERA_WIDTH/HEIGHT = $have (such frames still run, whole-image views only)"
   [ -f $D/config/cuphycontroller_$L1_CONFIG.yaml ] && [ -f $D/config/l2_adapter_$L1_CONFIG.yaml ] && [ -f $D/config/gnb.conf ] || { echo "!! config/ files missing (cuphycontroller_$L1_CONFIG.yaml, l2_adapter_$L1_CONFIG.yaml, gnb.conf)"; ok=0; }
+  if [ "$TG" = 1 ]; then   # 5-cell traffic generator
+    for b in cuphycontroller/examples/cuphycontroller_scf ru-emulator/ru_emulator/ru_emulator testMAC/testMAC/test_mac; do [ -x $T/$BUILD_DIR/cuPHY-CP/$b ] || { echo "!! traffic generator: $BUILD_DIR/cuPHY-CP/$b missing ($0 build-l1)"; ok=0; }; done
+    for f in cuphycontroller_$TGC.yaml l2_adapter_$TGC.yaml nvipc_multi_dgist_tg.yaml ru_dgist_tg.yaml testmac_dgist_tg.yaml; do [ -f $D/config/tgen/$f ] || { echo "!! traffic generator: config/tgen/$f missing"; ok=0; }; done
+    [ -f $D/scripts/l1_entrypoint_tg.sh ] && [ -f $D/scripts/tgen_load.py ] || { echo "!! traffic generator: scripts/l1_entrypoint_tg.sh / scripts/tgen_load.py missing"; ok=0; }
+    [ -f $TGTV/multi-cell/launch_pattern_F08_5C_${TRAFFIC_GEN_PATTERN:-tmp_fluct}.yaml ] && [ -f $TGTV/cuPhyChEstCoeffs.h5 ] || { echo "!! traffic generator: launch pattern F08_5C_${TRAFFIC_GEN_PATTERN:-tmp_fluct} / cuPhyChEstCoeffs.h5 missing in $TGTV (.env TRAFFIC_GEN_TV_DIR)"; ok=0; }
+    for i in aerial02 aerial03; do [ "$(cat /sys/class/net/$i/operstate 2>/dev/null)" = up ] || { echo "!! traffic generator: $i (emulator loop aerial02 <-> aerial03) is not up"; ok=0; }; done
+    [ -d $TGLOG ] && [ -w $TGLOG ] || { echo "!! traffic generator: log directory $TGLOG missing or not writable (.env TRAFFIC_GEN_LOG_DIR)"; ok=0; }
+    [ -d $TGLOG ] && { [ "$(df --output=avail -BG $TGLOG | tail -1 | tr -dc 0-9)" -ge 100 ] || echo "!! traffic generator: less than 100 GB free for the full logs in $TGLOG"; }
+    case ${TRAFFIC_LOAD:-low} in low|mid|high|auto) ;; *) echo "   note: .env TRAFFIC_LOAD=${TRAFFIC_LOAD} is not low|mid|high|auto (a name of TRAFFIC_LEVELS or a block number is expected)" ;; esac
+  fi
   other=$(docker ps --format '{{.Names}}' | grep -E '^(nv-cubb|oai-gnb.*|dgist-l1|dgist-gnb|dgist-yolo)$' | tr '\n' ' '); [ -z "$other" ] || { echo "!! L1/gNB container(s) running: $other - stop that stack first (never two L1s on this GPU/NIC)"; ok=0; }
   rp=$(ran_procs); [ -z "$rp" ] || { echo "!! RAN processes alive: $rp"; ok=0; }
   [ "$MODE" = ours ] && mps_on && echo "   note: an MPS server is running; the L1 entrypoint stops it (green contexts need MPS off)"
@@ -94,16 +120,21 @@ up)
   [ -f $CUR ] && { echo "!! a run is registered as current ($(cat $CUR)): $0 down first"; exit 1; }
   if [ "$MODE" = baseline ]; then echo "== $NAME [BASELINE]: vanilla cuBB 25-3 L1 ($BASELINE_TREE, config $BASELINE_L1_CONFIG) on MIG 4g + naive YOLO ${VA_MODEL:-26x} (whole MIG 3g instance) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
   else echo "== $NAME [OURS]: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"; fi
+  [ "$TG" = 1 ] && echo "   + traffic generator: 5 RU-emulator cells with testMAC in the l1 container (L1 cells 0-4, config $TGC, initial load ${TRAFFIC_LOAD:-low}); the phones' cell is L1 cell $PC$( [ "$MODE" = baseline ] && echo '; the L1 is OUR build with every dApp feature off (the vanilla tree has no tools for this layout)' || echo "; PUSCH profiles ${TG_PUSCH_PROFILES:-16,24,32,40,48,56,64,72,88,104}")"
   check || { echo "precheck failed"; exit 1; }
   mkdir -p $RUN; echo "$NAME" > $CUR
-  echo "   $COMPOSE up -d: the gNB starts once the L1 is healthy ($( [ "$MODE" = baseline ] && echo 'vanilla L1 ready + YOLO server port open' || echo 'L1 ready + dApp engines loaded + agent port open'); up to ~10 min)"
+  echo "   $COMPOSE up -d: the gNB starts once the L1 is healthy ($( [ "$MODE" = baseline ] && echo "$BL1 ready + YOLO server port open" || echo 'L1 ready + dApp engines loaded + agent port open'); up to ~10 min)"
   RUN_NAME=$NAME $COMPOSE up -d > $RUN/compose_up.log 2>&1; grep -E 'Healthy|Started|rror|unhealthy' $RUN/compose_up.log | sed 's/^/   /'
   c_up $L1C || { echo "!! L1 container is not running:"; tail -5 $RUN/l1_console.log 2>/dev/null; docker logs $L1C 2>&1 | tail -3; rm -f $CUR; exit 1; }
   c_up $GNBC || { echo "!! gNB container is not running (L1 unhealthy?): docker logs $L1C"; docker logs $L1C 2>&1 | tail -5; echo "   tear down with: $0 down"; exit 1; }
-  if [ "$MODE" = baseline ]; then echo "   vanilla L1 + naive YOLO ready $(date +%T) | $(docker logs $YOLOC 2>&1 | grep -E 'ready:' | tail -1 | cut -c1-120)"
+  if [ "$MODE" = baseline ]; then echo "   $BL1 + naive YOLO ready $(date +%T) | $(docker logs $YOLOC 2>&1 | grep -E 'ready:' | tail -1 | cut -c1-120)"
   else echo "   L1 + dApp ready $(date +%T) | $(docker logs $L1C 2>&1 | grep -E 'dApp tenant ready' | tail -1 | cut -c1-120)"; fi
   for i in $(seq 1 90); do gnb_started && break; c_up $GNBC || break; sleep 2; done
-  gnb_started && echo "   cell 0 CONFIG/START done $(date +%T)" || echo "!! no START.request for cell 0 within 180 s ($0 logs gnb)"
+  gnb_started && echo "   cell $PC CONFIG/START done $(date +%T)" || echo "!! no START.request for cell $PC within 180 s ($0 logs gnb)"
+  if [ "$TG" = 1 ]; then   # testMAC starts right after the gNB's CONFIG.request, then configures and starts cells 0-4
+    for i in $(seq 1 45); do [ "$(tg_cells)" -ge 5 ] && break; c_up $L1C || break; sleep 2; done
+    n=$(tg_cells); [ "$n" -ge 5 ] && echo "   traffic generator: 5 emulator cells started $(date +%T) | $(python3 $D/scripts/tgen_load.py show 2>&1 | head -1) | change: ./tgen.sh load low|mid|high|auto" || echo "!! traffic generator: $n of 5 emulator cells started within 90 s (./logs.sh testmac | ./logs.sh ru | runs/$NAME/entrypoint.log)"
+  fi
   for i in $(seq 1 15); do docker logs $GNBC 2>&1 | grep -q NGSetupResponse && break; sleep 2; done
   docker logs $GNBC 2>&1 | grep -q NGSetupResponse && echo "   NG Setup with the AMF ok" || echo "   note: no NGSetupResponse yet (core network? $0 logs gnb)"
   echo "   running - a COTS UE can attach now | status: $0 status | attach: $0 ue | dApp: $0 test | stop: $0 down"
@@ -113,18 +144,23 @@ down)
   NAME=$(cat $CUR 2>/dev/null || echo stop_$(date +%m%d_%H%M)); RUN=$OUT/$NAME; mkdir -p $RUN
   echo "== down ($NAME) $(date +%T)"
   docker ps -a --format '{{.Names}}' | grep -qx $GNBC && docker logs $GNBC > $RUN/oai.log 2>&1
-  $COMPOSE down -t 40 2>&1 | grep -E 'Stopped|Removed|rror' | sed 's/^/   /'
+  $COMPOSE down -t $DT 2>&1 | grep -E 'Stopped|Removed|rror' | sed 's/^/   /'
   for c in $L1C $GNBC $YOLOC; do docker ps -a --format '{{.Names}}' | grep -qx $c && { docker rm -f $c > /dev/null 2>&1 && echo "   removed leftover $c"; }; done   # a mode flipped while up
   rm -f $CUR
   echo "   L1 Err.ind $(grep -c 'Send Err.ind' $RUN/phy_warn.log 2>/dev/null), FATAL $(grep -c FATAL $RUN/phy_warn.log 2>/dev/null) | UE: $( [ -f $RUN/oai.log ] && ue_counts $RUN/oai.log ) | logs: $RUN"
+  [ "$TG" = 1 ] && grep -E 'RU emulator DL U late|full nvlog files' $RUN/entrypoint.log 2>/dev/null | tail -2 | sed -E 's/^\[[^]]*\] /   traffic generator: /' | cut -c1-400
   echo "   RAN processes now: $(rp=$(ran_procs); echo ${rp:-none}) | GPU: $(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader)"
   ;;
 status)
   echo "mode: $MODE$( [ "$MODE" = baseline ] && echo " (MIG 4g $MIG_4G / 3g $MIG_3G)") | containers: $(docker ps --format '{{.Names}}({{.Status}})' | grep -E 'dgist-|nv-cubb|oai-gnb' | tr '\n' ' ')"
   echo "RAN processes: $(rp=$(ran_procs); echo ${rp:-none}) | MPS: $(mps_on && echo ON || echo off) | Open5GS: $(core_up && echo up || echo down) | xApp agent port $DAPP_AGENT_PORT: $(port_open && echo open || echo closed) | current run: $(cat $CUR 2>/dev/null || echo none)"
   echo "GPU: $(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader)"
-  if c_up $L1C; then echo "L1: Err.ind $(in_l1 "grep -c 'Send Err.ind' $PHYLOG") FATAL $(in_l1 "grep -c FATAL $PHYLOG") | cell 0: $(in_l1 "grep -E '\] Cell +0 \| DL' $PHYLOG | tail -1" | sed -E 's/.*(DL +[0-9.]+ Mbps).*(UL +[0-9.]+ Mbps +[0-9]+ Slots CRC +[0-9]+).*/\1 \2/') | dApp: $(in_l1 'grep -E "agent ok" /tmp/dapp_tenant.log | tail -1' | sed -E 's/.*(agent ok [0-9]+ fail [0-9]+ queue [0-9]+).*/\1/')"; fi
+  if c_up $L1C && [ "$TG" = 1 ]; then CL1=$(clog)   # with the generator the full nvlog grows by GBs: read the console copy on the host instead
+    echo "L1 (6 cells): Err.ind $(grep -c 'Send Err.ind' $CL1 2>/dev/null) FATAL $(grep -c FATAL $CL1 2>/dev/null) | phone cell $PC: $(tail -n 20000 $CL1 2>/dev/null | grep -E "\] Cell +$PC \| DL" | tail -1 | sed -E 's/.*(DL +[0-9.]+ Mbps).*(UL +[0-9.]+ Mbps +[0-9]+ Slots CRC +[0-9]+).*/\1 \2/')$( [ "$MODE" = ours ] && echo " | dApp: $(in_l1 'grep -E "agent ok" /tmp/dapp_tenant.log | tail -1' | sed -E 's/.*(agent ok [0-9]+ fail [0-9]+ queue [0-9]+).*/\1/')")"
+    echo "traffic generator: $(bash $D/tgen.sh status-line 2>&1)"
+  elif c_up $L1C; then echo "L1: Err.ind $(in_l1 "grep -c 'Send Err.ind' $PHYLOG") FATAL $(in_l1 "grep -c FATAL $PHYLOG") | cell 0: $(in_l1 "grep -E '\] Cell +0 \| DL' $PHYLOG | tail -1" | sed -E 's/.*(DL +[0-9.]+ Mbps).*(UL +[0-9.]+ Mbps +[0-9]+ Slots CRC +[0-9]+).*/\1 \2/') | dApp: $(in_l1 'grep -E "agent ok" /tmp/dapp_tenant.log | tail -1' | sed -E 's/.*(agent ok [0-9]+ fail [0-9]+ queue [0-9]+).*/\1/')"; fi
   if c_up $GNBC; then docker logs $GNBC > $OUT/oai_live.log 2>&1; echo "gNB: NGSetup $(grep -c NGSetupResponse $OUT/oai_live.log) | UE: $(ue_counts $OUT/oai_live.log)"; fi
+  c_up $L1C || { [ "${TRAFFIC_GEN:-0}" = 1 ] && echo "traffic generator: on in .env (starts with the next up, initial load ${TRAFFIC_LOAD:-low})"; }
   echo "VA service (port ${VA_PORT:-8000}): $( (echo > /dev/tcp/127.0.0.1/${VA_PORT:-8000}) 2>/dev/null && echo "up - ./va.sh status" || echo "down - ./va.sh start")"
   echo "non-VA service (port ${NONVA_PORT:-8001}): $( (echo > /dev/tcp/127.0.0.1/${NONVA_PORT:-8001}) 2>/dev/null && echo "up - ./nonva.sh status" || echo "down - ./nonva.sh start")"
   echo "nearRT-RIC: $(ss -lnS 2>/dev/null | grep -q ":36422 " && echo up || echo down) | PPO xApp: $( [ -f $OUT/xapp/xapp.pid ] && kill -0 $(cat $OUT/xapp/xapp.pid) 2>/dev/null && echo running || echo stopped)   (./ric.sh, ./xapp.sh)"
@@ -165,6 +201,7 @@ nonva) shift; bash $D/nonva.sh "$@" ;;
 ric) shift; bash $D/ric.sh "$@" ;;
 xapp) shift; bash $D/xapp.sh "$@" ;;
 all) shift; bash $D/all.sh "$@" ;;
+tgen) shift; bash $D/tgen.sh "$@" ;;
 logs) shift; bash $D/logs.sh "$@" ;;
 ue-table|rntis) python3 $D/ue_table.py ;;
 build-l1)
@@ -173,5 +210,5 @@ build-l1)
   docker run --rm --cpuset-cpus $CPUS -e BUILD_DIR=$BUILD_DIR -e FULL=${FULL:-0} -e JOBS=${JOBS:-} -v $T:/opt/nvidia/cuBB -v $D/scripts:/opt/dgist/scripts:ro -w /opt/nvidia/cuBB -u root $AERIAL_IMAGE bash /opt/dgist/scripts/build_l1.sh "$@" 2>&1 | tee $OUT/build_l1_$(date +%m%d_%H%M).log | tail -15
   ;;
 build-oai) [ "${ALL_CPUS:-0}" = 1 ] && export BUILD_CPUS=0-$(( $(nproc --all) - 1 )); bash $D/scripts/build_oai_image.sh ;;
-*) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

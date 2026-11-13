@@ -32,7 +32,7 @@ def _ints(s):
 
 def load_cfg(root, env=None):
     """the dashboard's static configuration from /home/nvidia/_dgist/.env (process environment wins, like in va.sh)"""
-    e = read_env(Path(root) / ".env"); e.update({k: v for k, v in (env or os.environ).items() if k.split("_")[0] in ("DASH", "VA", "NONVA", "DAPP", "VCAM", "DEMO")})
+    e = read_env(Path(root) / ".env"); e.update({k: v for k, v in (env or os.environ).items() if k.split("_")[0] in ("DASH", "VA", "NONVA", "DAPP", "VCAM", "DEMO", "TRAFFIC", "TG")})
     inp = e.get("DAPP_INPUT", "4k")
     mp = {}
     for kv in re.split(r"[,\s]+", e.get("DASH_MAP", "")):
@@ -57,6 +57,7 @@ def load_cfg(root, env=None):
                   "port": _f(e, "NONVA_PORT", 8001, int)},
         "vcam_env": {"fps": _f(e, "VCAM_FPS", 10), "inflight": _f(e, "VCAM_INFLIGHT", 4, int), "jpeg_quality": _f(e, "VCAM_JPEG_QUALITY", 0.70), "frames": e.get("VCAM_FRAMES", "")},
         "agent": (host or "127.0.0.1", int(port or 9810)), "ppo_bundle": e.get("PPO_BUNDLE_NAME", ""),
+        "tgen_file": e.get("TRAFFIC_LOAD_FILE") or "/dev/shm/dgist_tgen_load", "tgen_levels": e.get("TRAFFIC_LEVELS") or "low=1,mid=2,high=3",
         "l1_container": e.get("DASH_L1_CONTAINER", "dgist-l1"), "gnb_container": e.get("DASH_GNB_CONTAINER", "dgist-gnb"), "yolo_container": "dgist-yolo",
         "core_since": e.get("DASH_CORE_SINCE", "10 days ago"), "amf_info": e.get("DASH_AMF_INFO", "127.0.0.5:9090"), "slot_csv": e.get("DASH_SLOT_CSV", "/tmp/dapp_tenant_slots.csv"), "l1_follow": e.get("DASH_L1_FOLLOW", "1") != "0", "rec_slots": e.get("DASH_REC_SLOTS", "1") != "0",
     }
@@ -166,7 +167,27 @@ RE_L1 = re.compile(r"Cell +(\d+) \| DL +([0-9.]+) Mbps +(\d+) Slots \| UL +([0-9
 def parse_l1_line(line):
     m = RE_L1.search(line)
     if not m: return None
-    return {"dl": float(m.group(2)), "dl_slots": int(m.group(3)), "ul": float(m.group(4)), "ul_slots": int(m.group(5)), "crc": int(m.group(6)), "crc_tot": int(m.group(7))}
+    return {"cell": int(m.group(1)), "dl": float(m.group(2)), "dl_slots": int(m.group(3)), "ul": float(m.group(4)), "ul_slots": int(m.group(5)), "crc": int(m.group(6)), "crc_tot": int(m.group(7))}
+
+
+def tgen_state(cfg, env, procs):
+    """the 5-cell traffic generator (RU emulator + testMAC inside the L1 container, ./tgen.sh): the .env switch, the two tool processes and the load level
+    of the 8-byte control word both tools map (bits 63..56 = block selection from extended frame F on, 55..48 = before F, 47..0 = F; 0 = auto; scripts/tgen_load.py)"""
+    run = "/ru_emulator " in procs and "/test_mac " in procs
+    d = {"on": (env.get("TRAFFIC_GEN") or "0").strip() == "1", "run": run, "load": None, "sel": None}
+    if not run: return d
+    try:
+        with open(cfg.get("tgen_file") or "/dev/shm/dgist_tgen_load", "rb") as fh: b = fh.read(8)
+    except OSError: return d
+    if len(b) < 8: return d
+    names = {}
+    for kv in re.split(r"[,\s]+", env.get("TRAFFIC_LEVELS") or cfg.get("tgen_levels") or ""):
+        k, _, x = kv.partition("=")
+        if x.isdigit(): names[int(x)] = k
+    names[0] = "auto"; v = int.from_bytes(b, "little")
+    sel = (v >> 56) if (time.time_ns() - 3640000000) // 10000000 >= (v & ((1 << 48) - 1)) else (v >> 48) & 255
+    d["sel"] = sel; d["load"] = names.get(sel, "block%d" % sel)
+    return d
 
 
 # ---------------------------------------------------------------------------------------------------------------- core: RNTI <-> IMSI <-> IP
@@ -514,12 +535,13 @@ class SysPoller(Collector):
         n = 0
         while not self.stop_ev.is_set():
             r = self.root; env = read_env(r / ".env"); names = set(run_out(["docker", "ps", "--format", "{{.Names}}"]).split())
-            ps = run_out(["ps", "-eo", "comm="]).split()
+            ps = run_out(["ps", "-eo", "comm="]).split(); tg = tgen_state(self.cfg, env, run_out(["ps", "-eo", "args="]) if self.cfg["l1_container"] in names else "")
             st = {"mode": env.get("DEMO_MODE", "ours"),
                   "up": {"l1": self.cfg["l1_container"] in names, "gnb": self.cfg["gnb_container"] in names, "yolo": self.cfg["yolo_container"] in names,
                          "va": pid_alive(r / "runs/va_service/uvicorn.pid") or self._col_up("va"), "nonva": pid_alive(r / "runs/nonva_service/uvicorn.pid") or self._col_up("nonva"),
                          "xapp": pid_alive(r / "runs/xapp/xapp.pid"), "moni": pid_alive(r / "runs/xapp/moni.pid"), "vcam": pid_alive(r / "runs/vcam/vcam.pid"),
-                         "ric": "nearRT-RIC" in ps, "core": "open5gs-amfd" in ps},
+                         "ric": "nearRT-RIC" in ps, "core": "open5gs-amfd" in ps, "tgen": tg["run"]},
+                  "tgen": tg,
                   "col": {k: {"state": c.state, "feed": getattr(c, "feed", None)} for k, c in self.collectors.items()}}
             try:
                 sv = os.statvfs(str(r / "runs")); st["disk_gb"] = round(sv.f_bavail * sv.f_frsize / 2 ** 30, 1)
@@ -602,7 +624,7 @@ def start_collectors(hub, cfg):
             for ln in lines:
                 d = parse_l1_line(ln)
                 if d: hub.on_l1(d)
-        col["l1"] = ProcFollower("l1", ["docker", "exec", cfg["l1_container"], "sh", "-c", "tail -n0 -F /tmp/phy.log 2>/dev/null | grep --line-buffered -E '\\] Cell +0 \\| DL'"], l1_lines)
+        col["l1"] = ProcFollower("l1", ["docker", "exec", cfg["l1_container"], "sh", "-c", "tail -n0 -F /tmp/phy.log 2>/dev/null | grep --line-buffered -E '\\] Cell +[0-9]+ \\| DL'"], l1_lines)   # every cell: 1 line per second without the traffic generator, 6 with it
 
     def ppo_lines(lines):
         now = time.time()

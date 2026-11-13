@@ -40,14 +40,16 @@
   }
 
   // ------------------------------------------------------------------ header: mode, components, measurement state
-  const CHIPS = [['l1', 'L1'], ['gnb', 'gNB'], ['yolo', 'YOLO 서버'], ['core', '5G 코어'], ['va', 'VA'], ['nonva', 'Non-VA'], ['xapp', 'xApp'], ['vcam', '가상 카메라']];
+  const CHIPS = [['l1', 'L1'], ['gnb', 'gNB'], ['yolo', 'YOLO 서버'], ['core', '5G 코어'], ['va', 'VA'], ['nonva', 'Non-VA'], ['xapp', 'xApp'], ['vcam', '가상 카메라'], ['tgen', '트래픽 생성기']];
+  const TGL = { low: '저부하', mid: '중부하', high: '고부하', auto: '자동 변동' };
   function header(F) {
     const m = F.meta || {}, t = F.cur, sys = (t && t.sys) || {}, mode = sys.mode || m.mode, mb = $('#modeBadge');
     D.txt(mb, !S.meta && !S.rp ? '연결 중' : mode === 'baseline' ? 'Baseline · MIG 고정 분할' : 'Ours · Green Context'); D.cls(mb, 'badge ' + (mode === 'baseline' ? 'base' : 'ours'));
     $('#simBadge').hidden = !m.sim;
-    const up = sys.up || {}, list = CHIPS.filter(c => c[0] === 'yolo' ? mode === 'baseline' : c[0] === 'xapp' ? mode !== 'baseline' : c[0] === 'vcam' ? !!up.vcam : true);
-    const sig = list.map(c => c[0] + (up[c[0]] ? 1 : 0)).join();
-    if (sig !== chipSig) { chipSig = sig; const h = $('#sysChips'); h.textContent = ''; for (const c of list) h.appendChild(el('span.sysc' + (up[c[0]] ? '.on' : ''), { title: c[1] + (up[c[0]] ? ' 동작 중' : ' 꺼짐') }, el('i'), c[1])); }
+    const up = sys.up || {}, tg = sys.tgen || {}, list = CHIPS.filter(c => c[0] === 'yolo' ? mode === 'baseline' : c[0] === 'xapp' ? mode !== 'baseline' : c[0] === 'vcam' ? !!up.vcam : c[0] === 'tgen' ? !!(tg.on || tg.run) : true);
+    const lab = c => c[0] === 'tgen' && tg.run && tg.load ? c[1] + ' · ' + (TGL[tg.load] || tg.load) : c[1];      // 5 emulator cells + their load level
+    const sig = list.map(c => lab(c) + (up[c[0]] ? 1 : 0)).join();
+    if (sig !== chipSig) { chipSig = sig; const h = $('#sysChips'); h.textContent = ''; for (const c of list) h.appendChild(el('span.sysc' + (up[c[0]] ? '.on' : ''), { title: (c[0] === 'tgen' ? 'RU 에뮬레이터 5셀 + testMAC (L1 셀 0-4), 부하 전환: ./tgen.sh load low|mid|high|auto · ' : '') + lab(c) + (up[c[0]] ? ' 동작 중' : ' 꺼짐') }, el('i'), lab(c))); }
     recState();
   }
   function recState() {        // always the LIVE state, also while a replay is on screen
@@ -72,12 +74,13 @@
   function startModal() {
     const L = S.live.ticks, t = L[L.length - 1], sys = (t && t.sys) || {}, up = sys.up || {}, src = sys.src || {}, mode = sys.mode || (S.meta || {}).mode;
     const now = new Date(), p2 = n => String(n).padStart(2, '0');
-    const sug = (mode === 'baseline' ? 'baseline' : 'ours') + '_' + p2(now.getMonth() + 1) + p2(now.getDate()) + '_' + p2(now.getHours()) + p2(now.getMinutes());
+    const tg = sys.tgen || {}, sug = (mode === 'baseline' ? 'baseline' : 'ours') + (tg.run ? '_tg' + (tg.load || '') : '') + '_' + p2(now.getMonth() + 1) + p2(now.getDate()) + '_' + p2(now.getHours()) + p2(now.getMinutes());
     modal(false, (m, close) => {
       const inp = el('input.field', { type: 'text', maxlength: '80', placeholder: '예: ours_4ue_q091_1차', value: sug, spellcheck: 'false' }), err = el('div.err');
       const go = el('button.btn.primary', '측정 시작');
       const checks = [['VA 서비스', up.va], ['Non-VA 서비스', up.nonva], ['L1', up.l1], ['gNB', up.gnb], ['dApp 에이전트 (추정 · SM)', src.agent], [mode === 'baseline' ? '슬롯 CSV (Baseline은 없음)' : '슬롯 CSV (슬롯별 SM)', src.slots],
         [mode === 'baseline' ? 'xApp (Baseline은 없음)' : 'xApp (PRB 슬라이싱)', up.xapp]];
+      if (tg.on || tg.run) checks.push(['트래픽 생성기 (에뮬레이터 5셀' + (tg.run && tg.load ? ', ' + (TGL[tg.load] || tg.load) : '') + ')', tg.run]);
       for (const u of D.UE) { const x = t && t.ue[u.k]; checks.push([u.name + (x && x.on ? ' 전송 중' : ' 전송 없음'), x && x.on]); }
       const submit = async () => {
         const name = inp.value.trim(); if (!name) { D.txt(err, '실험 이름을 입력하세요.'); inp.focus(); return; }

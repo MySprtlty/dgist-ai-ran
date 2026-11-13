@@ -102,7 +102,7 @@ class Hub:
         self.slot_ring = deque(maxlen=200); self.slot_t = 0.0; self.slot_win = self._slot_acc(); self.slot_cum = self._slot_acc()
         self.est = None; self.est_t = 0.0; self.rep = None; self.rep_t = 0.0; self.rep_new = False; self.welcome = None
         self.gpu_cum = self._gpu_acc()
-        self.l1 = None; self.l1_t = 0.0; self.sysd = {}; self.vcam = None; self.nvml = None
+        self.l1 = None; self.l1_t = 0.0; self.l1c = {}; self.cum_tg = {}; self.sysd = {}; self.vcam = None; self.nvml = None
         self.core = {"imsi_ip": {}, "cu_imsi": {}, "t": 0.0, "fixed": False}
         self.rec = None; self.ticks = deque(maxlen=int(cfg.get("live_ticks", 300))); self.rec_n = 0; self.rec_last = {}
         self.last_tick_t = time.time(); self.last_scope = None; self.sim = bool(cfg.get("sim"))
@@ -279,7 +279,13 @@ class Hub:
             elif t == "sm_report": self.rep = msg; self.rep_t = now; self.rep_new = True
 
     def on_l1(self, d, now=None):
-        with self.lock: self.l1 = d; self.l1_t = now or time.time()
+        """one per-second line of an L1 cell. With the traffic generator the L1 has 6 cells: the phones' cell is the highest index (5) and the
+        cells below it are the emulator cells; without it there is only cell 0."""
+        now = now or time.time()
+        with self.lock:
+            self.l1c[int(d.get("cell", 0))] = (d, now)
+            for c in [c for c, v in self.l1c.items() if now - v[1] >= 3.0]: self.l1c.pop(c)
+            self.l1, self.l1_t = self.l1c[max(self.l1c)]
 
     def set_sys(self, d):
         with self.lock: self.sysd.update(d)
@@ -326,7 +332,7 @@ class Hub:
             safe = safe[:60]; ts = time.strftime("%Y%m%d_%H%M%S"); d = Path(base) / ("%s_%s" % (safe, ts)); d.mkdir(parents=True, exist_ok=False)
             for u in self.ue.values(): u.reset_cum()
             self.slot_cum = self._slot_acc(); self.gpu_cum = self._gpu_acc(); self.cum_svc = {s: self._svc_acc() for s in ("va", "nv")}
-            self.cum_cell = {k: Stat() for k in self.cum_cell}; self.rec_n = 0; self.rec_last = {}
+            self.cum_cell = {k: Stat() for k in self.cum_cell}; self.cum_tg = {}; self.rec_n = 0; self.rec_last = {}
             fj = open(d / (safe + ".replay.jsonl"), "w", buffering=1 << 16)
             ff = open(d / (safe + ".frames.csv"), "w", newline="", buffering=1 << 16); fw = csv.writer(ff)
             fw.writerow("t_s,ue,service_ue,frame_id,ip,rnti,ul_ms,ai_ms,wait_ms,decode_ms,infer_ms,server_other_ms,e2e_ms,e2e_src,dl_ms,qos_met,status,reason,model,sm,sm_mean,kb,w,h,detections".split(","))
@@ -489,6 +495,15 @@ class Hub:
                 for f in ("prb", "unused", "ul", "dl", "mac"): self.cum_cell[f].add(cell[f])
                 cell["c"] = {f: rnd(self.cum_cell[f].mean()) for f in self.cum_cell}
             t["cell"] = cell
+            # traffic generator: the emulator cells (every L1 cell below the phones' cell) and the load level of this second
+            tg = self.sysd.get("tgen") or {}; pc = l1.get("cell", 0) if l1 else None
+            emu = [v[0] for c, v in self.l1c.items() if pc is not None and c != pc and now - v[1] < 3.0]
+            if emu or tg.get("run"):
+                t["tgen"] = {"load": tg.get("load"), "n": len(emu), "ul": rnd(sum(x["ul"] for x in emu)) if emu else None, "dl": rnd(sum(x["dl"] for x in emu)) if emu else None,
+                             "crc": sum(x["crc"] for x in emu) if emu else None}
+                if rec:
+                    k = tg.get("load") or "unknown"; self.cum_tg[k] = self.cum_tg.get(k, 0.0) + dt
+                    t["tgen"]["c"] = {k: rnd(v, 0) for k, v in self.cum_tg.items()}        # seconds of this measurement at each load level
             t["gpu"] = self._gpu_tick(now, dt, rec, t)
             t["vcam"] = self.vcam if self.vcam and now - self.vcam.get("seen", 0) < 5.0 else None
             t["sys"] = dict(self.sysd); t["sys"]["src"] = {"ppo": bool(ppo_ok), "moni": bool(moni_ok), "gnb": any(now - r.get("t", 0) < 4.0 for r in self.radio.values()),
@@ -597,7 +612,7 @@ class Hub:
         s["cell"] = (last.get("cell") or {}).get("c") or {}; s["gpu"] = (last.get("gpu") or {}).get("c") or {}
         base = self.map.get(self.cfg.get("base_model", "26x")) or 57.5; m = (s["svc"].get("va") or {}).get("map")
         s["accuracy"] = {"map_mean": m, "map_base": base, "retention_pct": rnd(100.0 * m / base, 2) if m else None, "loss_pct": rnd(100.0 * (1 - m / base), 2) if m else None}
-        s["vcam"] = last.get("vcam"); s["quota_src"] = last.get("quota_src")
+        s["vcam"] = last.get("vcam"); s["quota_src"] = last.get("quota_src"); s["tgen"] = last.get("tgen")
         s["prb_src"] = {k: (last.get("ue") or {}).get(k, {}).get("prbsrc") for k in UE_KEYS}
         return s
 
@@ -633,6 +648,9 @@ def summary_text(s):
           "  mean mAP %s vs %s (%s fixed) -> retention %s %%, loss %s %%" % (f(a.get("map_mean"), nd=2), f(a.get("map_base")), s.get("base_model"), f(a.get("retention_pct"), nd=2), f(a.get("loss_pct"), nd=2))]
     c = s.get("cell") or {}
     L += ["", "Cell: UL %s Mbps (L1), MAC sum %s Mbps, PRB used %s / unused %s per UL slot" % (f(c.get("ul"), nd=2), f(c.get("mac"), nd=2), f(c.get("prb")), f(c.get("unused")))]
+    g_ = s.get("tgen")
+    if g_: L.append("Traffic generator (5 emulator cells in the same L1): seconds per load level %s; at the end: load %s, %s cells, UL %s Mbps, DL %s Mbps, CRC errors %s" % (
+        ", ".join("%s %.0f" % kv for kv in sorted((g_.get("c") or {}).items())) or "-", g_.get("load") or "-", g_.get("n", "-"), f(g_.get("ul")), f(g_.get("dl")), g_.get("crc", "-")))
     L.append("Sources: quota %s, PRB per UE %s" % (s.get("quota_src") or "-", " ".join("%s=%s" % (k, v or "-") for k, v in (s.get("prb_src") or {}).items()) or "-"))
     for x in s.get("notes") or []: L.append("Note: " + x)
     return "\n".join(L) + "\n"

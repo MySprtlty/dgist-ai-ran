@@ -8,6 +8,8 @@
 #   restart [name]       down + up
 #   mode [ours|baseline] show or switch the demo mode (.env DEMO_MODE; stack must be down). baseline = vanilla cuBB 25-3 on MIG 4g + naive YOLO on MIG 3g,
 #                        no xApp; the MIG partition itself needs root: sudo -n scripts/mig.sh on|off (done here when sudo -n works, else printed)
+#   tgen on|off|load <level>|status   5-cell traffic generator next to the phones' cell (= ./tgen.sh): on/off = .env TRAFFIC_GEN, applies at the next up / restart;
+#                        load low|mid|high|auto switches the load of the 5 emulator cells while they run
 # Individual switches: ./core.sh ./dgist.sh ./va.sh ./nonva.sh ./ric.sh ./xapp.sh | logs: ./logs.sh <target>
 set -u
 [ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
@@ -23,6 +25,7 @@ case "${1:-status}" in
 up)
   shift; NAME=""; XAPP=0; for a in "$@"; do case $a in --xapp) XAPP=1 ;; *) NAME=$a ;; esac; done
   echo "######## mode: $MODE$( [ "$MODE" = baseline ] && echo ' (vanilla cuBB on MIG 4g + naive YOLO on MIG 3g, no xApp)')"
+  [ "${TRAFFIC_GEN:-0}" = 1 ] && echo "######## traffic generator: on - 5 emulator cells in the same L1 (6 cells), load at start ${TRAFFIC_LOAD:-low}; change while running: ./tgen.sh load low|mid|high|auto"
   [ "$MODE" = baseline ] && [ $XAPP = 1 ] && { echo "   note: --xapp ignored in baseline mode"; XAPP=0; }
   FAIL=""
   if core_up; then echo "######## core: already up"; else step "core up"; bash $D/core.sh up || FAIL="$FAIL core"; fi
@@ -74,6 +77,7 @@ mode)
   echo "   next: $0 up <name>" ;;
 status)
   echo "mode      : $MODE$( [ "$MODE" = baseline ] && echo " (vanilla cuBB 25-3 on MIG 4g + naive YOLO on MIG 3g, no xApp)")"
+  echo "traffic gen: $(bash $D/tgen.sh status-line 2>/dev/null)"
   echo "core      : $(core_up && echo up || echo DOWN) (Open5GS, ogstun 10.45.0.1)"
   echo "L1 / gNB  : $(c_up dgist-l1 && echo "l1 up" || echo "l1 DOWN") / $(c_up dgist-gnb && echo "gnb up" || echo "gnb DOWN") | dApp agent $(port_open ${DAPP_AGENT_PORT:-9810} && echo open || echo closed) | run: $(cat $D/runs/current_run 2>/dev/null || echo none)"
   echo "VA        : $(port_open ${VA_PORT:-8000} && echo "up :${VA_PORT:-8000}" || echo DOWN) | non-VA: $(port_open ${NONVA_PORT:-8001} && echo "up :${NONVA_PORT:-8001}" || echo DOWN)"
@@ -81,5 +85,6 @@ status)
   echo "xApp side : monitor $(pgrep -f '_dgist/.*xapp_ul_input_moni' > /dev/null && echo running || echo stopped) | compute writer $(pgrep -f '_dgist/.*dapp_compute_writer' > /dev/null && echo running || echo stopped) | guard $( [ -f $D/runs/xapp/guard.pid ] && kill -0 $(cat $D/runs/xapp/guard.pid) 2>/dev/null && echo running || echo off)"
   if c_up dgist-l1; then bash $D/dgist.sh status 2>/dev/null | grep -E '^(L1|GPU|gNB)' | sed 's/^/   /'; fi
   echo "UEs:"; python3 $D/ue_table.py 2>/dev/null | sed 's/^/   /' ;;
-*) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+tgen) shift; bash $D/tgen.sh "$@" ;;
+*) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -1,0 +1,21 @@
+# _dgist traffic generator, BASELINE mode (.env TRAFFIC_GEN=1 + DEMO_MODE=baseline, 2026-11-13): an overlay on docker-compose.baseline.yaml
+#   docker compose -f docker-compose.baseline.yaml -f docker-compose.tgen.baseline.yaml ...
+# The researchers' vanilla build has no RU emulator / testMAC for this layout, so the l1 container runs OUR build with every dApp feature
+# switched off (MPS, static mps_sm_* of the MIG arm, hook disabled, no tenant) on the MIG 4g instance + the RU emulator + testMAC for the 5
+# emulator cells. The naive YOLO server (dgist-yolo, MIG 3g) and the gNB are unchanged.
+services:
+  l1:
+    volumes: !override
+      - ./aerial-cuda-accelerated-ran:/opt/nvidia/cuBB
+      - ${TRAFFIC_GEN_TV_DIR:-/data/dgist_tgen/testVectors}:/opt/nvidia/cuBB/testVectors:ro
+      - ${TRAFFIC_GEN_LOG_DIR:-/data/dgist_tgen/log}:/opt/dgist/tglog
+      - ./config:/opt/dgist/config:ro
+      - ./scripts:/opt/dgist/scripts:ro
+      - ./runs:/opt/dgist/runs
+      - /dev/hugepages:/dev/hugepages
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+    environment:
+      - TG_L1_GDB=${TG_L1_GDB:-0}     # debug only: 1 = the L1 under gdb -batch (backtrace of a crash in l1_console.log)
+    command: ["bash", "/opt/dgist/scripts/l1_entrypoint_tg.sh"]
+    stop_grace_period: 90s

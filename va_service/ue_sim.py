@@ -235,6 +235,12 @@ def main():
         print(f"[{ue}]    mean: ul {m('ul_latency_ms', records):.1f} | ai {m('ai_latency_ms', records):.1f} | other {m('server_other_ms', records):.1f} | "
               f"dl {m('dl_latency_ms', records):.1f} ms || dApp: sm {m('dapp_sm', ok):.1f} wait {m('dapp_wait_ms', ok):.1f} dec {m('dapp_decode_ms', ok):.1f} "
               f"inf {m('dapp_infer_ms', ok):.1f} srv {m('dapp_latency_ms', ok):.1f} ms | det {m('detections', ok):.1f}")
+        per_model = {}
+        for r in records:
+            if r.get("dapp_model"):
+                per_model[r["dapp_model"]] = per_model.get(r["dapp_model"], 0) + 1
+        if per_model:
+            print(f"[{ue}]    models: " + ", ".join(f"{k} {v}" for k, v in sorted(per_model.items(), key=lambda kv: "nsmlx".find(kv[0][-1]))))
         reasons = {}
         for r in records:
             if r["dapp_status"] not in (None, "success"):

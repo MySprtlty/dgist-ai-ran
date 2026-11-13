@@ -20,8 +20,35 @@ hsw 연구실의 두-슬라이스 실험에서 **VA가 아닌 쪽 UE**가 쓰는
 | `NONVA_JPEG_QUALITY` | 0.80 | 프레임 JPEG 품질 (720p q0.80 ≈ 200 KB → 20 fps면 약 33 Mbps) |
 | `NONVA_VIEWER_FPS` | 20 | `/viewer` 중계 속도 |
 | `NONVA_PORT` | 8001 | HTTPS 포트 (VA 서비스는 8000) |
+| `NONVA_DEADLINE_MS` | 250 | non-VA 서비스의 QoS 기한(2026-11-14): 프레임의 실측 UL 지연이 이 값을 넘으면 미달 |
+| `NONVA_VIEWER_QOS_FREEZE` | 1 | 1 = 미달 프레임은 뷰어 화면을 갱신하지 않음(다음 충족 프레임까지 정지; VA 뷰어와 같은 규칙). 0 = 모든 프레임 중계, 판정만 표시 |
 
 바꾼 뒤 `../nonva.sh restart`, 전화기 페이지 새로 고침. 페이지 JS 상수는 서버가 채워 내려 준다(`_page()`).
+
+`/video_feed`는 **같은 호스트에서 온 페이지**(VA 서비스의 `/viewer`, 포트만 다름)에게만 `Access-Control-Allow-Origin`을 붙여 준다(2026-11-13).
+VA 뷰어의 녹화 기능이 중계 영상을 `fetch()`로 읽어 캔버스에 그리기 위한 것으로, 중계 내용·속도·연결 수는 그대로다. 다른 호스트의 페이지에는
+헤더가 붙지 않는다.
+
+## QoS 판정과 뷰어 정지 (2026-11-14)
+
+이 서비스의 QoS = **프레임의 실측 UL 지연 ≤ `NONVA_DEADLINE_MS`(250 ms)**. 추론도 하향 결과도 없으므로 UL 하나로 판정한다(UL = 프레임을 다 받은 시각 −
+(폰 `upload_start_ms` + 클럭 오프셋), CSV `ul_latency_ms`와 같은 값). 송신 시각을 쓸 수 없는 프레임(유한수가 아님)은 미달로 센다.
+
+```
+POST /upload_frame → qos_update(): 충족 → UE의 "현재 화면" 교체(shown_seq+1)   미달 → 화면 그대로(정지), 판정·연속 횟수·누계만 갱신
+GET /video_feed    → 현재 화면이 바뀔 때 조각 하나(X-NV-Meta: 판정 JSON, "pic": true) + 그림 없이 판정만 바뀌면 멈춘 프레임을 한 번 더("pic": false)
+GET /receiver_stats → 기존 필드 + "qos": {verdict, ul_ms, deadline_ms, streak, met, missed, stale, met_pct, shown_seq, held_ms, ...}
+```
+
+- VA 뷰어(`../va_service`의 `/viewer`)의 규칙을 그대로 옮긴 것이다: 판정은 프레임마다, 화면은 충족 프레임으로만 바뀐다. 먼저 보여 준 것보다 **오래된 캡처**가
+  나중에 도착하면 화면을 되돌리지 않는다(`stale`). 충족률은 최근 100 프레임.
+- 중계 조각 수는 전과 같거나 적다(미달 프레임은 내보내지 않음). 정지 중에 접속한 뷰어는 멈춘 프레임을 한 번 받는다.
+- 이 서비스의 `/viewer/<ue>` 페이지: 멈춘 동안 그림이 어두워지고 "QoS miss - picture held N s" / "UL 402 ms > 250 ms, N in a row" 배지, 아래에 기한·판정·
+  누계 줄. VA 서비스의 4칸 뷰어는 같은 정보를 `X-NV-Meta`(녹화 켬) 또는 `/receiver_stats`(1초마다)로 받아 한글 배지로 보여 준다.
+- **전화기 쪽은 바뀌지 않는다**: `/upload_frame` 응답, CSV 열, 텔레메트리(`nonva_ue*.json`) 모두 그대로이고 폰 페이지는 중계·통계를 받지 않는다 →
+  셀 하향 트래픽 증가 없음. `GET /nonva/status`에는 `deadline_ms`, `viewer_qos_freeze`, 세션별 `qos`가 추가됐다.
+- 확인(11-14, 시험 인스턴스, 생성 송신기): 충족/지연/송신 시각 없음/순서 뒤짐/송신 중단 계획대로 판정·누계·중계 조각이 나오는지 서버 수준에서 확인,
+  `/viewer/ue1` 배지·정지·복귀(헤드리스 Chromium). 실제 폰 4대 운용에서는 아직 미확인.
 
 ## 실행 (`../nonva.sh`)
 
@@ -37,6 +64,9 @@ VA 페이지와 같은 기능이다(`../va_service/README.md`의 같은 절). `V
 (반복·무음 재생; 파일은 폰 안에서만 읽으므로 **하향 트래픽이 없다**). 파일 프레임은 화면비를 유지한 채(남는 곳은 검은 띠) `NONVA_WIDTH × NONVA_HEIGHT`로
 변환해 보내므로 **UL 부하는 카메라 모드와 같은 설정을 따른다**(파일이 4K여도 720p로 올라간다). `Full Screen`은 영상만 화면 전체에 띄운다
 (나가기 = `Exit Full Screen`). 카메라로 돌아가려면 `Start Camera`, 끄려면 `Stop Camera / Video`. 서버 코드는 바뀌지 않았다.
+**처음부터 다시 재생 · 예약 시작(2026-11-14)**: `Restart Video`(즉시 0초부터, 전체 화면에서는 왼쪽 위 단추)와 `Start video at [시:분] Set / Cancel`(그 시각에 0초부터;
+`Start Streaming` 뒤에는 기지국 서버 시계, 그 전에는 폰 시계)도 VA 페이지와 같다. 폰 안의 `<video>`만 다루므로 요청도 하향 트래픽도 없다. 자세한 것은
+`../va_service/README.md`의 "처음부터 다시 재생 · 예약 시작" 절.
 확인(11-12, 헤드리스 Chromium, 시험 서버 1280×720·20 fps): 4:3 파일과 세로 파일 → 수신 1280×720, 20.0~20.3 fps, 전체 화면, 카메라 모드는 원본 페이지와 같음.
 실제 폰 확인은 아직.
 
@@ -44,7 +74,7 @@ VA 페이지와 같은 기능이다(`../va_service/README.md`의 같은 절). `V
 
 | 파일 | 내용 |
 |---|---|
-| `app.py` | hsw `app.py` + 설정의 환경변수화, 로그 디렉터리(`../runs/nonva_service_log/`), `service_common` 경로, `GET /nonva/status`. 서버 동작 변경 없음; 전화기 페이지에 동영상 파일 소스·전체 화면 추가(2026-11-12, 위 절) (차이: `../docs/patches/nonva_service_dgist.patch`) |
+| `app.py` | hsw `app.py` + 설정의 환경변수화, 로그 디렉터리(`../runs/nonva_service_log/`), `service_common` 경로, `GET /nonva/status`. 2026-11-13까지 서버 동작 변경 없음; 전화기 페이지에 동영상 파일 소스·전체 화면 추가(2026-11-12, 위 절); QoS 판정·뷰어 정지와 `Restart Video`·예약 시작 추가(2026-11-14, 위 절들) (차이: `../docs/patches/nonva_service_dgist.patch`) |
 | `nonva_sim.py`, `nonva_status.py` | 전화기 대역 시험 클라이언트, 상태 출력 (`nonva.sh test/status`) |
 | `service_common/`, `certs/` | hsw 그대로 |
 | `test_frames/hd_1280x720_q80.jpg` | `nonva.sh make-frame`이 만든 시험 프레임 |

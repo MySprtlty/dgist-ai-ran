@@ -5,7 +5,8 @@ dapp  : every camera frame becomes one RUN request to the DGIST dApp agent that 
         client: .../dapp_hook/python/xapp_client.py). The agent decodes the JPEG on the GPU (nvjpeg), runs the requested model on the
         SMs the L1 does not need in the coming slots (CUDA green contexts) and answers with the result and, because we ask for
         want_dets, the detections in the original image coordinates. One TCP connection serves every UE; requests are matched by
-        req_id, so two UEs' frames can be in flight at the same time.
+        req_id, so two UEs' frames can be in flight at the same time. The model of a request is VA_MODEL, or - with the
+        rule-based selection on (model_select.py, .env VA_MODEL_SELECT / VA_MODEL_WEIGHTS) - the model the selector hands out.
 local : the original hsw path (ultralytics YOLO in this process, PyTorch on the same GPU as a separate process) for A/B comparisons.
 
 Both return  {"detections": [{"class", "confidence", "x1", "y1", "x2", "y2"}, ...],   # the format the phone page draws
@@ -44,13 +45,14 @@ class DappBackend:
     name = "dapp"
 
     def __init__(self, agent="127.0.0.1:9810", model="26x", deadline_ms=200, priority=0, role="va", client_name="va-service",
-                 result_timeout=3.0):
+                 result_timeout=3.0, selector=None):
         host, _, port = str(agent).partition(":")
         self.host, self.port = host or "127.0.0.1", int(port or 9810)
         if model not in DAPP_MODELS:
             raise ValueError(f"unknown dApp model {model!r} (one of {DAPP_MODELS})")
         self.model, self.deadline_ms, self.priority = model, int(deadline_ms), int(priority)
         self.role, self.client_name, self.result_timeout = role, client_name, float(result_timeout)
+        self.selector = selector            # model_select.ModelSelector: the model of each request (None = self.model for all)
         cdir = _client_dir()
         if cdir not in sys.path:
             sys.path.insert(0, cdir)
@@ -101,6 +103,11 @@ class DappBackend:
                 raise ConnectionError(self.last_error)
             if self.model not in (w.get("models") or DAPP_MODELS):
                 print(f"[VA] warning: agent models {w.get('models')} do not list {self.model}", flush=True)
+            if self.selector is not None:
+                missing = self.selector.set_available(w.get("models"))
+                if missing:
+                    print(f"[VA] warning: model selection - the agent has not loaded {' '.join(missing)} (its models: {w.get('models')}); "
+                          f"their share is sent as {self.model}", flush=True)
             self._agent = a
             self.connected_since = time.time()
             self.counters["connects"] += 1
@@ -117,18 +124,19 @@ class DappBackend:
             a = self._agent if self._alive() else self._connect()
         except ConnectionError as exc:
             return {"detections": [], "dapp": self._fields(None, t0, reason="agent_unreachable", error=str(exc))}
+        model = self.selector.pick() if self.selector is not None else self.model
         try:
-            r = a.run(jpeg_bytes, model=self.model, qos={"deadline_ms": self.deadline_ms, "priority": self.priority},
+            r = a.run(jpeg_bytes, model=model, qos={"deadline_ms": self.deadline_ms, "priority": self.priority},
                       want_dets=True, timeout=self.result_timeout)
         except OSError as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
-            return {"detections": [], "dapp": self._fields(None, t0, reason="agent_lost", error=self.last_error)}
+            return {"detections": [], "dapp": self._fields(None, t0, reason="agent_lost", error=self.last_error, model=model)}
         status = r.get("status")
         if status == "timeout":
             self.counters["timeout"] += 1
             if not self._alive():
                 self.last_error = "connection closed by the agent"
-            return {"detections": [], "dapp": self._fields(r, t0, reason="timeout", error=f"no result within {self.result_timeout:.0f} s")}
+            return {"detections": [], "dapp": self._fields(r, t0, reason="timeout", error=f"no result within {self.result_timeout:.0f} s", model=model)}
         self.counters["success" if status == "success" else "fail"] += 1
         dets = []
         for d in r.get("dets") or []:
@@ -138,11 +146,11 @@ class DappBackend:
                          "confidence": round(float(d.get("conf", 0.0)), 3),
                          "x1": round(float(xy[0]), 2), "y1": round(float(xy[1]), 2),
                          "x2": round(float(xy[2]), 2), "y2": round(float(xy[3]), 2)})
-        return {"detections": dets, "dapp": self._fields(r, t0)}
+        return {"detections": dets, "dapp": self._fields(r, t0, model=model)}
 
-    def _fields(self, r, t0, reason=None, error=None):
+    def _fields(self, r, t0, reason=None, error=None, model=None):
         f = {"backend": "dapp", "status": (r or {}).get("status", "fail"), "reason": (r or {}).get("reason", reason),
-             "model": (r or {}).get("model", self.model), "deadline_ms": self.deadline_ms,
+             "model": (r or {}).get("model", model or self.model), "deadline_ms": self.deadline_ms,
              "client_ms": round((time.monotonic() - t0) * 1000.0, 3)}
         if r:
             for k in RESULT_KEYS:
@@ -162,7 +170,8 @@ class DappBackend:
         return {"backend": "dapp", "agent": f"{self.host}:{self.port}", "role": self.role, "connected": alive,
                 "connected_since": self.connected_since, "model": self.model, "deadline_ms": self.deadline_ms,
                 "welcome": a.welcome if a else None, "estimate": a.latest_estimate if (a and alive) else None,
-                "counters": dict(self.counters), "last_error": self.last_error}
+                "counters": dict(self.counters), "last_error": self.last_error,
+                "select": self.selector.snapshot() if self.selector is not None else None}
 
 
 class LocalBackend:
@@ -210,9 +219,10 @@ class LocalBackend:
         return {"backend": "local", "model": self.model_path, "device": self.device, "connected": True, "counters": dict(self.counters)}
 
 
-def make_backend(kind, agent="127.0.0.1:9810", model="26x", deadline_ms=200, priority=0, local_model_path="yolo26x.pt", device=0):
+def make_backend(kind, agent="127.0.0.1:9810", model="26x", deadline_ms=200, priority=0, local_model_path="yolo26x.pt", device=0,
+                 selector=None):
     if kind == "dapp":
-        return DappBackend(agent=agent, model=model, deadline_ms=deadline_ms, priority=priority)
+        return DappBackend(agent=agent, model=model, deadline_ms=deadline_ms, priority=priority, selector=selector)
     if kind == "local":
         return LocalBackend(local_model_path, device)
     raise ValueError(f"VA_BACKEND must be dapp or local, not {kind!r}")

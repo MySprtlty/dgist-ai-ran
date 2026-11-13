@@ -74,6 +74,9 @@ mode)
     if sudo -n true 2>/dev/null; then sudo -n bash $D/scripts/mig.sh $need; else echo "   MIG must be switched $need by an account with sudo:  sudo -n $D/scripts/mig.sh $need"; fi
   fi
   [ $want = baseline ] && ! ls $D/aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/models/migfhd26${VA_MODEL#26}/seg00_sm*.engine > /dev/null 2>&1 && echo "   Baseline engine missing: scripts/build_yolo_engines_mig.sh ${VA_MODEL#26}  (after MIG on)"
+  if [ $want = baseline ] && [ "${VA_MODEL_SELECT:-0}" = 1 ]; then IFS=, read -r -a wt <<< "${VA_MODEL_WEIGHTS:-}"; i=0; nb=""   # rule-based model selection: the other models need a Baseline engine too
+    for m in n s m l x; do w=${wt[$i]:-0}; w=${w// /}; i=$((i + 1)); case "$w" in ''|*[!0-9]*) continue ;; esac; [ "$w" -gt 0 ] && ! ls $D/aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/models/migfhd26$m/seg00_sm*.engine > /dev/null 2>&1 && nb="$nb $m"; done
+    [ -z "$nb" ] || echo "   VA_MODEL_SELECT=1 but no Baseline engine for:$nb - those requests run as ${VA_MODEL:-26x}: scripts/build_yolo_engines_mig.sh$nb  (after MIG on)"; fi
   echo "   next: $0 up <name>" ;;
 status)
   echo "mode      : $MODE$( [ "$MODE" = baseline ] && echo " (vanilla cuBB 25-3 on MIG 4g + naive YOLO on MIG 3g, no xApp)")"

@@ -9,6 +9,9 @@ BUILD_DIR=${BUILD_DIR:-build.aarch64_f1002}; L1_CONFIG=${L1_CONFIG:-dgist}; RUN=
 OWN=$(stat -c %u:%g $SDK)
 log() { local m="[dgist-l1 $(date +%T)] $*"; echo "$m"; echo "$m" >> $RUN/entrypoint.log 2>/dev/null; }
 rm -f /tmp/dgist_l1_ready /tmp/dgist_tenant_ready; mkdir -p $RUN; chown $OWN $RUN; : > $RUN/entrypoint.log; chown $OWN $RUN/entrypoint.log
+# ICNL 2026-11-14: /tmp is a host directory (docker-compose.yaml, .env L1_TMP_DIR, default ./runs/l1_tmp). Hand files root left there or
+# in run folders (a collect cut by the stop timeout) back to the host user, so they can be removed without sudo.
+find $DG/runs -maxdepth 2 -user root -exec chown $OWN {} + 2>/dev/null
 BIN=$SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf
 [ -x $BIN ] || { log "missing $BIN - on the host: ./dgist.sh build-l1"; exit 1; }
 for kv in SCF_FAPI_10_04:BOOL=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH:BOOL=OFF SCF_FAPI_10_04_SRS:BOOL=ON ENABLE_DAPP_HOOK:BOOL=ON; do
@@ -39,12 +42,15 @@ export DAPP_TENANT_LOG=/tmp/dapp_tenant.log
 export DAPP_TENANT_CSV=$([ "${DAPP_SLOT_CSV:-1}" = 1 ] && echo /tmp/dapp_tenant_slots.csv)
 export DAPP_INPUT=${DAPP_INPUT:-4k}
 if [ "$DAPP_INPUT" = fhd ]; then   # the batch-3 FHD engine set + FHD warm-up frames (the tenant defaults are the 4K set models/full26<m> and 4K frames)
-  export DAPP_TENANT_MODELS=$(c=""; for m in n s m l x; do printf "%s26%s=%s" "$c" $m $M/fhd26$m; c=,; done)
+  # ICNL 2026-11-13: .env DAPP_SKIP_MODELS (e.g. "m") leaves models out of the tenant (an fhd26m sm80 engine built without the sm72
+  # timing cache hit the TensorRT 10.3 "Cask Gemm execution" of the s/l sm80 note in build_yolo_engines.sh on the ICNL GH200, 11/13)
+  export DAPP_TENANT_MODELS=$(c=""; for m in n s m l x; do case " ${DAPP_SKIP_MODELS:-} " in *" $m "*) continue ;; esac; printf "%s26%s=%s" "$c" $m $M/fhd26$m; c=,; done)
+  [ -n "${DAPP_SKIP_MODELS:-}" ] && log "DAPP_SKIP_MODELS=$DAPP_SKIP_MODELS: tenant models $DAPP_TENANT_MODELS"
   export DAPP_AGENT_WARMUP=$M/imgfhd/fhd_0_q85.jpg,$M/imgfhd/fhd_1_q85.jpg
   export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}   # the FHD ladder (.env; 26s/26l sm80 = sm72-tactic engines, see build_yolo_engines.sh)
 fi
 [ -n "${PRACH_FORCE_THR0:-}" ] && export CUPHY_PRACH_FORCE_THR0=$PRACH_FORCE_THR0
-rm -f $PHYLOG /tmp/dapp_tenant.log /tmp/dapp_tenant_slots.csv
+rm -f $PHYLOG $PHYLOG.[0-9]* /tmp/dapp_tenant.log /tmp/dapp_tenant_slots.csv   # ICNL 11/14: + nvlog's rotated files phy.log.N
 env | grep -E '^(DAPP_|CUPHY_|BUILD_DIR|L1_CONFIG|RUN_NAME)' | sort > $RUN/l1_env.txt
 
 # 4. the L1 (the process renames itself phy_main)
@@ -54,11 +60,18 @@ chown $OWN $RUN/l1_console.log $RUN/l1_env.txt 2>/dev/null
 stopping=0
 on_term() { [ $stopping = 1 ] && return; stopping=1; log "stop requested - SIGTERM to the L1 (SIGKILL after 15 s)"; kill -TERM $L1 2>/dev/null; ( sleep 15; kill -KILL $L1 2>/dev/null ) & }
 trap on_term TERM INT
+# ICNL 2026-11-14: collect() reads every rotated file oldest first (nvlog: phy.log, phy.log.1..3), hands /tmp and the run folder to the
+# host user before the long greps (docker stop gives 40 s), and matches RACH but not PRACH: 'RACH' also matched the per-slot INF lines
+# "PRACH Aggr ... Map" and "requesting ... PRACH", which made the 11/13 run's phy_warn.log 8.5 M lines / 2.95 GB.
 collect() {
-  grep -E ' (WRN|ERR|FATAL) |Send Err.ind|recovery|not responsive|Order kernel timeout|exit handler|CONFIG.req received|START.req|L1 is ready|RACH|Preambles|dApp sizer' $PHYLOG > $RUN/phy_warn.log 2>/dev/null
-  grep -E '\] Cell +0 \| DL' $PHYLOG > $RUN/l1_persec.log 2>/dev/null
-  tail -n 2000000 $PHYLOG > $RUN/phy_tail.log 2>/dev/null
+  local PL NEWEST; PL=$(ls -tr $PHYLOG $PHYLOG.[0-9]* 2>/dev/null); NEWEST=$(ls -t $PHYLOG $PHYLOG.[0-9]* 2>/dev/null | head -1)
   cp /tmp/dapp_tenant.log /tmp/dapp_tenant_slots.csv $RUN/ 2>/dev/null
+  chown -R $OWN $RUN /tmp 2>/dev/null
+  if [ -n "$PL" ]; then   # (no file: grep would read the container's tty)
+    grep -hE ' (WRN|ERR|FATAL) |Send Err.ind|recovery|not responsive|Order kernel timeout|exit handler|CONFIG.req received|START.req|L1 is ready|[^P]RACH|Preambles|dApp sizer' $PL > $RUN/phy_warn.log 2>/dev/null
+    grep -hE '\] Cell +0 \| DL' $PL > $RUN/l1_persec.log 2>/dev/null
+    tail -n 2000000 $NEWEST > $RUN/phy_tail.log 2>/dev/null
+  fi
   chown -R $OWN $RUN
   log "logs: $RUN | L1 Err.ind $(grep -c 'Send Err.ind' $RUN/phy_warn.log 2>/dev/null), FATAL $(grep -c FATAL $RUN/phy_warn.log 2>/dev/null)"
 }

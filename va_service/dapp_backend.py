@@ -110,25 +110,29 @@ class DappBackend:
             return a
 
     # ---- one frame --------------------------------------------------------------------------------------------------
-    def infer(self, jpeg_bytes, ue_id=None):
+    def infer(self, jpeg_bytes, ue_id=None, model=None, deadline_ms=None):
+        # ICNL 11/12: model / deadline_ms of this frame (the Resource Allocator's decision, ra_link.py); None = VA_MODEL / VA_DEADLINE_MS
+        model = model if model in DAPP_MODELS else self.model
+        deadline_ms = round(float(deadline_ms), 1) if deadline_ms else self.deadline_ms
         t0 = time.monotonic()
         self.counters["requests"] += 1
         try:
             a = self._agent if self._alive() else self._connect()
         except ConnectionError as exc:
-            return {"detections": [], "dapp": self._fields(None, t0, reason="agent_unreachable", error=str(exc))}
+            return {"detections": [], "dapp": self._fields(None, t0, reason="agent_unreachable", error=str(exc), model=model, deadline_ms=deadline_ms)}
         try:
-            r = a.run(jpeg_bytes, model=self.model, qos={"deadline_ms": self.deadline_ms, "priority": self.priority},
+            r = a.run(jpeg_bytes, model=model, qos={"deadline_ms": deadline_ms, "priority": self.priority},
                       want_dets=True, timeout=self.result_timeout)
         except OSError as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
-            return {"detections": [], "dapp": self._fields(None, t0, reason="agent_lost", error=self.last_error)}
+            return {"detections": [], "dapp": self._fields(None, t0, reason="agent_lost", error=self.last_error, model=model, deadline_ms=deadline_ms)}
         status = r.get("status")
         if status == "timeout":
             self.counters["timeout"] += 1
             if not self._alive():
                 self.last_error = "connection closed by the agent"
-            return {"detections": [], "dapp": self._fields(r, t0, reason="timeout", error=f"no result within {self.result_timeout:.0f} s")}
+            return {"detections": [], "dapp": self._fields(r, t0, reason="timeout", error=f"no result within {self.result_timeout:.0f} s",
+                                                           model=model, deadline_ms=deadline_ms)}
         self.counters["success" if status == "success" else "fail"] += 1
         dets = []
         for d in r.get("dets") or []:
@@ -138,11 +142,11 @@ class DappBackend:
                          "confidence": round(float(d.get("conf", 0.0)), 3),
                          "x1": round(float(xy[0]), 2), "y1": round(float(xy[1]), 2),
                          "x2": round(float(xy[2]), 2), "y2": round(float(xy[3]), 2)})
-        return {"detections": dets, "dapp": self._fields(r, t0)}
+        return {"detections": dets, "dapp": self._fields(r, t0, model=model, deadline_ms=deadline_ms)}
 
-    def _fields(self, r, t0, reason=None, error=None):
+    def _fields(self, r, t0, reason=None, error=None, model=None, deadline_ms=None):
         f = {"backend": "dapp", "status": (r or {}).get("status", "fail"), "reason": (r or {}).get("reason", reason),
-             "model": (r or {}).get("model", self.model), "deadline_ms": self.deadline_ms,
+             "model": (r or {}).get("model", model or self.model), "deadline_ms": deadline_ms if deadline_ms else self.deadline_ms,
              "client_ms": round((time.monotonic() - t0) * 1000.0, 3)}
         if r:
             for k in RESULT_KEYS:
@@ -178,7 +182,7 @@ class LocalBackend:
         self.counters = {"requests": 0, "success": 0, "fail": 0}
         print("[VA] local model loaded", flush=True)
 
-    def infer(self, jpeg_bytes, ue_id=None):
+    def infer(self, jpeg_bytes, ue_id=None, model=None, deadline_ms=None):   # one local model: model / deadline_ms are ignored
         import io
         from PIL import Image
         t0 = time.monotonic()

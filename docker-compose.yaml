@@ -40,6 +40,11 @@ services:
       - ./config:/opt/dgist/config:ro
       - ./scripts:/opt/dgist/scripts:ro
       - ./runs:/opt/dgist/runs
+      # ICNL 2026-11-14: the container's /tmp (nvlog phy.log*, dApp tenant log / slot CSV, healthcheck markers) on a host directory (.env
+      # L1_TMP_DIR, default ./runs/l1_tmp) instead of the container layer on the root disk - an 11/13 run filled a 879 GB root disk in
+      # about 6 h with phy.log (the SDK default keeps up to 8 x 50 GB) - and nvlog capped at 4 x 4 GB (config/nvlog_config_dgist.yaml)
+      - ${L1_TMP_DIR:-./runs/l1_tmp}:/tmp
+      - ./config/nvlog_config_dgist.yaml:/opt/nvidia/cuBB/cuPHY/nvlog/config/nvlog_config.yaml:ro
       - /dev/hugepages:/dev/hugepages
       - /lib/modules:/lib/modules:ro
       - /usr/src:/usr/src:ro

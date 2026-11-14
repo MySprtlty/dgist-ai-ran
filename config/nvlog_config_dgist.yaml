@@ -1,0 +1,324 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+# log files stored at /tmp directory (default)
+# log file path can be customized using environment variable $AERIAL_LOG_PATH
+# Log levels: 0 - NONE, 1 - FATAL, 2 - ERROR, 3 - CONSOLE, 4 - WARNING, 5 - INFO, 6 - DEBUG, 7 - VERBOSE
+# ICNL 2026-11-14: copy of the SDK's cuPHY/nvlog/config/nvlog_config.yaml, bind-mounted over it in the dgist-l1 container only (docker-compose.yaml)
+# the SDK file itself is not changed. Only the two size lines differ. The SDK default (50 GB x 8 files) let
+# phy.log grow to ~80 GB in 16 h of the 11/13 19:01 run and filled GH200's shared root disk at about 04:50 on 11/14, because the
+# container's /tmp was on the root disk. /tmp is now a host directory (.env L1_TMP_DIR), and phy.log, phy.log.1..3 hold at most 4 x 4 GB = 16 GB
+# (nvlog.cpp update_log_filename: the base file, then .1 .. .N-1, then the base file again, truncated).
+aerial_sdk_version: 25-3-cubb
+nvlog:
+  shm_log_level: 4 # SHM log level
+  max_file_size_bytes: 4000000000 # ICNL: 4 GB per file (SDK default 50000000000)
+  max_rotating_file_num: 4 # ICNL: 4 files (SDK default 8)
+  log_file_path: "/tmp"
+  nvlog_tags:
+    - 0: "" # Reserve number 0 for no tag print
+      shm_level: 5 # Example: overlay shm_log_level for a tag
+    - 10: "NVLOG" # nvlog
+    - 11: "NVLOG.TEST"
+    - 12: "NVLOG.ITAG"
+    - 13: "NVLOG.STAG"
+    - 14: "NVLOG.STAT"
+    - 15: "NVLOG.OBSERVER"
+    - 16: "NVLOG.CPP"
+    - 17: "NVLOG.SHM"
+    - 18: "NVLOG.UTILS"
+    - 19: "NVLOG.C"
+    - 20: "NVLOG.EXIT_HANDLER"
+    - 30: "NVIPC" # nvipc
+    - 31: "NVIPC:YAML"
+    - 32: "NVIPC.SHM_UTILS"
+    - 33: "NVIPC.CUDAPOOL"
+    - 34: "NVIPC.CUDAUTILS"
+    - 35: "NVIPC.TESTCUDA"
+    - 36: "NVIPC.SHM"
+    - 37: "NVIPC.QUEUE"
+    - 38: "NVIPC.IPC"
+    - 39: "NVIPC.FD_SHARE"
+    - 40: "NVIPC.DEBUG"
+    - 41: "NVIPC.EFD"
+    - 42: "NVIPC.EPOLL"
+    - 43: "NVIPC.MEMPOOL"
+    - 44: "NVIPC.RING"
+    - 45: "NVIPC.SEM"
+    - 46: "NVIPC.SHMLOG"
+    - 47: "NVIPC.CONF"
+    - 48: "NVIPC.DOCA"
+    - 49: "NVIPC.DOCA_UTILS"
+    - 50: "NVIPC.DPDK"
+    - 51: "NVIPC.DPDK_UTILS"
+    - 52: "NVIPC.GPUDATAUTILS"
+    - 53: "NVIPC.GPUDATAPOOL"
+    - 54: "NVIPC.TIMING"
+    - 55: "NVIPC.DUMP"
+    - 56: "NVIPC.UDP"
+    - 57: "INIT"
+    - 58: "TEST"
+    - 59: "PHY"
+    - 60: "MAC"
+    - 61: "NVIPC.PCAP"
+    - 100: "CTL" # cuPHYController
+    - 101: "CTL.SCF"
+    - 103: "CTL.DRV"
+    - 104: "CTL.YAML"
+    - 105: "CTL.STARTUP_TIMES"
+    - 106: "CTL.DATA_LAKE"
+      #shm_level: 5
+    - 107: "CTL.E3"
+      #shm_level: 5
+    - 200: "DRV" # cuPHYDriver
+    - 201: "DRV.SA"
+    - 202: "DRV.TIME"
+    - 203: "DRV.CTX"
+    - 204: "DRV.API"
+    - 205: "DRV.FH"
+    - 206: "DRV.GEN_CUDA"
+    - 207: "DRV.GPUDEV"
+    - 208: "DRV.PHYCH"
+    - 209: "DRV.TASK"
+    - 210: "DRV.WORKER"
+    - 211: "DRV.DLBUF"
+    - 212: "DRV.CSIRS"
+    - 213: "DRV.PBCH"
+    - 214: "DRV.PDCCH_DL"
+    - 215: "DRV.PDSCH"
+    - 216: "DRV.MAP_DL"
+      #shm_level: 5
+
+      shm_level: 5
+    - 217: "DRV.FUNC_DL"
+      #shm_level: 5
+
+      shm_level: 5
+    - 218: "DRV.HARQ_POOL"
+    - 219: "DRV.ORDER_CUDA"
+    - 220: "DRV.ORDER_ENTITY"
+    - 221: "DRV.PRACH"
+    - 222: "DRV.PUCCH"
+    - 223: "DRV.PUSCH"
+    - 224: "DRV.MAP_UL"
+      #shm_level: 5
+
+      shm_level: 5
+    - 225: "DRV.FUNC_UL"
+      #shm_level: 5
+
+      shm_level: 5
+    - 226: "DRV.ULBUF"
+    - 227: "DRV.MPS"
+    - 228: "DRV.METRICS"
+    - 229: "DRV.MEMFOOT"
+      #shm_level: 5
+    - 230: "DRV.CELL"
+    - 231: "DRV.EXCP"
+    - 232: "DRV.CV_MEM_BNK"
+    - 233: "DRV.DLBFW"
+    - 234: "DRV.ULBFW"
+    - 235: "DRV.CUPHY_PTI"
+    - 236: "DRV.SYMBOL_TIMINGS"
+      #shm_level: 5
+    - 237: "DRV.PACKET_TIMINGS"
+      #shm_level: 5
+    - 238: "DRV.UL_PACKET_SUMMARY"
+      #shm_level: 5
+
+      shm_level: 5
+    - 239: "DRV.SRS"
+      #shm_level: 6
+    - 240: "DRV.MAP_DL_VERBOSE"
+    - 241: "DRV.MAP_UL_VERBOSE"
+    - 242: "DRV.PMU"
+      shm_level: 5
+    - 243: "DRV.SRS_PACKET_SUMMARY"
+      #shm_level: 5
+
+      shm_level: 5
+    - 244: "DRV.SRS_FAPI_PACKET_SUMMARY"
+      #shm_level: 5
+    - 245: "DRV.SYMBOL_TIMINGS_SRS"
+      #shm_level: 5
+    - 246: "DRV.PACKET_TIMINGS_SRS"
+      #shm_level: 5
+    - 247: "DRV.WAVGCFO_POOL"
+      #shm_level: 5
+    - 300: "L2A" # cuphyl2adapter
+    - 301: "L2A.MAC"
+    - 302: "L2A.MACFACT"
+    - 303: "L2A.PROXY"
+    - 304: "L2A.EPOLL"
+    - 305: "L2A.TRANSPORT"
+    - 306: "L2A.MODULE"
+    - 307: "L2A.TICK"
+    - 308: "L2A.UEMD"
+    - 309: "L2A.PARAM"
+    - 310: "L2A.SIM"
+    - 311: "L2A.PROCESSING_TIMES"
+      #shm_level: 5
+
+      shm_level: 5
+    - 312: "L2A.TICK_TIMES"
+      #shm_level: 5
+
+      shm_level: 5
+    - 330: "SCF" # scfl2adapter
+    - 331: "SCF.MAC"
+    - 332: "SCF.DISPATCH"
+    - 333: "SCF.PHY"
+      # shm_level: 7
+    - 334: "SCF.SLOTCMD"
+      # shm_level: 7
+    - 335: "SCF.L2SA"
+    - 336: "SCF.DUMMYMAC"
+    - 337: "SCF.CALLBACK"
+    - 338: "SCF.TICK_TEST"
+    - 339: "SCF.UL_FAPI_VALIDATE"
+    - 340: "SCF.DL_FAPI_VALIDATE"
+    - 400: "MAC" # testMAC
+    - 401: "MAC.LP"
+    - 402: "MAC.FAPI"
+    - 403: "MAC.UTILS"
+    - 404: "MAC.SCF"
+    - 406: "MAC.CFG"
+    - 407: "MAC.PROC"
+    - 408: "MAC.VALD"
+      #shm_level: 7
+    - 409: "MAC.PROCESSING_TIMES"
+      #shm_level: 5
+
+      shm_level: 5
+    - 420: "CUMAC" # testMAC - cuMAC
+      shm_level: 5
+    - 421: "CUMAC.CFG"
+    - 422: "CUMAC.HANDLER"
+    - 423: "CUMAC.PATTERN"
+      shm_level: 5
+    - 424: "CUMAC.VALD"
+      shm_level: 5
+    - 450: "CUMCP" # cuMAC-CP
+    - 451: "CUMCP.MAIN"
+      shm_level: 5
+    - 452: "CUMCP.CFG"
+    - 453: "CUMCP.RECV"
+      shm_level: 5
+    - 454: "CUMCP.HANDLER"
+      shm_level: 5
+    - 455: "CUMCP.TASK"
+      shm_level: 5
+    - 500: "RU" # ru-emulator
+    - 501: "RU.EMULATOR"
+    - 502: "RU.PARSER"
+    - 503: "RU.LATE_PACKETS"
+      shm_level: 3
+    - 504: "RU.SYMBOL_TIMINGS"
+      #shm_level: 5
+    - 505: "RU.TX_TIMINGS"
+      #shm_level: 5
+    - 506: "RU.TX_TIMINGS_SUM"
+      #shm_level: 5
+    - 507: "RU.TV_CONFIGS"
+      shm_level: 5
+    - 508: "RU.UL_LATE_TX"
+      shm_level: 5
+    - 509: "RU.CP_WORKER_TRACING"
+      # shm_level: 5
+    - 600: "FH" # aerial-fh-driver
+    - 601: "FH.FLOW"
+    - 602: "FH.FH"
+    - 603: "FH.GPU_MP"
+    - 604: "FH.LIB"
+    - 605: "FH.MEMREG"
+    - 606: "FH.METRICS"
+    - 608: "FH.PDUMP"
+    - 609: "FH.PEER"
+    - 610: "FH.QUEUE"
+    - 611: "FH.RING"
+    - 612: "FH.TIME"
+    - 613: "FH.GPU_COMM"
+    - 614: "FH.STREAMRX"
+    - 615: "FH.GPU"
+    - 616: "FH.RMAX"
+    - 617: "FH.GPU_COMM_CUDA"
+    - 618: "FH.DOCA"
+    - 619: "FH.NIC"
+    - 620: "FH.STATS"
+    - 621: "FH.LATE_PACKETS"
+      shm_level: 5
+    - 622: "FH.SYMBOL_TIMINGS"
+      shm_level: 5
+    - 623: "FH.TX_TIMINGS"
+      #shm_level: 5
+    - 624: "FH.PACKET_SUMMARY"
+      shm_level: 5
+    - 625: "FH.DEBUG"
+      shm_level: 5
+    - 650: "FHGEN" # fh_generator
+    - 651: "FHGEN.GEN"
+    - 652: "FHGEN.WORKER"
+    - 653: "FHGEN.YAML"
+    - 654: "FHGEN.ORAN_SLOT_ITER"
+    - 700: "COMP" # compression_decompression
+    - 800: "OAM" # cuphyoam
+    - 801: "OAM.YMMGR" # cuphyoam YANG Model Manager
+      #shm_level: 5
+    - 802: "OAM.YMSVC" # cuphyoam YANG Model OAM Service
+      #shm_level: 5
+    - 803: "OAM.CUSConnMgr" # cuphyoam AerialCUSConnMgr
+      #shm_level: 5
+    - 804: "OAM.COMMSVC" # cuphyoam Common SVC
+      #shm_level: 5
+    - 900: "CUPHY" # cuPHY
+    - 901: "CUPHY.SSB_TX"
+    - 902: "CUPHY.PDCCH_TX"
+    - 904: "CUPHY.PDSCH_TX"
+    - 905: "CUPHY.CSIRS_TX"
+    - 906: "CUPHY.PRACH_RX"
+    - 907: "CUPHY.PUCCH_RX"
+    - 908: "CUPHY.PUSCH_RX"
+    - 909: "CUPHY.BFW"
+    - 910: "CUPHY.SRS_RX"
+    - 911: "CUPHY.SRS_TX"
+    - 912: "CUPHY.CSIRS_RX"
+    # cuPHY components and common utilities (not channels)
+    - 931: "CUPHY.UTILS"
+    - 932: "CUPHY.MEMFOOT"
+    - 933: "CUPHY.PTI"
+      #shm_level: 5
+    - 934: "CUPHY.CUPTI"
+      #shm_level: 5
+    - 935: "CUPHY.PYAERIAL"
+    # test bench (currently phase-3)
+    - 1000: "TESTBENCH"
+    - 1001: "TESTBENCH.PHY"
+    - 1002: "TESTBENCH.MAC"
+    # Unit test bench
+    - 1010: "UNIT_TB"
+    - 1011: "UNIT_TB.COMMON"
+    - 1012: "UNIT_TB.DLC"
+    # order kernel test bench
+    - 1050: "ORDER_TB"
+    - 1051: "ORDER_TB.INIT"
+    - 1052: "ORDER_TB.RUN"
+    # App Configs and utilities
+    - 1100: "APP"
+    - 1101: "APP.CONFIG"
+    - 1102: "APP.UTILS"
+    # CuMAC
+    - 1200: "CUMAC"
+    - 1210: "CUMAC.UTILS"

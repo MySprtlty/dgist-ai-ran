@@ -41,12 +41,12 @@ class Http:
         req = Request(self.url + path, data=json.dumps(obj).encode(), method="POST", headers={"Content-Type": "application/json"})
         return json.loads(self._do(req))
 
-    def post_multipart(self, path, fields, filename, data):
+    def post_multipart(self, path, fields, filename, data, headers=None):
         b = "----ue_sim" + uuid.uuid4().hex
         body = b"".join(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields.items())
         body += (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: image/jpeg\r\n\r\n'.encode()
                  + data + b"\r\n" + f"--{b}--\r\n".encode())
-        req = Request(self.url + path, data=body, method="POST", headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+        req = Request(self.url + path, data=body, method="POST", headers={"Content-Type": f"multipart/form-data; boundary={b}", **(headers or {})})
         return self._do(req)
 
 
@@ -123,9 +123,11 @@ def main():
         client_send_ms = time.time() * 1000.0
         e2e0 = time.perf_counter()
         try:
+            # DGIST viewer fields in the form + ICNL: the same headers as the page, for the Resource Allocator link (ra_link.py)
             raw = h.post_multipart("/detect_frame", {"enable_yolo": "false" if a.no_yolo else "true", "ue_id": ue, "session_token": token, "frame_id": str(frame_id),
                                              "client_send_ms": f"{client_send_ms:.3f}", "clock_offset_ms": f"{offset_ms:.3f}"},   # viewer: UL on the server
-                                   "frame.jpg", data)
+                                   "frame.jpg", data, headers={"X-Frame-Id": str(frame_id), "X-Ue-Id": ue,
+                                                               "X-T0-Ms": f"{client_send_ms + offset_ms:.3f}"})
         except HTTPError as e:
             msg = e.read().decode(errors="replace")[:200]
             with lock:
@@ -172,6 +174,9 @@ def main():
                    "dapp_model": dapp.get("model"), "dapp_sm": dapp.get("sm"), "dapp_wait_ms": dapp.get("wait_ms"),
                    "dapp_decode_ms": dapp.get("decode_ms"), "dapp_infer_ms": dapp.get("infer_ms"), "dapp_latency_ms": dapp.get("latency_ms"),
                    "detections": len(d.get("detections") or [])}
+            ra = d.get("ra") or {}
+            rec.update(ra_answered=ra.get("answered"), ra_model=ra.get("model"), ra_deadline_ms=ra.get("deadline_ms"),
+                       ra_pred_ms=ra.get("pred_ms"), ra_feasible=ra.get("feasible"), ra_ul_ms=ra.get("ul_ms"))
             records.append(rec)
         try:
             h.post_json("/telemetry/result", {"ue_id": ue, "session_token": token, "frame_id": frame_id, "latency_ms": e2e,
@@ -182,7 +187,8 @@ def main():
             print(f"[{ue}] #{frame_id:3d} {dapp.get('status', '-'):8s}{('/' + dapp['reason']) if dapp.get('reason') else '':10s} "
                   f"e2e {e2e:7.1f} ms = ul {ul:5.1f} + ai {ai:6.1f} + other {other:4.1f} + dl {dl:4.1f} | "
                   f"sm {str(dapp.get('sm', '-')):>3s} wait {float(dapp.get('wait_ms') or 0):5.1f} dec {float(dapp.get('decode_ms') or 0):4.1f} "
-                  f"inf {float(dapp.get('infer_ms') or 0):5.1f} | det {rec['detections']:3d} | QoS {'met' if qos_met else 'MISS'}", flush=True)
+                  f"inf {float(dapp.get('infer_ms') or 0):5.1f} | det {rec['detections']:3d} | QoS {'met' if qos_met else 'MISS'}"
+                  + (f" | {dapp.get('model')} RA dl {rec['ra_deadline_ms']}" if d.get("ra") else ""), flush=True)
 
     pool = ThreadPoolExecutor(max_workers=max(1, a.inflight))
     futs = []

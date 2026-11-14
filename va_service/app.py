@@ -11,6 +11,10 @@ Settings come from the environment (_dgist/.env, exported by va.sh):
   VA_JPEG_QUALITY=0.90  VA_MAX_INFLIGHT=4  VA_AGENT=127.0.0.1:9810  VA_LOG_DIR=<_dgist>/runs/va_service_log  VA_VERBOSE=0
   VA_FILE_WIDTH=1920  VA_FILE_HEIGHT=1080   (phone page, video-file source: the size every frame of a file is converted to)
 Run (va.sh start):  uvicorn app:app --host 0.0.0.0 --port 8000 --ssl-keyfile certs/server.key --ssl-certfile certs/server.crt
+
+ICNL 2026-11-12 (iitp_demo/va_service_ra): with VA_RA_HOOK=host:port the IITP demo Resource Allocator chooses each frame's model and
+server deadline (ra_link.py: frame_start / progress from an ASGI middleware while the upload arrives, decide before the RUN, done after
+it). The page sends X-Frame-Id / X-Ue-Id / X-T0-Ms headers for that. VA_RA_HOOK empty (default) = the DGIST behaviour above.
 """
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -56,6 +60,10 @@ VA_MODEL = _env("VA_MODEL", "26x")                      # the one dApp model eve
 VA_DEADLINE_MS = _env("VA_DEADLINE_MS", 200, int)       # QoS: RUN qos.deadline_ms, and the per-frame E2E target judged on the phone
 VA_AGENT = _env("VA_AGENT", "127.0.0.1:9810")           # dApp agent (TCP; the dgist-l1 container runs with network host)
 VA_VERBOSE = _env("VA_VERBOSE", 0, int)                 # 1 = one console line per frame
+# ICNL: Resource Allocator link (ra_link.py). Empty = off
+VA_RA_HOOK = _env("VA_RA_HOOK", "")                     # RA hook address, e.g. 127.0.0.1:9822 (ra_main.py --hook)
+VA_RA_TIMEOUT_MS = _env("VA_RA_TIMEOUT_MS", 5.0, float) # how long a frame waits for the RA's decision before it runs with VA_MODEL
+VA_RA_PROGRESS_MS = _env("VA_RA_PROGRESS_MS", 5.0, float)   # upload progress reports to the RA at most this often
 
 CAMERA_WIDTH = _env("VA_CAMERA_WIDTH", 3840, int)       # 4K UHD capture on the phone
 CAMERA_HEIGHT = _env("VA_CAMERA_HEIGHT", 2160, int)
@@ -166,6 +174,16 @@ def _telemetry_result_dash(ue, token, frame_id, latency_ms=None, payload_bytes=0
 telemetry.result = _telemetry_result_dash
 
 
+# ICNL: Resource Allocator link (off without VA_RA_HOOK)
+ra_link = None
+if VA_RA_HOOK:
+    from ra_link import RaLink, RaMiddleware, SCOPE_KEY as RA_SCOPE_KEY   # noqa: E402
+    ra_link = RaLink(VA_RA_HOOK, timeout_ms=VA_RA_TIMEOUT_MS, progress_ms=VA_RA_PROGRESS_MS)
+    app.add_middleware(RaMiddleware, link=ra_link)
+    print(f"VA service: Resource Allocator link on, hook {VA_RA_HOOK}, decision wait <= {VA_RA_TIMEOUT_MS:g} ms "
+          f"(no answer: {VA_MODEL}, {VA_DEADLINE_MS} ms)", flush=True)
+
+
 # =====================================================
 # CSV Data Models
 # =====================================================
@@ -211,6 +229,13 @@ class LatencyRecord(BaseModel):
     dapp_infer_ms: float | None = None
     dapp_latency_ms: float | None = None
     detections: int | None = None
+    # ICNL: Resource Allocator decision of this frame (ra_link.py; empty without VA_RA_HOOK)
+    ra_answered: bool | None = None
+    ra_model: str | None = None
+    ra_deadline_ms: float | None = None
+    ra_pred_ms: float | None = None
+    ra_feasible: bool | None = None
+    ra_ul_ms: float | None = None
 
 
 class LatencySession(BaseModel):
@@ -2139,6 +2164,12 @@ async function sendLoop() {
                 {
                     method: "POST",
                     body: formData,
+                    // ICNL: who / which frame / when it left the phone (server clock) for the Resource Allocator (ra_link.py)
+                    headers: {
+                        "X-Frame-Id": String(currentFrameId),
+                        "X-Ue-Id": String(frameTelemetry.ue),
+                        "X-T0-Ms": (clientSendMs + clockOffsetMs).toFixed(3)
+                    },
                     signal: uploadAbort.signal
                 }
             );
@@ -2524,7 +2555,13 @@ async function sendLoop() {
             dapp_decode_ms: dapp.decode_ms ?? null,
             dapp_infer_ms: dapp.infer_ms ?? null,
             dapp_latency_ms: dapp.latency_ms ?? null,
-            detections: data.detections.length
+            detections: data.detections.length,
+            ra_answered: data.ra ? data.ra.answered : null,
+            ra_model: data.ra ? (data.ra.model ?? null) : null,
+            ra_deadline_ms: data.ra ? (data.ra.deadline_ms ?? null) : null,
+            ra_pred_ms: data.ra ? (data.ra.pred_ms ?? null) : null,
+            ra_feasible: data.ra ? (data.ra.feasible ?? null) : null,
+            ra_ul_ms: data.ra ? (data.ra.ul_ms ?? null) : null
         });
 
 
@@ -2641,7 +2678,9 @@ async function sendLoop() {
         document.getElementById("dappInfo").innerText = data.yolo_enabled
             ? ((dapp.backend || VA_BACKEND) + " " + (dapp.model || VA_MODEL) + " " + (dapp.status || "-") + (dapp.reason ? "/" + dapp.reason : "")
                + " | SM " + fmt(dapp.sm, 0) + " | wait " + fmt(dapp.wait_ms, 1) + " dec " + fmt(dapp.decode_ms, 1)
-               + " inf " + fmt(dapp.infer_ms, 1) + " srv " + fmt(dapp.latency_ms, 1) + " ms | det " + data.detections.length)
+               + " inf " + fmt(dapp.infer_ms, 1) + " srv " + fmt(dapp.latency_ms, 1) + " ms | det " + data.detections.length
+               + (data.ra ? (" | RA " + (data.ra.answered ? (data.ra.model + " server deadline " + fmt(data.ra.deadline_ms, 1) + " ms"
+                                                            + (data.ra.feasible ? "" : " (infeasible)")) : "no answer")) : ""))
             : "YOLO OFF";
 
 
@@ -3180,6 +3219,18 @@ async def clock_sync():
 # YOLO Detection
 # =====================================================
 
+def _infer_ra(image_data, ue_id, ra, t1_fallback_ms):
+    """ICNL: ask the Resource Allocator for this frame's model and server deadline, RUN with them (or with VA_MODEL /
+    VA_DEADLINE_MS when it does not answer in VA_RA_TIMEOUT_MS), tell it the result. Runs in the worker thread."""
+    d = ra_link.decide(ra, ue_id, t1_fallback_ms)
+    if d:
+        res = backend.infer(image_data, ue_id, model=d["model"], deadline_ms=d["deadline_ms"])
+    else:
+        res = backend.infer(image_data, ue_id)
+    ra_link.done(ra, res["dapp"])
+    return res
+
+
 @app.post("/detect_frame")
 async def detect_frame(
     file: UploadFile = File(...),
@@ -3217,8 +3268,13 @@ async def detect_frame(
     # Snapshot of GPU-wide metrics associated with this frame (NVML util = recent sampling window, not per-frame usage).
     gpu_util_percent, gpu_memory_used_gb = read_gpu_metrics()
 
+    ra = request.scope.get(RA_SCOPE_KEY) if ra_link and request is not None else None    # ICNL: this frame's Resource Allocator record (ra_link.py)
+
     if enable_yolo:
-        res = await run_in_threadpool(backend.infer, image_data, ue_id)
+        if ra is not None:
+            res = await run_in_threadpool(_infer_ra, image_data, ue_id, ra, server_receive_ms)
+        else:
+            res = await run_in_threadpool(backend.infer, image_data, ue_id)
         # t3: AI end (the agent's reply is in)
         ai_end_ms = time.time_ns() / 1_000_000.0
         processing_ms = ai_end_ms - ai_start_ms
@@ -3228,13 +3284,16 @@ async def detect_frame(
             print(f"[VA] {ue_id} {dapp.get('status')}{('/' + str(dapp.get('reason'))) if dapp.get('reason') else ''} {dapp.get('model')} "
                   f"sm {dapp.get('sm')} wait {dapp.get('wait_ms')} dec {dapp.get('decode_ms')} inf {dapp.get('infer_ms')} "
                   f"srv {dapp.get('latency_ms')} ai {processing_ms:.1f} ms det {len(detections)} {image_width}x{image_height} "
-                  f"{len(image_data) / 1024:.0f} KB", flush=True)
+                  f"{len(image_data) / 1024:.0f} KB"
+                  + (f" | RA {RaLink.public(ra)}" if ra is not None else ""), flush=True)
     else:
         # No inference request in this branch: upload + header read only, AI time explicitly zero.
         ai_end_ms = ai_start_ms
         processing_ms = 0.0
         detections = []
         dapp = None
+        if ra is not None:
+            ra_link.done(ra, None, status="no_ai", kind="done_no_ai")
 
     # t4: application data for the response is ready
     server_send_ms = time.time_ns() / 1_000_000.0
@@ -3280,11 +3339,12 @@ async def detect_frame(
         "gpu_memory_used_gb": gpu_memory_used_gb,
         # DGIST additions
         "backend": VA_BACKEND,
-        "model": VA_MODEL,
-        "qos_deadline_ms": VA_DEADLINE_MS,
+        "model": (dapp or {}).get("model") or VA_MODEL,        # ICNL: the model this frame ran with (the RA may change it per frame)
+        "qos_deadline_ms": VA_DEADLINE_MS,                      # the E2E target the page judges (the RA's server deadline is in "ra")
         "ue_id": ue_id,
         "dapp": dapp,
         "viewer": viewer,
+        "ra": RaLink.public(ra) if ra is not None else None,   # ICNL: the Resource Allocator decision
     }
 
 
@@ -3405,7 +3465,13 @@ async def save_latency_log(
                 "dapp_decode_ms",
                 "dapp_infer_ms",
                 "dapp_latency_ms",
-                "detections"
+                "detections",
+                "ra_answered",
+                "ra_model",
+                "ra_deadline_ms",
+                "ra_pred_ms",
+                "ra_feasible",
+                "ra_ul_ms"
             ]
         )
 
@@ -3457,7 +3523,13 @@ async def save_latency_log(
                     record.dapp_decode_ms,
                     record.dapp_infer_ms,
                     record.dapp_latency_ms,
-                    record.detections
+                    record.detections,
+                    None if record.ra_answered is None else int(record.ra_answered),
+                    record.ra_model,
+                    record.ra_deadline_ms,
+                    record.ra_pred_ms,
+                    None if record.ra_feasible is None else int(record.ra_feasible),
+                    record.ra_ul_ms
                 ]
             )
 
@@ -3520,6 +3592,7 @@ async def va_status():
                    "max_inflight": MAX_INFLIGHT, "camera": [CAMERA_WIDTH, CAMERA_HEIGHT], "file_frame": [VA_FILE_WIDTH, VA_FILE_HEIGHT], "jpeg_quality": JPEG_QUALITY,
                    "agent": VA_AGENT, "log_dir": str(LOG_DIR), "telemetry_dir": str(telemetry.directory)},
         "backend": backend.status(),
+        "ra": ra_link.status() if ra_link else None,
         "ue": ue,
         "viewer": {"on": VA_VIEWER, "dl_ms": VA_VIEWER_DL_MS, "freeze": VA_VIEWER_QOS_FREEZE,
                    "ue": {u: {k: st.meta(time.time_ns() / 1_000_000.0, False)[k] for k in ("seq", "verdict", "results", "met", "missed", "failed", "met_pct", "active", "kb", "req_s", "mbps")}

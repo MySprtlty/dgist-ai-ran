@@ -34,7 +34,7 @@
     }
     destroy() { this.ro.disconnect(); this.F = null; }
     redraw() { if (this.F) this.draw(this.F); }
-    begin() { const c = this.ctx; c.setTransform(this.d, 0, 0, this.d, 0, 0); c.clearRect(0, 0, this.w, this.h); c.globalAlpha = 1; c.setLineDash([]); return c; }
+    begin() { const c = this.ctx; this.cvs._v = (this.cvs._v | 0) + 1; c.setTransform(this.d, 0, 0, this.d, 0, 0); c.clearRect(0, 0, this.w, this.h); c.globalAlpha = 1; c.setLineDash([]); return c; }
     ready() { if (!this.w) this.size(); return this.w > 0; }
     empty(c, msg) { c.fillStyle = D.cv('--ink6'); c.font = font(13, 500); c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(msg, this.w / 2, this.h / 2); }
     // tooltip: title + rows [colour, label, value]

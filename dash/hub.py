@@ -92,6 +92,7 @@ class Hub:
         self.cfg = cfg; self.lock = threading.RLock()
         self.map = dict(MAP_DEFAULT); self.map.update(cfg.get("map") or {})
         self.deadline = float(cfg.get("deadline_ms", 200.0)); self.dl_fixed = float(cfg.get("dl_fixed_ms", 20.0))
+        self.nv_deadline = float((cfg.get("nonva") or {}).get("deadline_ms") or 250.0)      # non-VA QoS: the frame's uplink time against NONVA_DEADLINE_MS (the service's own viewer rule)
         self.ue = {k: UE(k) for k in UE_KEYS}
         self.pending = {}                    # (sid, tok, fid) -> [frame event, arrival time]
         self.radio = {}                      # rnti -> latest gNB stats of that UE
@@ -109,6 +110,7 @@ class Hub:
         self.cum_svc = {s: self._svc_acc() for s in ("va", "nv")}; self.cum_cell = {k: Stat() for k in ("prb", "unused", "ul", "dl", "mac")}
         self.rec_frames = None; self.rec_slots = None; self.listeners = []
         self.frames_total = 0; self.e2e_late = 0
+        self.fr_buf = {k: deque(maxlen=600) for k in UE_KEYS}      # demo tab: frames finalised since the last frames() call
 
     # ------------------------------------------------------------------ accumulators
     @staticmethod
@@ -166,6 +168,7 @@ class Hub:
         if f.get("w"): u.w, u.h = f.get("w"), f.get("h")
         if f.get("ip") and f.get("ip") != u.ip: u.ip = f.get("ip"); self._remap()
         u.last_t = now; self.frames_total += 1
+        self.fr_buf[u.key].append([rnd((f.get("t") or now * 1000.0) / 1000.0, 3), rnd(e2e, 1) if ok else None, int(met)])
         if self.rec is not None:
             c["n"] += 1; c["ok"] += ok; c["met"] += met; c["fail"] += (not ok); c["est"] += (src == "est"); c["bytes"] += (f.get("kb") or 0.0) * 1024.0
             for k, v in vals.items():
@@ -183,13 +186,15 @@ class Hub:
         with self.lock:
             u = self._ue_of("nv", ev.get("ue"))
             if u is None: return
-            w = u.win; w["n"] += 1; w["ok"] += 1; w["bytes"] += (ev.get("kb") or 0.0) * 1024.0
+            met = ev.get("ul") is not None and ev["ul"] <= self.nv_deadline          # a frame without a measured uplink time counts as missed (as in the service)
+            w = u.win; w["n"] += 1; w["ok"] += 1; w["met"] += met; w["bytes"] += (ev.get("kb") or 0.0) * 1024.0
             if ev.get("ul") is not None: w["ul"].append(ev["ul"])
             if ev.get("kb") is not None: w["kb"].append(ev["kb"])
             if ev.get("ip") and ev.get("ip") != u.ip: u.ip = ev.get("ip"); self._remap()
             u.last_t = now
+            self.fr_buf[u.key].append([rnd((ev.get("t") or now * 1000.0) / 1000.0, 3), rnd(ev.get("ul"), 1), int(met)])
             if self.rec is not None:
-                c = u.cum; c["n"] += 1; c["ok"] += 1; c["bytes"] += (ev.get("kb") or 0.0) * 1024.0; c["ul"].add(ev.get("ul")); c["kb"].add(ev.get("kb"))
+                c = u.cum; c["n"] += 1; c["ok"] += 1; c["met"] += met; c["bytes"] += (ev.get("kb") or 0.0) * 1024.0; c["ul"].add(ev.get("ul")); c["kb"].add(ev.get("kb"))
 
     # ------------------------------------------------------------------ inputs: gNB
     def on_gnb_ue(self, rnti, fields, t_blk=None, now=None):
@@ -372,7 +377,8 @@ class Hub:
         with self.lock:
             c = self.cfg; w = self.welcome or {}; mode = self.sysd.get("mode") or c.get("mode")
             return {"k": "meta", "t": rnd(time.time(), 3), "ver": 1, "sim": self.sim, "mode": mode,
-                    "rec": self.rec_info(), "deadline_ms": self.deadline, "dl_fixed_ms": self.dl_fixed,
+                    "rec": self.rec_info(), "deadline_ms": self.deadline, "dl_fixed_ms": self.dl_fixed, "nv_deadline_ms": self.nv_deadline,
+                    "viewer": c.get("viewer"), "cap": c.get("cap"), "tls_port": c.get("tls_port") or 0, "ctl": bool(c.get("ctl")), "ctl_dry": bool(c.get("ctl_dry")),
                     "map": self.map, "map_src": c.get("map_src"), "models": list(MODELS), "base_model": c.get("base_model", "26x"),
                     "gpu_sm": NSM if mode == "baseline" else (w.get("gpu_sm") or NSM), "agent_sm": w.get("gpu_sm"), "order_sm": ORDER, "tdd": w.get("tdd", c.get("tdd", "DDDDDDSUUU")), "input": w.get("input", c.get("input")),
                     "classes": c.get("classes"), "pusch_profiles": c.get("pusch_profiles"), "pdsch_profiles": c.get("pdsch_profiles"),
@@ -414,6 +420,7 @@ class Hub:
                     d.update(qos=rnd(100.0 * w["met"] / w["n"], 1) if w["n"] else None, est=w["est"], src="est" if w["est"] and w["est"] == w["n"] else "phone",
                              model=u.model if now - u.last_model_t < 5.0 else None, sm=u.sm if now - u.last_model_t < 5.0 else None,
                              map=rnd(mean(w["map"])), models=dict(w["models"]), w=u.w, h=u.h)
+                else: d["qos"] = rnd(100.0 * w["met"] / w["n"], 1) if w["n"] else None
                 # radio: PRB / throughput from the PPO xApp input log, else the lab monitor xApp, else the gNB log itself
                 r = self.radio.get(u.rnti) if u.rnti else None
                 rd = dict.fromkeys(RADIO); psrc = None
@@ -448,6 +455,7 @@ class Hub:
                         cd.update(qos=rnd(100.0 * c["met"] / c["n"], 2) if c["n"] else None, met=c["met"], est=c["est"], map=rnd(c["map"].mean(), 2),
                                   models=dict(c["models"]), combo=dict(c["combo"]),
                                   e2ep=[rnd(x, 1) for x in c["e2e"].pct((50, 90, 99))], aip=[rnd(x, 1) for x in c["ai"].pct((50, 90, 99))])
+                    else: cd.update(qos=rnd(100.0 * c["met"] / c["n"], 2) if c["n"] else None, met=c["met"])
                     for f in RADIO: cd[f] = rnd(c[f].mean(), 5 if f in ("bler", "dlbler") else 2)
                     cd["blerx"] = rnd(c["retx1"] / c["retx0"], 5) if c["retx0"] else None
                     d["c"] = cd
@@ -470,7 +478,10 @@ class Hub:
                     sd["qos"] = rnd(100.0 * met / n, 1) if n else None
                     sd["e2e"] = rnd(mean(self.ue["va1"].win["e2e"] + self.ue["va2"].win["e2e"])); sd["ul"] = rnd(mean(self.ue["va1"].win["ul"] + self.ue["va2"].win["ul"]))
                     sd["ai"] = rnd(mean(self.ue["va1"].win["ai"] + self.ue["va2"].win["ai"])); sd["map"] = rnd(mean(self.ue["va1"].win["map"] + self.ue["va2"].win["map"]))
-                else: sd["ul"] = rnd(mean(self.ue["nv1"].win["ul"] + self.ue["nv2"].win["ul"]))
+                else:
+                    sd["ul"] = rnd(mean(self.ue["nv1"].win["ul"] + self.ue["nv2"].win["ul"]))
+                    n = sum(self.ue[k].win["n"] for k in ("nv1", "nv2")); met = sum(self.ue[k].win["met"] for k in ("nv1", "nv2"))
+                    sd["qos"] = rnd(100.0 * met / n, 1) if n else None
                 if rec:
                     a = self.cum_svc[s]; a["quota"].add(q); a["prb"].add(sd["prb"]); a["mac"].add(sd["mac"]); a["mbps"].add(sd["mbps"])
                     cd = {"quota": rnd(a["quota"].mean(), 1), "prb": rnd(a["prb"].mean()), "mac": rnd(a["mac"].mean()), "mbps": rnd(a["mbps"].mean(), 3)}
@@ -482,6 +493,7 @@ class Hub:
                         nn = c1["map"].n + c2["map"].n; cd["map"] = rnd((c1["map"].s + c2["map"].s) / nn, 2) if nn else None
                     else:
                         c1, c2 = self.ue["nv1"].cum, self.ue["nv2"].cum; cd["n"] = c1["n"] + c2["n"]
+                        cd["qos"] = rnd(100.0 * (c1["met"] + c2["met"]) / cd["n"], 2) if cd["n"] else None; cd["met"] = c1["met"] + c2["met"]
                         nn = c1["ul"].n + c2["ul"].n; cd["ul"] = rnd((c1["ul"].s + c2["ul"].s) / nn) if nn else None
                     sd["c"] = cd
                 t["svc"][s] = sd
@@ -596,12 +608,25 @@ class Hub:
             self.last_scope = s
             return s
 
+    def frames(self, now=None):
+        """demo tab (2026-11-14): the frames finalised since the previous call, per UE [frame time s, latency ms, QoS met 0/1].
+        Latency = E2E for a VA frame (phone report, else the estimate of _va_final), uplink time for a Non-VA frame; None = failed / not measured.
+        A message kind of its own ("fr"): tick, scope, timeseries.csv and the summary are not touched. None when no frame was finalised."""
+        now = now or time.time()
+        with self.lock:
+            f = {k: list(b) for k, b in self.fr_buf.items() if b}
+            if not f: return None
+            for b in self.fr_buf.values(): b.clear()
+            m = {"k": "fr", "t": rnd(now, 3), "f": f}
+            if self.rec is not None: self.rec_write(m)
+            return m
+
     # ------------------------------------------------------------------ summary of a measurement
     def summary(self, now=None):
         r = self.rec; now = now or time.time(); el = now - r["t0"]; last = self.rec_last or {}
         s = {"name": r["name"], "id": r["id"], "dir": r["dir"], "start": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["t0"])),
              "end": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "t0": rnd(r["t0"], 3), "duration_s": rnd(el, 1), "ticks": self.rec_n,
-             "mode": self.sysd.get("mode") or self.cfg.get("mode"), "sim": self.sim, "deadline_ms": self.deadline, "map_table": self.map, "base_model": self.cfg.get("base_model", "26x"),
+             "mode": self.sysd.get("mode") or self.cfg.get("mode"), "sim": self.sim, "deadline_ms": self.deadline, "nv_deadline_ms": self.nv_deadline, "map_table": self.map, "base_model": self.cfg.get("base_model", "26x"),
              "va_cfg": self.cfg.get("va"), "nonva_cfg": self.cfg.get("nonva"), "ue": {}, "svc": {}, "notes": []}
         for k in UE_KEYS:
             u = self.ue[k]; c = (last.get("ue") or {}).get(k, {}).get("c") or {}
@@ -629,14 +654,14 @@ def summary_text(s):
                  f(u.get("inf")), f(u.get("e2e")), f(p[2]), f(u.get("dl")), f(u.get("prb")), f(u.get("mac"), nd=2), f(u.get("snr")), f(u.get("mcs")), f(u.get("bler"), nd=4)))
     v = s["svc"].get("va") or {}
     L.append("  service: QoS %s %%  E2E %s ms  UL %s ms  AI %s ms  quota %s PRB  used %s PRB  MAC %s Mbps" % (f(v.get("qos"), nd=2), f(v.get("e2e")), f(v.get("ul")), f(v.get("ai")), f(v.get("quota")), f(v.get("prb")), f(v.get("mac"), nd=2)))
-    L += ["", "Non-VA service"]
-    L.append("  %-5s %-5s %8s %7s %8s %8s %8s %7s %8s %7s %7s %7s" % ("UE", "RNTI", "frames", "fps", "UL ms", "UL p99", "app Mbps", "PRB", "MAC Mbps", "SNR", "MCS", "BLER"))
+    L += ["", "Non-VA service" + (" (deadline %.0f ms on the uplink time)" % s["nv_deadline_ms"] if s.get("nv_deadline_ms") else "")]
+    L.append("  %-5s %-5s %8s %7s %8s %8s %8s %8s %7s %8s %7s %7s %7s" % ("UE", "RNTI", "frames", "fps", "QoS %", "UL ms", "UL p99", "app Mbps", "PRB", "MAC Mbps", "SNR", "MCS", "BLER"))
     for k in ("nv1", "nv2"):
         u = s["ue"].get(k) or {}; p = u.get("ulp") or [None] * 3
-        L.append("  %-5s %-5s %8s %7s %8s %8s %8s %7s %8s %7s %7s %7s" % (k, u.get("rnti") or "-", u.get("n", 0), f(u.get("fps")), f(u.get("ul")), f(p[2]), f(u.get("mbps"), nd=2), f(u.get("prb")),
+        L.append("  %-5s %-5s %8s %7s %8s %8s %8s %8s %7s %8s %7s %7s %7s" % (k, u.get("rnti") or "-", u.get("n", 0), f(u.get("fps")), f(u.get("qos"), nd=2), f(u.get("ul")), f(p[2]), f(u.get("mbps"), nd=2), f(u.get("prb")),
                  f(u.get("mac"), nd=2), f(u.get("snr")), f(u.get("mcs")), f(u.get("bler"), nd=4)))
     n = s["svc"].get("nv") or {}
-    L.append("  service: quota %s PRB  used %s PRB  MAC %s Mbps" % (f(n.get("quota")), f(n.get("prb")), f(n.get("mac"), nd=2)))
+    L.append("  service: QoS %s %%  UL %s ms  quota %s PRB  used %s PRB  MAC %s Mbps" % (f(n.get("qos"), nd=2), f(n.get("ul")), f(n.get("quota")), f(n.get("prb")), f(n.get("mac"), nd=2)))
     g = s.get("gpu") or {}; sm = g.get("sm") or {}
     L += ["", "GPU", "  YOLO requests %s req/s (total %s, rejected/failed %s)  load %s %%  sustainable ~%s req/s  queue %s  wait %s ms  saturated %s s / warning %s s" % (
         f(g.get("req")), g.get("n_req", "-"), g.get("n_rej", "-"), f(g.get("busy")), f(g.get("cap")), f(g.get("queue"), nd=2), f(g.get("wait")), g.get("sat_s", "-"), g.get("warn_s", "-"))]

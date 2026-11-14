@@ -165,7 +165,7 @@
         const x = t.ue[u.k] || {}, p = P.ue[u.k], mu = (m.ues || {})[u.k];
         p.h.set(x, mu, true);
         if (u.svc === 'va') { D.setNum(p.v, pk(x, 'e2e'), 1); D.fill(p.l, ['QoS ', ['b', fu(pk(x, 'qos'), 1, '%')]]); p.kv.set('model', x.model ? x.model + ' @ ' + (x.sm || '–') : '–'); }
-        else { D.setNum(p.v, pk(x, 'ul'), 1); D.fill(p.l, [resName((m.nonva || {}).width, (m.nonva || {}).height)]); p.kv.set('fps', fu(pk(x, 'fps'), 1, 'fps')); }
+        else { D.setNum(p.v, pk(x, 'ul'), 1); D.fill(p.l, ['QoS ', ['b', fu(pk(x, 'qos'), 1, '%')], ' · ' + resName((m.nonva || {}).width, (m.nonva || {}).height)]); p.kv.set('fps', fu(pk(x, 'fps'), 1, 'fps')); }
         p.kv.set('thr', f(pk(x, 'mac'), 1), 'Mbps'); p.kv.set('prb', f(pk(x, 'prb'), 1));
         p.kv.set('snr', f(pk(x, 'snr'), 1) + ' dB · ' + f(pk(x, 'mcs'), 1)); p.kv.set('bler', fu(pctf(pk(x, 'bler')), 1, '%'));
       }
@@ -244,7 +244,7 @@
   V.nv = {
     build(host, meta) {
       const P = this.p = { ue: {} };
-      P.t = [D.tile('서비스 Throughput', 'hero'), D.tile('MAC Throughput'), D.tile('Uplink Latency'), D.tile('수신 FPS (2 UE 합)'), D.tile('PRB 사용'), D.tile('누적 프레임')];
+      P.t = [D.tile('QoS 충족률', 'hero'), D.tile('서비스 Throughput'), D.tile('MAC Throughput'), D.tile('Uplink Latency'), D.tile('수신 FPS (2 UE 합)'), D.tile('PRB 사용')];
       host.appendChild(el('div.tiles', P.t.map(x => x.el)));
       const g = el('div.grid', { style: { marginTop: '16px' } });
       for (const u of D.UE) {
@@ -252,32 +252,33 @@
         const p = P.ue[u.k] = {}, c = el('div.card.s6');
         p.h = ueHead(u);
         p.chips = chips([['res', '화질'], ['q', 'JPEG Quality'], ['fps', 'FPS 목표 / 실제'], ['kb', '프레임'], ['radio', 'SNR · MCS']]);
-        p.t = { ul: D.tile('Uplink Latency', 'in'), fps: D.tile('수신 FPS', 'in'), thr: D.tile('Throughput', 'in'), prb: D.tile('PRB 사용', 'in') };
+        p.t = { qos: D.tile('QoS 충족률', 'in'), ul: D.tile('Uplink Latency', 'in'), fps: D.tile('수신 FPS', 'in'), thr: D.tile('Throughput', 'in'), prb: D.tile('PRB 사용', 'in') };
         const lg1 = el('div.legend'), ch1 = box('clamp(160px, calc(50vh - 330px - var(--rb, 0px) / 2), 300px)'), lg2 = el('div.legend'), ch2 = box('clamp(160px, calc(50vh - 330px - var(--rb, 0px) / 2), 300px)');
-        p.c1 = new D.TimeChart(ch1, { unit: 'ms', legend: lg1, series: [ser('Uplink Latency', u.color, 'ue.' + u.k, 'ul')] });
+        p.c1 = new D.TimeChart(ch1, { unit: 'ms', legend: lg1, series: [ser('Uplink Latency', u.color, 'ue.' + u.k, 'ul')], thresholds: [{ label: 'QoS 기한', get: m => m.nv_deadline_ms }] });
         p.c2 = new D.TimeChart(ch2, { unit: 'Mbps', legend: lg2, series: [ser('앱 수신 (JPEG)', u.color, 'ue.' + u.k, 'mbps'), ser('MAC', '--ink5', 'ue.' + u.k, 'mac')] });
         c.appendChild(p.h.el); c.appendChild(el('div', { style: { margin: '12px 0' } }, p.chips.el));
-        c.appendChild(el('div.tiles.c4', p.t.ul.el, p.t.fps.el, p.t.thr.el, p.t.prb.el));
+        c.appendChild(el('div.tiles.c5', p.t.qos.el, p.t.ul.el, p.t.fps.el, p.t.thr.el, p.t.prb.el));
         c.appendChild(el('div.rowl', el('span', 'Uplink Latency 추이'), el('span.r', lg1))); c.appendChild(ch1);
         c.appendChild(el('div.rowl', el('span', 'Throughput 추이'), el('span.r', lg2))); c.appendChild(ch2);
         g.appendChild(c);
       }
       host.appendChild(g);
-      host.appendChild(el('div.note', { style: { marginTop: '12px' } }, 'Non-VA는 영상 프레임을 Uplink로만 보내는 서비스입니다 (추론 없음). Uplink Latency = 폰이 프레임을 보내기 시작한 뒤 서버가 다 받을 때까지. Throughput "앱 수신" = 서버가 받은 JPEG 바이트, "MAC" = gNB가 센 Uplink MAC 바이트 (헤더 · 재전송 포함).'));
+      host.appendChild(el('div.note', { style: { marginTop: '12px' } }, 'Non-VA는 영상 프레임을 Uplink로만 보내는 서비스입니다 (추론 없음). Uplink Latency = 폰이 프레임을 보내기 시작한 뒤 서버가 다 받을 때까지. QoS 충족률 = Uplink Latency가 기한 (' + f(meta.nv_deadline_ms != null ? meta.nv_deadline_ms : 250, 0) + ' ms) 이내인 프레임의 비율 (뷰어가 화면을 멈추는 기준과 같음; Uplink 시간을 잴 수 없는 프레임은 미달). Throughput "앱 수신" = 서버가 받은 JPEG 바이트, "MAC" = gNB가 센 Uplink MAC 바이트 (헤더 · 재전송 포함).'));
     },
     update(F) {
       const t = F.cur, P = this.p, m = F.meta; if (!t) return;
       const nv = t.svc.nv || {}, c = nv.c || {}, rec = D.recNow, mn = m.nonva || {};
-      P.t[0].kpi(c.mbps, nv.mbps, 1, 'Mbps', ['앱 수신 (JPEG 바이트)']); P.t[1].kpi(c.mac, nv.mac, 1, 'Mbps');
-      P.t[2].kpi(c.ul, nv.ul, 1, 'ms'); P.t[3].kpi(rec && num(c.n) && t.el > 0 ? c.n / t.el : null, nv.fps, 1, 'fps');
-      P.t[4].kpi(c.prb, nv.prb, 1, 'PRB', num(nv.quota) ? ['할당 ', ['b', f(pk(nv, 'quota'), 0) + ' PRB']] : ['슬라이싱 없음']);
-      if (rec) { P.t[5].set(c.n, 0, '').kind(null); D.fill(P.t[5].sub, ['측정 ', ['b', D.mmss(t.el)]]); } else { P.t[5].text('–').kind(null); D.fill(P.t[5].sub, ['측정 중에만 집계']); }
+      P.t[0].kpi(c.qos, nv.qos, 1, '%', ['기한 ', ['b', f(m.nv_deadline_ms != null ? m.nv_deadline_ms : 250, 0) + ' ms'], ' (Uplink)']);
+      P.t[1].kpi(c.mbps, nv.mbps, 1, 'Mbps', ['앱 수신 (JPEG 바이트)']); P.t[2].kpi(c.mac, nv.mac, 1, 'Mbps');
+      P.t[3].kpi(c.ul, nv.ul, 1, 'ms'); P.t[4].kpi(rec && num(c.n) && t.el > 0 ? c.n / t.el : null, nv.fps, 1, 'fps', rec ? ['누적 ', ['b', f(c.n, 0)], ' 프레임'] : null);
+      P.t[5].kpi(c.prb, nv.prb, 1, 'PRB', num(nv.quota) ? ['할당 ', ['b', f(pk(nv, 'quota'), 0) + ' PRB']] : ['슬라이싱 없음']);
       for (const u of D.UE) {
         if (u.svc !== 'nv') continue;
         const x = t.ue[u.k] || {}, xc = x.c || {}, p = P.ue[u.k];
         p.h.set(x, (m.ues || {})[u.k]);
         p.chips.set('res', resName(mn.width, mn.height)); p.chips.set('q', mn.jpeg_quality); p.chips.set('fps', f(mn.fps, 0) + ' / ' + f(x.fps, 1));
         p.chips.set('kb', fu(pk(x, 'kb'), 0, 'KB')); p.chips.set('radio', f(pk(x, 'snr'), 1) + ' dB · ' + f(pk(x, 'mcs'), 1));
+        p.t.qos.kpi(xc.qos, x.qos, 1, '%'); if (rec && num(xc.met)) D.fill(p.t.qos.sub, ['지금 ', ['b', fu(x.qos, 0, '%')], ' · ', ['b', f(xc.met, 0)], ' / ' + f(xc.n, 0)]);
         p.t.ul.kpi(xc.ul, x.ul, 1, 'ms'); if (rec && xc.ulp && num(xc.ulp[1])) D.fill(p.t.ul.sub, ['지금 ', ['b', f(x.ul, 1)], ' · p90 ', ['b', f(xc.ulp[1], 0)], ' · p99 ', ['b', f(xc.ulp[2], 0)]]);
         p.t.fps.kpi(xc.fps, x.fps, 1, 'fps', rec ? ['누적 ', ['b', f(xc.n, 0)], ' 프레임'] : null);
         p.t.thr.kpi(xc.mbps, x.mbps, 1, 'Mbps', ['MAC ', ['b', f(pk(x, 'mac'), 1)]]);
@@ -462,12 +463,12 @@
       T('셀 Uplink Throughput', cell.mac, 1, 'Mbps', ['VA ', ['b', f(va.mac, 1)], ' · Non-VA ', ['b', f(nv.mac, 1)]]),
       T('GPU YOLO 요청', g.req, 1, 'req/s', ['부하율 ', ['b', fu(g.busy, 0, '%')], ' · 거절 ', ['b', f(g.n_rej, 0)]]),
       T('mAP 유지율', acc.retention_pct, 1, '%', ['평균 mAP ', ['b', f(acc.map_mean, 2)], ' / ' + (s.base_model || '26x') + ' ' + f(acc.map_base, 1)]),
-      T('Non-VA Uplink Latency', nv.ul, 1, 'ms', [['b', f(nv.n, 0)], ' 프레임 · ', ['b', f(nv.mbps, 1)], ' Mbps'])));
+      T('Non-VA QoS 충족률', nv.qos, 1, '%', ['기한 ', ['b', f(s.nv_deadline_ms, 0) + ' ms'], ' · UL ', ['b', f(nv.ul, 1)], ' ms · ', ['b', f(nv.n, 0)], ' 프레임'])));
     const cols = ['UE', 'RNTI', '프레임', 'FPS', 'UL (ms)', 'UL p90 / p99', 'Inference (ms)', 'E2E (ms)', 'E2E p90 / p99', 'QoS (%)', '앱 Mbps', 'MAC Mbps', 'PRB', 'SNR (dB)', 'MCS', 'BLER (%)'];
     const tb = el('tbody');
     for (const u of D.UE) {
       const x = (s.ue || {})[u.k] || {}, isva = u.svc === 'va', pp = a => a && num(a[1]) ? f(a[1], 0) + ' / ' + f(a[2], 0) : '–';
-      const vals = [null, x.rnti || '–', f(x.n, 0), f(x.fps, 1), f(x.ul, 1), pp(x.ulp), isva ? f(x.ai, 1) : '–', isva ? f(x.e2e, 1) : '–', isva ? pp(x.e2ep) : '–', isva ? f(x.qos, 1) : '–', f(x.mbps, 2), f(x.mac, 2), f(x.prb, 1), f(x.snr, 1), f(x.mcs, 1), f(pctf(num(x.blerx) ? x.blerx : x.bler), 2)];
+      const vals = [null, x.rnti || '–', f(x.n, 0), f(x.fps, 1), f(x.ul, 1), pp(x.ulp), isva ? f(x.ai, 1) : '–', isva ? f(x.e2e, 1) : '–', isva ? pp(x.e2ep) : '–', f(x.qos, 1), f(x.mbps, 2), f(x.mac, 2), f(x.prb, 1), f(x.snr, 1), f(x.mcs, 1), f(pctf(num(x.blerx) ? x.blerx : x.bler), 2)];
       const tr = el('tr', vals.map((v, i) => i ? el('td', v) : el('td', el('span.nm', el('i', { style: { background: cvar(u.color) } }), u.name))));
       tb.appendChild(tr);
     }

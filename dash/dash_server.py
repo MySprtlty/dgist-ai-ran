@@ -6,9 +6,14 @@ stopped by name ("측정 시작" / "측정 종료") and written to runs/dash/<na
 
   uvicorn dash_server:app --host 0.0.0.0 --port 8010        (dash.sh does this inside the VA service's venv)
 
-Plain HTTP on the LAN. Requests from the UE network (DASH_DENY_NETS, default 10.45.0.0/16) get 403: the page can never be loaded over the cell,
-so it adds no downlink traffic. The server only READS the other components (docker logs / docker exec tail, the services' loopback status and
-/metrics/frames feeds, the dApp agent's telemetry stream as role "dash", journalctl, files) - it sends nothing to a UE and controls nothing.
+Plain HTTP on the LAN, and the same page over HTTPS on DASH_TLS_PORT (a TLS front in this process; browsers allow the video encoder that
+"Capture" uses only on HTTPS pages). Requests from the UE network (DASH_DENY_NETS, default 10.45.0.0/16) get 403 on the plain port and are
+closed before the TLS handshake on the HTTPS port: the page can never be loaded over the cell, so it adds no downlink traffic. The server
+READS the other components (docker logs / docker exec tail, the services' loopback status and /metrics/frames feeds, the dApp agent's
+telemetry stream as role "dash", journalctl, files) and sends nothing to a UE.
+  viewer.py   the four /viewer screens for the "뷰어" tab: a loopback relay of the services' viewer feeds (read only, on demand)
+  control.py  the "제어" tab: On / Off / restart of the components through the operator scripts (the only part that changes anything;
+              two-step confirmation, one action at a time, logged in runs/dash/control.jsonl; DASH_CTL=0 switches it off)
 
 DASH_SIM=1 feeds the page from sim.py instead (made-up numbers, badged "SIMULATION" everywhere, recordings in runs/dash_sim/).
 """
@@ -18,6 +23,7 @@ import ipaddress
 import json
 import os
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -26,11 +32,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import hub as hubmod          # noqa: E402
 import sources                # noqa: E402
+import viewer as viewermod    # noqa: E402
+import control as controlmod  # noqa: E402
 
 ROOT = Path(os.environ.get("DASH_ROOT") or HERE.parent).resolve()
 SIM = os.environ.get("DASH_SIM", "0") not in ("", "0")
@@ -53,14 +62,33 @@ def log(*a):
     print("[dash %s]" % time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+PORT = int(os.environ.get("DASH_PORT") or (8011 if SIM else 8010))          # the plain port uvicorn listens on (dash.sh passes it): the HTTPS front forwards to it
+TLS_PORT = int(os.environ.get("DASH_TLS_PORT") or (8013 if SIM else 8012))   # 0 = no HTTPS port
+TLS_CERT = Path(os.environ.get("DASH_TLS_CERT") or (ROOT / "va_service" / "certs" / "server.crt"))        # default: the certificate the VA service already shows this PC
+TLS_KEY = Path(os.environ.get("DASH_TLS_KEY") or (ROOT / "va_service" / "certs" / "server.key"))
+TLS_TASKS = set()                                                            # HTTPS front: its connection tasks (strong references)
+PEERS = {}                                                                   # HTTPS front: source port of its loopback connection -> the real client address
+cfg["tls_port"] = TLS_PORT if TLS_PORT > 0 and TLS_CERT.is_file() and TLS_KEY.is_file() else 0
+cfg["ctl_dry"] = bool(cfg.get("ctl_dry")) or SIM                              # the simulation never runs a real command
+relay = viewermod.Relay(cfg, log, SIM)
+cfg["viewer"].update(relay=relay.on, va=relay.va is not None, nv=relay.nv is not None)
+ctl = controlmod.Control(ROOT, hub, cfg, REC_BASE, log, dry=cfg["ctl_dry"]) if cfg.get("ctl") else None
+
+
+def _denied(host):
+    try: ip = ipaddress.ip_address(host)
+    except ValueError: return False
+    if ip.version == 6 and ip.ipv4_mapped is not None: ip = ip.ipv4_mapped
+    return any(ip in n for n in DENY)
+
+
 @app.middleware("http")
 async def lan_only(request: Request, call_next):
     """the UE network never gets this page (no downlink traffic on the cell); everything else is no-store so a reload always shows the installed files"""
     host = request.client.host if request.client else ""
-    try:
-        ip = ipaddress.ip_address(host)
-        if any(ip in n for n in DENY): return PlainTextResponse("not served on the UE network\n", status_code=403)
-    except ValueError: pass
+    if request.client and host in ("127.0.0.1", "::1") and request.client.port in PEERS: host = PEERS[request.client.port]       # came in through the HTTPS front
+    if _denied(host): return PlainTextResponse("not served on the UE network\n", status_code=403)
+    request.state.peer = host
     resp = await call_next(request)
     if not request.url.path.startswith("/static/fonts/"): resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -108,13 +136,16 @@ def ticker():
                         threading.Thread(target=_stop_rec, daemon=True).start()
             sc = hub.scope()
             if sc is not None: push(sc)
+            fr = hub.frames()                         # demo tab: per-frame latency feed (message kind "fr")
+            if fr is not None: push(fr)
         except Exception:
             log("ticker:", traceback.format_exc().strip().splitlines()[-1]); traceback.print_exc()
 
 
 @app.on_event("startup")
 async def _startup():
-    state["loop"] = asyncio.get_running_loop()
+    state["loop"] = relay.loop = asyncio.get_running_loop()
+    await _tls_start()
     if SIM:
         import sim
         state["sim"] = sim.Sim(hub, cfg); state["sim"].start(); log("SIMULATION source (made-up numbers)")
@@ -133,18 +164,83 @@ async def _startup():
             if callable(prev): prev(signum, frame)
         try: signal.signal(sg, on_exit)
         except ValueError: pass                               # not the main thread (embedded): --timeout-graceful-shutdown still bounds the wait
-    log("root %s | recordings %s | deny %s" % (ROOT, REC_BASE, ",".join(str(n) for n in DENY)))
+    log("root %s | recordings %s | deny %s | https %s | viewer relay %s | control %s" % (ROOT, REC_BASE, ",".join(str(n) for n in DENY), cfg["tls_port"] or "off",
+        "on" if relay.on else "off", "off" if ctl is None else ("dry-run" if ctl.dry else "on")))
 
 
 def _wake_clients():
     for q in list(state["clients"]):
         try: q.put_nowait(None)
         except asyncio.QueueFull: pass                        # that stream sees state["stopping"] at its next message
+    relay.close()
+
+
+# ---------------------------------------------------------------------------------------------- HTTPS front (the page on a secure origin, for Capture)
+async def _pump(r, w):
+    try:
+        while True:
+            b = await r.read(65536)
+            if not b: break
+            w.write(b); await w.drain()
+    except Exception: pass
+
+
+async def _tls_conn(sock, addr, ctx):
+    """one browser connection: TLS ends here, the bytes go to the plain port on loopback and back"""
+    loop = asyncio.get_running_loop(); r = asyncio.StreamReader(limit=1 << 16); proto = asyncio.StreamReaderProtocol(r); w = uw = None; lport = None
+    try:
+        tr, _ = await loop.connect_accepted_socket(lambda: proto, sock, ssl=ctx, ssl_handshake_timeout=10.0)
+        w = asyncio.StreamWriter(tr, proto, r, loop)
+        ur, uw = await asyncio.open_connection("127.0.0.1", PORT)
+        lport = uw.get_extra_info("sockname")[1]; PEERS[lport] = addr[0]
+        a = asyncio.ensure_future(_pump(r, uw)); b = asyncio.ensure_future(_pump(ur, w))
+        try: await asyncio.wait({a, b}, return_when=asyncio.FIRST_COMPLETED)
+        finally: a.cancel(); b.cancel()
+    except Exception: pass
+    finally:
+        if lport is not None: PEERS.pop(lport, None)
+        for x in (w, uw):
+            if x is not None:
+                try: x.close()
+                except Exception: pass
+        if w is None:
+            try: sock.close()
+            except Exception: pass
+
+
+async def _tls_accept(srv, ctx):
+    loop = asyncio.get_running_loop()
+    while True:
+        try: sock, addr = await loop.sock_accept(srv)
+        except OSError:
+            await asyncio.sleep(0.2); continue
+        if _denied(addr[0]):                                  # the UE network: closed before a single TLS byte goes out
+            sock.close(); continue
+        sock.setblocking(False)
+        t = asyncio.ensure_future(_tls_conn(sock, addr, ctx)); TLS_TASKS.add(t); t.add_done_callback(TLS_TASKS.discard)
+
+
+async def _tls_start():
+    if not cfg["tls_port"]:
+        log("https: off (%s)" % ("DASH_TLS_PORT=0" if TLS_PORT <= 0 else "no certificate at %s" % TLS_CERT)); return
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(str(TLS_CERT), str(TLS_KEY)); ctx.set_alpn_protocols(["http/1.1"])
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", TLS_PORT)); srv.listen(64); srv.setblocking(False)
+        state["tls"] = (srv, asyncio.ensure_future(_tls_accept(srv, ctx)))
+    except Exception as e:
+        cfg["tls_port"] = 0; log("https: off (%r)" % (e,))
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     state["stop"].set(); state["stopping"] = True
+    t = state.get("tls")
+    if t:
+        t[1].cancel()
+        try: t[0].close()
+        except Exception: pass
+        for x in list(TLS_TASKS): x.cancel()
     if hub.rec is not None:
         try: s = hub.rec_stop(); log("measurement %s closed at shutdown" % s.get("id"))
         except Exception as e: log("closing the measurement failed: %r" % (e,))
@@ -176,6 +272,58 @@ async def api_stream(request: Request):
 @app.get("/api/init")
 def api_init():
     return JSONResponse({"meta": hub.meta(), "ticks": hub.history(), "scope": hub.last_scope, "now": time.time(), "free_gb": free_gb(), "min_free_gb": MIN_FREE_GB})
+
+
+# ---------------------------------------------------------------------------------------------- viewer screens (viewer.py)
+@app.get("/api/viewer/stream")
+async def api_viewer_stream():
+    if not relay.on: raise HTTPException(404, "뷰어 중계가 꺼져 있습니다")
+
+    async def gen():
+        c = relay.attach()
+        try:
+            yield viewermod.record({"k": "hello", "va": relay.va is not None, "nv": relay.nv is not None})
+            while True:
+                try: await asyncio.wait_for(c.ev.wait(), 5.0)
+                except asyncio.TimeoutError:
+                    yield viewermod.record({"k": "ka"}); continue
+                if c.closed or state.get("stopping"): return
+                out = c.take()
+                if out: yield b"".join(out)
+        finally:
+            relay.detach(c)
+    return StreamingResponse(gen(), media_type="application/octet-stream", headers={"X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------------------------- component control (control.py)
+async def _ctl_body(request):
+    if ctl is None: raise HTTPException(404, "제어 기능이 꺼져 있습니다 (.env DASH_CTL=0)")
+    if not request.headers.get("content-type", "").startswith("application/json"): raise HTTPException(415, "JSON만 받습니다")
+    origin = request.headers.get("origin")
+    if origin and origin.split("://", 1)[-1] != request.headers.get("host"): raise HTTPException(403, "다른 사이트에서 온 요청입니다")
+    try: body = await request.json()
+    except Exception: body = None
+    if not isinstance(body, dict): raise HTTPException(400, "잘못된 요청")
+    return body
+
+
+@app.get("/api/ctl/state")
+def api_ctl_state():
+    return JSONResponse({"on": False} if ctl is None else ctl.state())
+
+
+@app.post("/api/ctl/plan")
+async def api_ctl_plan(request: Request):
+    b = await _ctl_body(request)
+    try: return JSONResponse(await run_in_threadpool(ctl.plan, b.get("comp"), b.get("action"), b.get("arg")))
+    except controlmod.Refused as e: raise HTTPException(e.code, str(e))
+
+
+@app.post("/api/ctl/run")
+async def api_ctl_run(request: Request):
+    b = await _ctl_body(request)
+    try: return JSONResponse({"ok": True, "job": await run_in_threadpool(ctl.run, b.get("token"), getattr(request.state, "peer", "?"))})
+    except controlmod.Refused as e: raise HTTPException(e.code, str(e))
 
 
 # ---------------------------------------------------------------------------------------------- measurement start / stop
@@ -284,4 +432,5 @@ def static_file(path: str):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "sim": SIM, "recording": hub.rec_info(), "clients": len(state["clients"])}
+    return {"ok": True, "sim": SIM, "recording": hub.rec_info(), "clients": len(state["clients"]), "https": cfg["tls_port"], "viewer": relay.info(),
+            "control": None if ctl is None else {"dry": ctl.dry, "busy": ctl.busy is not None}}

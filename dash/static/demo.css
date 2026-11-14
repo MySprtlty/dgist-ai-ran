@@ -1,0 +1,26 @@
+/* _dgist experiment dashboard - tab "데모 영상" (2026-11-14).
+   Everything here is scoped to #tab-demo: no rule of app.css is changed and no other tab is restyled.
+   All moving parts are drawn on canvases by js/demo.js (Capture copies a canvas pixel for pixel); this file only places them.
+   Colours come from the tokens of app.css, so light and dark follow the page theme. */
+#tab-demo .dm-card { position: relative; }
+#tab-demo .dm-card > .cardh { position: relative; z-index: 1; margin-bottom: 10px; }
+#tab-demo .dm-card > .cardh .t { font-size: 17px; }
+#tab-demo .dm-card > .cardh .s { font-size: 13.5px; }
+
+/* a canvas that fills its host */
+#tab-demo .dm-stage { position: relative; min-width: 0; }
+#tab-demo .dm-stage > canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+
+/* UE meter: one canvas under the whole card (the red outline follows the card edge), the DOM header above it */
+#tab-demo .dm-meter > canvas.dm-full { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
+#tab-demo .dm-meter > .cardh { padding-right: 150px; }          /* room for the status pill drawn on the canvas */
+#tab-demo .dm-meter > .dm-body { height: 148px; position: relative; z-index: 1; pointer-events: none; }
+
+#tab-demo .dm-h-bar { height: 208px; }
+#tab-demo .dm-h-chart { height: 300px; flex: 1 1 auto; }
+#tab-demo .dm-note { font-size: 13px; color: var(--ink5); margin-top: 10px; line-height: 1.5; }
+#tab-demo .dm-stage > .tip { font-size: 13px; }
+
+@media (max-width: 1500px) {
+  #tab-demo .dm-h-chart { height: 260px; }
+}

@@ -3,32 +3,42 @@
 'use strict';
 (function () {
   const D = window.D, el = D.el, $ = D.$, $$ = D.$$, S = D.S, f = D.f;
-  const TABS = ['ov', 'va', 'nv', 'gpu', 'radio', 'rec'], built = {};
+  const TABS = ['ov', 'va', 'nv', 'gpu', 'radio', 'view', 'ctl', 'rec', 'demo'], built = {};
   let shownSummary = null, timer = null, wasOffline = false, chipSig = '';
   const NS = 'http://www.w3.org/2000/svg';
   const icon = d => { const s = document.createElementNS(NS, 'svg'), p = document.createElementNS(NS, 'path'); s.setAttribute('viewBox', '0 0 16 16'); p.setAttribute('d', d); p.setAttribute('fill', 'currentColor'); s.appendChild(p); return s; };
   const PLAY = 'M4 2.5v11l9-5.5z', PAUSE = 'M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z';
 
   // ------------------------------------------------------------------ drawing
-  function ensure() {
-    const t = S.tab, m = S.rp ? S.rp.meta : S.meta; if (built[t] || !m) return;
-    D.views[t].build($('#tab-' + t), m); built[t] = true;
+  function ensure(t) {
+    t = t || S.tab; const m = S.rp ? S.rp.meta : S.meta; if (built[t] || !m) return;
+    D.views[t].build($('#tab-' + t), (t === 'view' || t === 'ctl') ? (S.meta || m) : m); built[t] = true;   // the viewer and the control tab are always live
   }
+  const capTabs = () => (D.cap ? D.cap.tabs() : []).filter(t => t !== S.tab);   // tabs a capture keeps laid out off screen
   function render() {
     const F = D.frame(); D.recNow = !!(F.cur && F.cur.rec);
     ensure(); if (built[S.tab]) D.views[S.tab].update(F);
+    for (const t of capTabs()) { ensure(t); if (built[t]) D.views[t].update(F); }
+    if (D.cap) D.cap.touch();
     header(F);
   }
-  function renderScope() { const v = D.views[S.tab]; if (built[S.tab] && v.scope) v.scope(D.frame()); }
+  function renderScope() {
+    const F = D.frame();
+    for (const t of [S.tab].concat(capTabs())) { const v = D.views[t]; if (built[t] && v.scope) v.scope(F); }
+  }
   function rebuild() {          // the source changed (live <-> replay, or new meta): build the views again
     for (const c of D.charts) c.destroy(); D.charts.length = 0;
     for (const t of TABS) { $('#tab-' + t).textContent = ''; built[t] = false; }
-    render();
+    render(); if (D.cap) D.cap.rebuilt();
   }
-  function setTab(t) {
-    if (TABS.indexOf(t) < 0) return; S.tab = t;
+  function showTab(t) {
+    S.tab = t;
     for (const b of $$('#tabs .tabbtn')) b.classList.toggle('on', b.dataset.tab === t);
     for (const x of TABS) $('#tab-' + x).classList.toggle('on', x === t);
+    if (D.viewer) D.viewer.shown(t === 'view'); if (D.ctl) D.ctl.shown(t === 'ctl');
+  }
+  function setTab(t) {
+    if (TABS.indexOf(t) < 0) return; showTab(t);
     window.scrollTo(0, 0); render();
   }
   function seg(id, key, cb) {
@@ -137,6 +147,7 @@
       else if (L.length > 7200) { const h = L.length >> 1, keep = []; for (let i = 0; i < h; i += 2) keep.push(L[i]); S.live.ticks = keep.concat(L.slice(h)); }   // long measurements: thin the older half
       if (!S.rp) render(); else recState();
     } else if (m.k === 'scope') { S.live.scope = m; if (!S.rp) renderScope(); }
+    else if (m.k === 'fr') { if (D.demo) D.demo.fr(m); }                             // demo tab: per-frame latency feed
     else if (m.k === 'meta') {
       const o = S.meta, same = o && o.mode === m.mode && String(o.models) === String(m.models) && String(o.classes) === String(m.classes) && o.base_model === m.base_model && o.sim === m.sim;
       S.meta = m; if (!S.rp) { if (same) render(); else rebuild(); } else recState();
@@ -172,6 +183,7 @@
           try {
             const o = JSON.parse(line);
             if (o.k === 'tick') rp.ticks.push(o); else if (o.k === 'meta') rp.meta = o; else if (o.k === 'end') { rp.summary = o.summary || null; rp.ended = true; }
+            else if (o.k === 'fr') (rp.frs || (rp.frs = [])).push(o);                    // demo tab: per-frame latency feed (absent in older recordings)
           } catch (e) { bad++; }                                            // a cut last line of an unfinished file
         }
       }
@@ -208,7 +220,7 @@
   function startReplay(rp) {
     S.rp = rp; $('#replayBar').hidden = false; document.documentElement.style.setProperty('--rb', '52px'); D.txt($('#rpName'), rp.name + (rp.ended ? '' : ' (비정상 종료된 기록)'));
     for (const x of $$('#rpSpeed button')) x.classList.toggle('on', x.dataset.v === '1');
-    rpLocate(); S.tab = 'ov'; for (const b of $$('#tabs .tabbtn')) b.classList.toggle('on', b.dataset.tab === 'ov'); for (const x of TABS) $('#tab-' + x).classList.toggle('on', x === 'ov');
+    rpLocate(); showTab('ov');
     rebuild(); rpBar(); window.scrollTo(0, 0);
     if (!timer) timer = setInterval(rpTick, 200);
     D.toast('Replay: ' + rp.name + ' · ' + D.mmss(rp.dur) + ' · ' + f(rp.ticks.length, 0) + ' 초 분량');
@@ -239,13 +251,15 @@
   function theme(set) {
     const root = document.documentElement;
     if (set) { root.dataset.theme = set; try { localStorage.setItem('dash.theme', set); } catch (e) { /* private window */ } }
-    D.themeChanged();
+    D.themeChanged(); if (D.cap) D.cap.touch(true);
   }
+  D.app = { render, rebuild, setTab, modal, modalOpen: () => modalOpen(), built, TABS, ensure };
   document.addEventListener('DOMContentLoaded', () => {
     try { const t = localStorage.getItem('dash.theme'); if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t; } catch (e) { /* private window */ }
     $('#tabs').addEventListener('click', e => { const b = e.target.closest('.tabbtn'); if (b) setTab(b.dataset.tab); });
     seg('#segVal', 'val', render); seg('#segWin', 'win', render);
     $('#recBtn').addEventListener('click', () => { if (S.meta && S.meta.rec) stopModal(); else if (S.meta) startModal(); });
+    $('#capBtn').addEventListener('click', () => { if (D.cap) D.cap.click(); });
     $('#themeBtn').addEventListener('click', () => {
       const cur = document.documentElement.dataset.theme || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); theme(cur === 'dark' ? 'light' : 'dark');
     });
@@ -258,7 +272,7 @@
     $('#rpClose').addEventListener('click', stopReplay);
     document.addEventListener('keydown', e => {
       if (modalOpen() || e.ctrlKey || e.metaKey || e.altKey || /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
-      if (e.key >= '1' && e.key <= '6') setTab(TABS[Number(e.key) - 1]);
+      if (e.key >= '1' && e.key <= '9') setTab(TABS[Number(e.key) - 1]);
       else if (e.key === ' ' && S.rp) { e.preventDefault(); $('#rpPlay').click(); }
     });
     setInterval(() => { if (S.meta && S.meta.rec) recState(); }, 1000);

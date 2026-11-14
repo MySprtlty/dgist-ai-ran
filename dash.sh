@@ -2,9 +2,13 @@
 # dash.sh - the experiment dashboard of the 1-cell demo, run from /home/nvidia/_dgist (nvidia account, no sudo)
 #   One web page for the researchers (PC on the lab LAN): http://<host>:8010/
 #   live metrics per UE / service / GPU slot / radio, "측정 시작" (asks for a name) ... "측정 종료" (summary), every measurement saved under
-#   runs/dash/<name>_<time>/ and replayable on the same page (tab "기록 · Replay"). The page is READ-ONLY towards the stack: it starts, stops and
-#   changes nothing, sends nothing to a UE, and refuses requests from the UE network (10.45.0.0/16) so it can never add downlink traffic.
-#   Code: dash/ (dash_server.py, hub.py, sources.py, sim.py, static/). Doc: dash/README.md
+#   runs/dash/<name>_<time>/ and replayable on the same page (tab "기록 · Replay"). The measurement side is READ-ONLY towards the stack and sends
+#   nothing to a UE; requests from the UE network (10.45.0.0/16) are refused, so the page can never add downlink traffic.
+#   Since 2026-11-14 the same page is also served over HTTPS on .env DASH_TLS_PORT (default 8012; needed by "Capture" = MP4 files made in the
+#   browser), has the tab "뷰어 화면" (the four /viewer screens, read over loopback) and the tab "컴포넌트 제어": On / Off / restart of L1 + gNB,
+#   core, VA, non-VA, xApp, traffic generator through the operator scripts of this directory, run as THIS account after a confirmation dialog,
+#   logged in runs/dash/control.jsonl (.env DASH_CTL=0 switches the tab off, DASH_CTL_DRYRUN=1 only logs the command lines).
+#   Code: dash/ (dash_server.py, hub.py, sources.py, viewer.py, control.py, sim.py, static/). Doc: dash/README.md
 # commands
 #   start                start the dashboard (plain HTTP, port .env DASH_PORT, default 8010) in the background; works in both DEMO_MODEs
 #   stop | restart       a running measurement is closed properly (summary + files) before the process exits
@@ -21,6 +25,10 @@ D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
 P=$D/dash; VENV=$D/va_service/yolo_env; R=$D/runs/dash_service
 PORT=${DASH_PORT:-8010}; SIMPORT=${DASH_SIM_PORT:-8011}
+https_url() { api $1 /healthz | $VENV/bin/python -c 'import json, sys
+try: p = json.load(sys.stdin).get("https")
+except Exception: p = None
+print("https://%s:%s/ (Capture)" % (sys.argv[1], p) if p else "https port off")' "$(lan_ip)"; }
 mkdir -p $R
 port_open() { (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null; }      # connect only: a byte sent here would be logged by uvicorn as an invalid request
 lan_ip() { hostname -I 2>/dev/null | tr " " "\n" | grep -E "^10\.150\." | head -1 | grep . || hostname -I 2>/dev/null | awk '{print $1}'; }
@@ -39,7 +47,7 @@ launch() {                                                # $1 = uvicorn|sim, $2
   port_open $port && { echo "!! port $port is already in use"; exit 1; }
   LOG=$R/${tag}_$(date +%m%d_%H%M%S).log; ln -sfn $LOG $R/$tag.log
   # the braces matter: '&' must background only uvicorn (not the whole && list), so $! is uvicorn's pid and nothing keeps our stdout open
-  (cd $P && set +u && . $VENV/bin/activate && { env "$@" DASH_ROOT=$D nohup uvicorn dash_server:app --host 0.0.0.0 --port $port --log-level warning --timeout-graceful-shutdown 5 > $LOG 2>&1 < /dev/null & echo $! > $R/$tag.pid; })
+  (cd $P && set +u && . $VENV/bin/activate && { env "$@" DASH_ROOT=$D DASH_PORT=$port nohup uvicorn dash_server:app --host 0.0.0.0 --port $port --log-level warning --timeout-graceful-shutdown 5 > $LOG 2>&1 < /dev/null & echo $! > $R/$tag.pid; })
   for i in $(seq 1 30); do port_open $port && break; alive $tag || break; sleep 1; done
   port_open $port || { echo "!! did not come up - log tail:"; tail -20 $LOG; exit 1; }
 }
@@ -67,12 +75,12 @@ start)
   alive uvicorn && { echo "dashboard already running (pid $(pid uvicorn)) - http://$(lan_ip):$PORT/"; exit 0; }
   echo "== dashboard start $(date +%T): mode ${DEMO_MODE:-ours}, port $PORT, measurements -> runs/dash/"
   launch uvicorn $PORT DASH_SIM=0
-  echo "   up: http://$(lan_ip):$PORT/  (PC on the lab LAN; the UE network gets 403) | log $LOG"
+  echo "   up: http://$(lan_ip):$PORT/ | $(https_url $PORT)  (PC on the lab LAN; the UE network gets 403) | log $LOG"
   docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^dgist-l1$' || echo "   note: the stack is down (./all.sh up <name>) - the page shows empty tiles until it is up; no restart of the dashboard is needed" ;;
 stop) halt uvicorn ;;
 restart) bash $0 stop; bash $0 start ;;
 status)
-  if alive uvicorn; then echo "dashboard: running (pid $(pid uvicorn)), http://$(lan_ip):$PORT/ port $(port_open $PORT && echo open || echo CLOSED), log $(readlink -f $R/uvicorn.log 2>/dev/null)"
+  if alive uvicorn; then echo "dashboard: running (pid $(pid uvicorn)), http://$(lan_ip):$PORT/ port $(port_open $PORT && echo open || echo CLOSED), $(https_url $PORT), log $(readlink -f $R/uvicorn.log 2>/dev/null)"
     api $PORT /api/init | $VENV/bin/python -c '
 import json, sys
 try: d = json.load(sys.stdin)
@@ -96,9 +104,9 @@ sim)
   ours|baseline)
     alive sim && { echo "simulation instance already running (pid $(pid sim)) - http://$(lan_ip):$SIMPORT/ ($0 sim stop)"; exit 0; }
     echo "== dashboard SIMULATION start $(date +%T): made-up numbers, mode ${2:-ours}, port $SIMPORT, recordings -> runs/dash_sim/"
-    launch sim $SIMPORT DASH_SIM=1 DASH_SIM_MODE=${2:-ours}
-    echo "   up: http://$(lan_ip):$SIMPORT/  | log $LOG | stop: $0 sim stop" ;;
+    launch sim $SIMPORT DASH_SIM=1 DASH_SIM_MODE=${2:-ours} DASH_TLS_PORT=${DASH_SIM_TLS_PORT:-8013}
+    echo "   up: http://$(lan_ip):$SIMPORT/ | $(https_url $SIMPORT) | log $LOG | stop: $0 sim stop" ;;
   *) echo "usage: $0 sim [ours|baseline|stop|logs]"; exit 2 ;;
   esac ;;
-*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

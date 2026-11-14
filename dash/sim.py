@@ -62,6 +62,7 @@ class Sim(threading.Thread):
             while u["next"] <= now:
                 t_cap = u["next"]; u["next"] += 1.0 / 15.0; u["fid"] += 1; kb = r.gauss(118, 10)
                 ul = max(6.0, r.lognormvariate(math.log(24 + 1500.0 / max(20.0, self.quota[1] / 2.0)), 0.25))
+                if r.random() < (0.30 if ph["ulc"] else 0.02): ul += r.uniform(180.0, 420.0)        # late frames: over the non-VA deadline
                 self._push(t_cap + ul / 1000.0, lambda u=u, fid=u["fid"], ul=ul, kb=kb, t=t_cap: h.on_nv_event({"k": "f", "t": (t + ul / 1000.0) * 1000.0, "ue": u["sid"], "fid": fid, "ip": u["ip"], "ul": ul, "kb": kb}, now))
                 u["rx"] += int(kb * 1024 * 1.04)
         # --- virtual cameras: extra requests straight to the GPU (no radio)
@@ -129,7 +130,8 @@ class Sim(threading.Thread):
             self.win_req = 0; self.win_sm = []
             mac = sum(self.tp.values())
             h.on_l1({"dl": round(r.uniform(3.5, 4.5), 2), "dl_slots": 1200, "ul": round(mac * 0.97, 2), "ul_slots": 600, "crc": int(r.uniform(20, 60) + ph["ulc"] * 40), "crc_tot": 0}, now)
-            h.set_sys({"mode": self.cfg.get("mode", "ours"), "up": {"l1": True, "gnb": True, "yolo": self.base, "va": True, "nonva": True, "xapp": not self.base, "moni": False, "vcam": ph["vcam"], "ric": True, "core": True},
+            h.set_sys({"mode": self.cfg.get("mode", "ours"), "up": {"l1": True, "gnb": True, "yolo": self.base, "va": True, "nonva": True, "xapp": not self.base, "moni": False, "vcam": ph["vcam"], "ric": True, "core": True, "tgen": True},
+                       "tgen": {"on": True, "run": True, "load": "auto", "sel": "auto"},
                        "col": {}, "disk_gb": 56.0, "rntis": "VA_RNTIS=1c69,398f NONVA_RNTIS=1a60,3656"})
             util = min(99.0, 38 + 22 * ph["ulc"] + (30 if ph["vcam"] else 0) + r.uniform(-4, 4))
             h.set_nvml({"util": round(util, 1), "power": round(240 + util * 2.1, 1), "temp": round(52 + util * 0.12, 1), "mem": 21.4})

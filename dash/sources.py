@@ -54,7 +54,15 @@ def load_cfg(root, env=None):
                "max_inflight": _f(e, "VA_MAX_INFLIGHT", 4, int), "deadline_ms": _f(e, "VA_DEADLINE_MS", 200.0), "track": e.get("VA_TRACK", "1"), "drop_missed": e.get("VA_QOS_DROP_MISSED", "1"),
                "port": _f(e, "VA_PORT", 8000, int)},
         "nonva": {"width": _f(e, "NONVA_WIDTH", 1280, int), "height": _f(e, "NONVA_HEIGHT", 720, int), "fps": _f(e, "NONVA_FPS", 15), "jpeg_quality": _f(e, "NONVA_JPEG_QUALITY", 0.85),
-                  "port": _f(e, "NONVA_PORT", 8001, int)},
+                  "port": _f(e, "NONVA_PORT", 8001, int), "deadline_ms": _f(e, "NONVA_DEADLINE_MS", 250.0)},
+        "viewer": {"on": e.get("VA_VIEWER", "1") != "0", "nonva": e.get("VA_VIEWER_NONVA", "1") != "0", "display_conf": _f(e, "VA_DISPLAY_CONF", 0.40), "dl_ms": _f(e, "VA_VIEWER_DL_MS", 20.0),
+                   "freeze": e.get("VA_VIEWER_QOS_FREEZE", "1") != "0", "badge": e.get("VA_VIEWER_BADGE", "1") != "0", "rec_badge": e.get("VA_VIEWER_REC_BADGE", "1") != "0",
+                   "model_text": "mix" if e.get("VA_MODEL_SELECT", "0") not in ("", "0") else e.get("VA_MODEL", "26x"),
+                   "relay": e.get("DASH_VIEWER", "1") != "0", "va_addr": e.get("DASH_VIEWER_VA", ""), "nv_addr": e.get("DASH_VIEWER_NV", "")},
+        "cap": {"fps": max(1, min(60, _f(e, "DASH_CAP_FPS", _f(e, "VA_VIEWER_REC_FPS", 30, int), int))), "mbps": max(0.5, min(50.0, _f(e, "DASH_CAP_MBPS", _f(e, "VA_VIEWER_REC_MBPS", 6.0)))),
+                "max_min": max(0.0, _f(e, "DASH_CAP_MAX_MIN", _f(e, "VA_VIEWER_REC_MAX_MIN", 20.0))), "scale": max(0.0, min(3.0, _f(e, "DASH_CAP_SCALE", 0.0))),
+                "prefix": "".join(ch for ch in e.get("DASH_CAP_PREFIX", e.get("VA_VIEWER_REC_PREFIX", e.get("DEMO_MODE", "ours"))) if ch.isascii() and (ch.isalnum() or ch in "-_"))[:32]},
+        "ctl": e.get("DASH_CTL", "1") != "0", "ctl_dry": e.get("DASH_CTL_DRYRUN", "0") != "0",
         "vcam_env": {"fps": _f(e, "VCAM_FPS", 10), "inflight": _f(e, "VCAM_INFLIGHT", 4, int), "jpeg_quality": _f(e, "VCAM_JPEG_QUALITY", 0.70), "frames": e.get("VCAM_FRAMES", "")},
         "agent": (host or "127.0.0.1", int(port or 9810)), "ppo_bundle": e.get("PPO_BUNDLE_NAME", ""),
         "tgen_file": e.get("TRAFFIC_LOAD_FILE") or "/dev/shm/dgist_tgen_load", "tgen_levels": e.get("TRAFFIC_LEVELS") or "low=1,mid=2,high=3",
@@ -649,12 +657,16 @@ def start_collectors(hub, cfg):
                                     camera=c.get("camera", v["camera"]), file_frame=c.get("file_frame", v["file_frame"]), max_inflight=c.get("max_inflight", v["max_inflight"]),
                                     deadline_ms=c.get("deadline_ms", v["deadline_ms"]), backend=c.get("backend", v["backend"]))
             hub.deadline = float(v["deadline_ms"]); hub.dl_fixed = float((d.get("viewer") or {}).get("dl_ms", hub.dl_fixed))
+            w = d.get("viewer") or {}; vw = cfg["viewer"]                              # what the running service really uses wins over .env
+            vw.update(on=bool(w.get("on", vw["on"])), dl_ms=float(w.get("dl_ms", vw["dl_ms"])), freeze=bool(w.get("freeze", vw["freeze"])),
+                      model_text="mix" if c.get("model_select") else str(c.get("model_fixed") or c.get("model") or vw["model_text"]))
         b = d.get("backend") or {}
         hub.set_sys({"va_backend": {"connected": b.get("connected"), "counters": b.get("counters"), "last_error": b.get("last_error")}})
 
     def nv_status(d):
         c = d.get("config") or {}
         if c: cfg["nonva"].update(width=c.get("width"), height=c.get("height"), fps=c.get("fps"), jpeg_quality=c.get("jpeg_quality"))
+        if c.get("deadline_ms"): cfg["nonva"]["deadline_ms"] = float(c["deadline_ms"]); hub.nv_deadline = float(c["deadline_ms"])
     col["va"] = FeedPoller("va", cfg["va"]["port"], hub.on_va_event, va_status, "/va/status")
     col["nonva"] = FeedPoller("nonva", cfg["nonva"]["port"], hub.on_nv_event, nv_status, "/nonva/status")
     col["sys"] = SysPoller(hub, cfg, col)

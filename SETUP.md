@@ -169,6 +169,17 @@ sudo <패키지>/scripts/mig.sh off                  # Ours로 돌아갈 때
 | compose 구성 네 가지 (Ours / Baseline × 생성기 켬 / 끔) | 오류 없이 풀렸고, 마운트 원본은 호스트의 `/dev/hugepages`, `/lib/modules`, `/usr/src`를 빼면 모두 `<패키지>` 안이었다 |
 | `./dgist.sh check` | 남은 `!!`는 YOLO 엔진이 없다는 줄뿐이었다 |
 
+이 브랜치(`demo-slot-level`)도 같은 날 빈 디렉터리에 클론해서 같은 순서로 확인했다.
+
+| 단계 | 결과 |
+|---|---|
+| 클론 + 서브모듈 + LFS | Aerial 서브모듈이 슬롯 단위 커밋으로 채워졌고, LFS 파일 43개의 sha256이 포인터와 맞았다 |
+| `./dgist.sh build-l1` | 새 구성 + 다섯 타깃 3분 8초(코어 11개). `cuphycontroller_scf`와 `dapp_tenant_main`이 `demo`의 것과 다르고(슬롯 단위 전환이 들어간 두 파일), 나머지 셋은 `demo`의 것과 같았다(`test_mac`만 컴파일러 임시 파일 이름 3바이트가 다르다) |
+| compose 구성 네 가지 | 오류 없이 풀렸고, l1 컨테이너에 `DAPP_TENANT_ENGINE_SM=132`, `DAPP_AGENT_PIECE=1`, `DAPP_AGENT_AHEAD_US=150`, `DAPP_TENANT_CLASSES_SL`이 들어갔다 |
+| `./dgist.sh check` | 남은 `!!`는 `models/fhd132_26<m>/seg00_sm132.engine` 다섯 줄뿐이었다 |
+
+이 브랜치의 L1(슬롯 단위 전환 + 11-14의 순서 보장 · YOLO 여유)은 여기서 빌드만 했고, 실행해 본 적은 없다. `fhd132` 엔진을 이 패키지의 스크립트로 만드는 것도 해 보지 못했다.
+
 해 보지 못한 것(새 클론에서 실행한 적이 없다): (2a) · (2b) 이미지 빌드, (4) venv, (6) 엔진 빌드와 4절의 MIG 엔진, (7) 코어 설정 설치, 스택을 켜는 것(`./all.sh up`), 테스트 벡터를 릴리스에서 내려받는 것, GH200이 아닌 서버에서의 빌드.
 
 버전: Aerial 25-3(커밋 654c249) 기반 포크. OAI `87c016b5` + FlexRIC `ef6d722f`(`oai/README.md`). Open5GS v2.8.0. 변경 요약 `docs/CHANGES_DGIST_AERIAL.md`, `docs/CHANGES_HSW_OAI.md`, 개별 패치 `docs/patches/`.

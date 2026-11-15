@@ -1,4 +1,4 @@
-# DGIST AI-RAN 운용 매뉴얼 (2026-11-15 개정, 브랜치 `demo`)
+# DGIST AI-RAN 운용 매뉴얼 (2026-11-15 개정, 브랜치 `demo-slot-level`)
 
 5G 기지국의 신호 처리(L1)와 영상 분석 AI(YOLO)를 **GPU 한 장**에서 함께 돌리는 DGIST AI-RAN 데모 스택의 운용 설명서다.
 실제 무선 장치(Benetel RU) 1셀에 전화기 4대를 붙여 쓰고, 같은 스택을 두 방식(**Ours** / **Baseline**)으로 띄워 비교한다.
@@ -69,7 +69,7 @@ gNB <──E2──> nearRT-RIC <──> PPO 슬라이싱 xApp (Ours)
 |---|---|---|
 | GPU | 132 SM 전체를 한 덩어리로 쓴다. MIG 꺼짐 | MIG로 고정 분할: 4g(64 SM) = L1, 3g(60 SM) = YOLO. 나머지 8 SM은 쓰지 않는다 |
 | L1 | 우리 빌드(`build.aarch64_f1002`). 슬롯마다 L1에 필요한 SM 수를 계산해 그만큼만 쓴다 | **같은 우리 빌드**에서 dApp 기능을 모두 끈 것: MPS와 고정 `mps_sm_*` 분할(연구실 Benetel 기준 설정값), green context · 훅 · 테넌트 없음(`config/cuphycontroller_dgist_base.yaml`). SM 수 고정 |
-| YOLO | L1 프로세스 안에서, L1이 쓰지 않는 SM으로 돈다. 추론 한 번마다 SM 등급 하나(24~88)를 고른다 | 별도 컨테이너의 단순 서버. 항상 60 SM, 도착 순서대로 하나씩 |
+| YOLO | L1 프로세스 안에서, L1이 쓰지 않는 SM으로 돈다. 추론 하나를 조각으로 나누고 **조각마다** SM 등급(8~104)을 고른다(슬롯 단위 SM 전환, 아래 7번) | 별도 컨테이너의 단순 서버. 항상 60 SM, 도착 순서대로 하나씩 |
 | 요청 처리 | 기한을 지킬 수 없는 요청은 거절하고, 추론을 조각으로 나눠 L1 차례가 오면 조각 사이에서 멈춘다 | 거절 · 분할 없음 |
 | 모델 | 26n ~ 26x 다섯 개가 모두 올라가 있다 | MIG용 엔진을 빌드해 둔 모델만. 없는 모델의 요청은 `VA_MODEL`로 돈다 |
 | PUSCH 결과 순서 보장 | 켜짐 | 꺼짐 |
@@ -80,8 +80,8 @@ Ours가 GPU를 나누는 방법을 차례로 적으면:
 
 1. **슬롯마다 L1 몫 정하기 (sizer)**: gNB가 보내는 FAPI 메시지에는 다음 슬롯의 작업량이 들어 있다. 이것을 보고 PUSCH · PDSCH 처리에 줄 SM 수를
    미리 정해 둔 후보(`DAPP_PUSCH_PROFILES`, `DAPP_PDSCH_PROFILES`) 가운데서 고른다.
-2. **남는 SM으로 YOLO 돌리기 (tenant)**: 추론을 시작할 때 그 시점에 남는 SM에 맞는 등급을 고른다. 등급 88은 엔진은 있지만 실제 상향 트래픽이 있는
-   실행에서는 선택된 적이 없어 실질 최대는 80이다.
+2. **남는 SM으로 YOLO 돌리기 (tenant)**: 추론의 조각을 GPU에 올릴 때마다, 그 조각이 걸치는 슬롯에서 L1이 남기는 SM에 맞는 등급을 고른다(7번).
+   2026-11-13의 6셀 측정에서 실제로 쓰인 등급은 56~96이다.
 3. **요청 접수 (agent, TCP 9810)**: VA 서비스와 가상 카메라가 프레임을 보내는 창구다. 기한(`VA_DEADLINE_MS`) 검사와 추론 분할이 여기서 이뤄진다.
 4. **PUSCH 결과 순서 보장 (in-order gate, 2026-11-14)**: PUSCH 결과가 상향 슬롯 순서대로 gNB에 가도록 L1이 잠깐(최대 3000 µs) 잡아 둔다. YOLO와 같이 돌 때
    이웃한 두 슬롯의 결과가 뒤바뀌면 gNB가 재전송 정보를 버려 재전송이 연쇄로 늘어나던 문제를 막는다.
@@ -90,8 +90,28 @@ Ours가 GPU를 나누는 방법을 차례로 적으면:
 6. **요청마다 모델 고르기 (VA 서비스의 규칙)**: `VA_MODEL_SELECT=1`이면 VA 서비스가 `VA_MODEL_WEIGHTS` 비율로 모델을 섞는다
    (현재 26n : 26s : 26m : 26l : 26x = 10 : 10 : 60 : 10 : 10). Baseline에서도 같은 규칙이 돌지만 엔진이 있는 모델만 실제로 쓰인다.
 
-> **슬롯 단위 SM 전환**(추론 하나의 조각마다 SM 등급을 바꾸는 방식)은 이 브랜치(`demo`)에 없다. 그 코드와 설정은 브랜치 `demo-slot-level`에 있다(`demo` + 슬롯 단위 전환).
-> 이 매뉴얼의 절차는 모두 "추론 한 번에 등급 하나" 기준이다.
+7. **슬롯 단위 SM 전환 (이 브랜치에만 있다. 2026-11-12/13의 연구)**: 브랜치 `demo`에서는 추론 하나가 시작할 때 고른 SM 등급으로 끝까지 돈다. 이 브랜치에서는
+   추론을 조각으로 나눠 **조각마다** 등급을 다시 고른다. 추론 도중에 L1의 몫이 줄면 YOLO가 더 많은 SM을 쓰고, L1의 몫이 늘면 적게 쓴다.
+   - **엔진**: 모델마다 하나다(`models/fhd132_26<m>/seg00_sm132.engine`). GPU의 132 SM이 모두 보이는 상태에서 만든 엔진은 모든 등급에서 돌 수 있어서
+     등급을 추론 도중에 바꿀 수 있다. `demo`의 등급별 엔진(`models/fhd26<m>/`)은 이 방식에서 쓰지 않는다.
+   - **스위치**: `.env`의 네 키다. `DAPP_TENANT_ENGINE_SM=132`(엔진 하나 방식), `DAPP_AGENT_PIECE=1`(조각마다 등급 선택), `DAPP_AGENT_AHEAD_US=150`
+     (GPU에 미리 올려 두는 조각의 양, µs), `DAPP_TENANT_CLASSES_SL`(등급 목록 8~104). L1 시작 스크립트가 `scripts/slot_level_env.sh`로 이 키들을 읽는다.
+   - **`demo`의 규칙으로 되돌리기**: `.env DAPP_TENANT_ENGINE_SM=0`으로 바꾸고 `./dgist.sh down && ./dgist.sh up <이름>`. 이때는 등급별 엔진
+     `models/fhd26<m>/`이 있어야 한다(`SETUP.md` 3절). `DAPP_AGENT_PIECE=0`만 바꾸면 132-SM 엔진은 그대로 쓰고 "추론 한 번에 등급 하나"로 돈다.
+     어느 쪽이든 L1 바이너리는 이 브랜치의 것이다(포크의 `demo`와 소스 16개 파일이 다르다. `docs/CHANGES_DGIST_AERIAL.md`). `demo`와 같은 바이너리가 필요하면
+     브랜치를 바꿔 다시 빌드한다(`SETUP.md` 2절 · 3절).
+   - **켜졌는지 확인**: `grep slot-level runs/<이름>/entrypoint.log` → `slot-level: 5 model(s) in piece mode …`. 다섯 모델이 모두 켜지지 않았으면 경고 줄이 같이 찍힌다.
+   - **화면에 나오는 SM 값**: 뷰어 아래 줄과 대시보드의 모델 × SM 표가 보여 주는 SM은 그 추론의 **첫 조각** 등급이다. 조각마다 바뀐 값을 시간으로 가중 평균한 값은
+     응답의 `sm_mean`이고, 대시보드 녹화 CSV의 `sm_mean` 열에 남는다. PPO xApp이 받는 "YOLO에 준 SM 수"도 마지막 추론의 첫 조각 등급이다(24~80 밖의 값은 24나 80으로 잘린다).
+
+> **측정한 것 (2026-11-13)**: 에뮬레이터 6셀, 전화기 없음, 기한 검사 끔, 실행마다 모델 하나, 20 req/s, 240초. 같은 모델의 Baseline(MIG 3g, 60 SM)과 견준 평균 추론 시간은
+> 26x −15.0 %(상향 부하가 가장 낮은 단계 −19.5 %, 가장 높은 단계 −7.2 %), 26m −14.0 %, 26l −12.7 %, 26s −8.5 %, 26n +2.3 %(이득 없음)이다.
+> 본 실행에서 L1의 Err.ind와 FATAL은 0이었다. 예비 실행 12번 가운데 1번은 원인을 찾지 못한 L1 FATAL로 끝났고, 26l의 첫 시도는 약 25초 뒤 L1 FATAL로 죽었다.
+>
+> **측정하지 않은 것**: 전화기 셀이 들어간 실행(이 패키지의 5 + 1셀 구성), 기한 검사(`DAPP_AGENT_QOS=1`), 모델 선택 규칙(`VA_MODEL_SELECT=1`), sizer의 YOLO 항,
+> PUSCH 결과 순서 보장, 생성기를 끈 1셀 실행, PPO xApp · 대시보드와 함께 돈 경우. 이 조합들은 시작 스크립트와 설정을 정적으로 검사했을 뿐이다.
+> 132-SM 엔진을 이 패키지의 스크립트(`scripts/build_yolo_engines.sh fhd132`)로 만든 적도 아직 없다(측정에 쓴 엔진은 같은 `trtexec` 명령을 손으로 실행해 만들었다).
+> 전화기를 붙인 실험에 쓰기 전에 전화기 없이(4.5절) 먼저 확인한다.
 
 ### 1.3 5셀 트래픽 생성기 (두 모드 공통, 선택)
 
@@ -126,6 +146,7 @@ RU 에뮬레이터와 testMAC(가짜 무선 장치와 가짜 상위 계층)이 *
 - 값 정정: non-VA 전송은 15 fps, MIG 4g 조각은 64 SM.
 - 자급자족(2026-11-15): 연구실 트리(`BASELINE_TREE`)와 호스트 고정 경로(`/home/…`, `/data/…`)를 쓰지 않는다. Baseline L1은 모든 구성에서 우리 빌드이고,
   생성기의 테스트 벡터와 전체 로그는 패키지의 `tgen/` 아래에 둔다.
+- 이 브랜치(`demo-slot-level`)에서만: YOLO의 슬롯 단위 SM 전환이 켜진 상태가 기본이다(1.2절 7번, 설정은 5절). 그 밖의 절차는 브랜치 `demo`와 같다.
 
 ## 2. 모드 전환
 
@@ -165,7 +186,7 @@ sudo <패키지>/scripts/mig.sh off                    # [sudo가 있는 계정]
 **전환이 됐는지 확인**
 
 - `./all.sh status`의 첫 줄 `mode`와 둘째 줄 `traffic gen`.
-- 뷰어 화면 아래 줄의 SM 수: Baseline은 항상 60 SM, Ours는 요청마다 다르다(최대 80).
+- 뷰어 화면 아래 줄의 SM 수: Baseline은 항상 60 SM, Ours는 요청마다 다르다(슬롯 단위 전환에서는 그 추론의 첫 조각 등급, 8~104).
 - 대시보드는 `.env DEMO_MODE`를 2초마다 읽어 화면이 따라 바뀐다.
 
 **주의**
@@ -350,7 +371,8 @@ Wi-Fi를 끄고 5G로 붙인다(인증서가 자체 서명이라 경고를 한 �
 | 모드 | `DEMO_MODE`(`ours`), `BASELINE_L1_CONFIG`(`dgist_base`), `BASELINE_YOLO_SM`(`auto`) | Ours / Baseline 선택, Baseline L1의 설정 이름(`config/cuphycontroller_<이름>.yaml`), Baseline YOLO의 SM 수(`auto` = 조각 전체) | `DEMO_MODE`는 손으로 고치지 말고 `./all.sh mode` |
 | 생성기 | `TRAFFIC_GEN`(`1`), `TRAFFIC_LOAD`(`low`), `TRAFFIC_GEN_TV_DIR`, `TRAFFIC_GEN_LOG_DIR` | 생성기 스위치, 시작할 때의 부하 단계, 테스트 벡터와 전체 로그 위치(기본 `./tgen/testVectors`, `./tgen/log`. 패키지 기준 상대 경로나 절대 경로) | 스위치는 `./tgen.sh on\|off` 뒤 L1 + gNB 재시작. 부하는 `./tgen.sh load` |
 | L1 · dApp (Ours) | `DAPP_PUSCH_PROFILES`(`16,24,32,40,56`), `DAPP_PDSCH_PROFILES`(`24,40`) | sizer가 슬롯마다 고를 수 있는 PUSCH / PDSCH SM 후보. 생성기를 켠 6셀 실행에서는 PUSCH 후보가 시작 스크립트의 10단계(16~104)로 바뀐다 | L1 + gNB 재시작 |
-| | `DAPP_INPUT`(`fhd`), `DAPP_TENANT_CLASSES_FHD`(`24,40,48,56,64,72,80,88`), `DAPP_TENANT_CLASSES` | YOLO 입력 형식(`fhd` = FHD 한 장을 3장 묶음으로 추론, `4k` = 4K 타일 8장)과 YOLO SM 등급 목록(`fhd`일 때 `_FHD` 쪽, `4k`일 때 뒤쪽 키) | L1 + gNB 재시작 |
+| | `DAPP_INPUT`(`fhd`), `DAPP_TENANT_CLASSES_FHD`(`24,40,48,56,64,72,80,88`), `DAPP_TENANT_CLASSES` | YOLO 입력 형식(`fhd` = FHD 한 장을 3장 묶음으로 추론, `4k` = 4K 타일 8장)과 YOLO SM 등급 목록(`fhd`일 때 `_FHD` 쪽, `4k`일 때 뒤쪽 키). 슬롯 단위 전환이 켜져 있으면 등급 목록은 아래 줄의 `DAPP_TENANT_CLASSES_SL`이다 | L1 + gNB 재시작 |
+| | `DAPP_TENANT_ENGINE_SM`(`132`), `DAPP_AGENT_PIECE`(`1`), `DAPP_AGENT_AHEAD_US`(`150`), `DAPP_TENANT_CLASSES_SL`(`8,16,…,104`) | 슬롯 단위 SM 전환(1.2절 7번). 차례로 엔진 하나 방식의 SM 수(`0` = 브랜치 `demo`의 규칙과 등급별 엔진), 조각마다 등급 선택(`0` = 추론 한 번에 등급 하나), GPU에 미리 올려 두는 조각의 양(µs), 조각 방식의 등급 목록. `DAPP_INPUT=fhd`이고 `DAPP_AGENT_GRAPH_CHUNK`가 1 이상일 때만 동작한다. Baseline은 이 키들을 쓰지 않는다 | L1 + gNB 재시작 |
 | | `DAPP_AGENT_PORT`(`9810`), `DAPP_AGENT_QOS`(`1`), `DAPP_AGENT_GRAPH_CHUNK`(`3`), `DAPP_AGENT_CHUNK_AHEAD`(`2`) | 요청 창구 포트, 기한 검사(거절) 켬, 추론 분할 설정(0 = 분할 끔) | L1 + gNB 재시작 |
 | | `DAPP_SIZER_YOLO_US`(`7:120,8:120,17:120,18:120`) | sizer의 YOLO 항: `프레임 안 슬롯 번호:여유 µs`. 비우면 꺼짐 | L1 + gNB 재시작 |
 | | `DAPP_SLOT_CSV`(`1`), `DAPP_TENANT_CPU`, `DAPP_AGENT_CPU`, `PRACH_FORCE_THR0`(`20.0`) | 슬롯별 CSV 기록(분당 약 5 MB, 슬롯 맵 · 대시보드용), dApp 스레드의 CPU 코어, PRACH 검출 임계값 | L1 + gNB 재시작 |
@@ -413,6 +435,7 @@ grep -c 'Send Err.ind' $R/phy_warn.log ; grep -c FATAL $R/phy_warn.log     # L1 
 grep -a 'in-order gate' $R/l1_console.log | tail -2                        # 순서 보장: ON / OFF, 10초마다 held · timeout · out-of-order 수
 grep -a 'sizer YOLO term' $R/l1_console.log                                # sizer의 YOLO 항이 적용됐는지
 tail -n 3 $R/dapp_tenant.log                                               # YOLO: agent ok / fail / rejected, PUSCH · PDSCH 후보별 사용 횟수
+grep slot-level $R/entrypoint.log ; grep 'piece mode' $R/dapp_tenant.log   # 슬롯 단위 전환: 켜진 모델 수, 모델마다 ON / OFF (도는 중에는 docker exec dgist-l1 grep 'piece mode' /tmp/dapp_tenant.log)
 cat $R/tgen_load.log                                                       # 생성기 부하 전환 시각
 ./dgist.sh ue <이름>                                                       # 전화기 접속 단계별 첫 시각과 횟수 (이름을 빼면 지금 또는 마지막 실행)
 ```
@@ -447,6 +470,8 @@ cat $R/tgen_load.log                                                       # 생
 | `!! stack is up - ./all.sh down first` | 모드 전환은 스택을 내린 뒤에 한다 |
 | `mig.sh`가 거부한다 | GPU에 프로세스가 남아 있다. `nvidia-smi`로 확인한다 |
 | `Baseline engine missing: …` | MIG를 켠 뒤 `scripts/build_yolo_engines_mig.sh <모델>` |
+| `!! YOLO engine models/fhd132_26…/seg00_sm132.engine missing` | 슬롯 단위 전환용 엔진이 없다. 스택을 내리고 `scripts/build_yolo_engines.sh fhd132`. 당장 `demo`의 규칙으로 돌리려면 `.env DAPP_TENANT_ENGINE_SM=0` |
+| `entrypoint.log`에 `warning: slot-level is on in .env but not every model runs in piece mode` | `dapp_tenant.log`의 `piece mode` 줄에서 OFF인 모델과 이유를 본다. 그 모델은 "추론 한 번에 등급 하나"로 돈다 |
 | "RNTI mapping not possible" | 전화기 4대가 붙은 뒤 `./xapp.sh start` |
 | 전화기가 "Authentication failure" | 코어를 재시작한 뒤다. 전화기를 껐다 켠다 |
 | gNB만 죽었다 (`docker ps`에 `dgist-gnb` 없음) | RIC는 그대로 두고 `./dgist.sh down` → `./dgist.sh up <새 이름>` → `./xapp.sh restart` |

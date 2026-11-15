@@ -1,4 +1,4 @@
-# SETUP.md — 다른 GH200 서버에 같은 스택 만들기 (2026-11-15 개정, 브랜치 `demo`)
+# SETUP.md — 다른 GH200 서버에 같은 스택 만들기 (2026-11-15 개정, 브랜치 `demo-slot-level`)
 
 저장소: **https://github.com/MySprtlty/dgist-ai-ran** (브랜치 `demo`, `demo-slot-level`). 운용(켜기 / 끄기 / 모드 전환)은 `MANUAL.md`.
 이 문서는 **빈 서버에서 클론 → 빌드 → 실행**까지의 순서와, 저장소에 들어 있지 않은 것(생성물)을 다시 만드는 방법을 적는다.
@@ -10,7 +10,7 @@
 | 브랜치 | 내용 |
 |---|---|
 | `demo` | 2026-11-14에 돌린 구성: Ours / Baseline 모드 전환, VA · non-VA 서비스, 뷰어, 대시보드, 코어, RIC · xApp, 5셀 트래픽 생성기. YOLO는 "추론 한 번에 SM 등급 하나" |
-| `demo-slot-level` | `demo` + 슬롯 단위 SM 전환(추론 하나의 조각마다 SM 등급을 바꾼다). 그 밖은 `demo`와 같다 |
+| `demo-slot-level` (이 문서) | `demo` + 슬롯 단위 SM 전환(추론 하나의 조각마다 SM 등급을 바꾼다. `MANUAL.md` 1.2절 7번). 그 밖은 `demo`와 같다 |
 
 두 브랜치는 같은 이름의 Aerial 포크 브랜치(`MySprtlty/aerial-cuda-accelerated-ran`의 `demo`, `demo-slot-level`)를 서브모듈로 가리킨다.
 
@@ -25,7 +25,7 @@
 | Aerial cuPHY (L1, YOLO 테넌트, RU 에뮬레이터, testMAC) `aerial-cuda-accelerated-ran/` | **서브모듈** = 포크의 같은 이름 브랜치 | 빌드: `./dgist.sh build-l1` (컨테이너 안 Ninja, `build.aarch64_f1002/`). Ours와 Baseline이 **같은 빌드**를 쓴다 |
 | OAI gNB + FlexRIC (MAC 쿼터 스케줄러 · E2 agent · xApp) `openairinterface5g/` | **패치 묶음** `oai/` (업스트림 커밋 고정 + 변경분) | `./oai/fetch_oai.sh` → 이미지: `./dgist.sh build-oai`, RIC / xApp: `./ric.sh build` |
 | Open5GS 소스 `open5gs/` (v2.8.0) | **서브모듈** (업스트림) | 실행은 apt 패키지. 소스 빌드는 선택(`./core.sh build`) |
-| YOLO 가중치 · ONNX · TensorRT 엔진 (`models/fhd26*/`, `models/full26*/`, Baseline용 `models/migfhd26*/`) | 없음 | `scripts/build_yolo_engines.sh fhd`, `scripts/build_yolo_engines_mig.sh` (3절, 4절) |
+| YOLO 가중치 · ONNX · TensorRT 엔진 (슬롯 단위 전환용 `models/fhd132_26*/`, 등급별 `models/fhd26*/` · `models/full26*/`, Baseline용 `models/migfhd26*/`) | 없음 | `scripts/build_yolo_engines.sh fhd132`(등급별은 `fhd` · `4k`), `scripts/build_yolo_engines_mig.sh` (3절, 4절) |
 | 트래픽 생성기의 테스트 벡터 (187개 파일, 0.85 GB) | 없음. 파일별 sha256 목록만 추적(`config/tgen/testvectors.sha256`) | `scripts/fetch_testvectors.sh` (5절) → `tgen/testVectors/` |
 | Docker 이미지 (`nvcr.io/nvidia/aerial/aerial-cuda-accelerated-ran:25-3-cubb`, `ran-base:latest`, `dgist-oai-gnb-aerial:latest`) | 없음 | NGC pull / `docker build` (3절) |
 | 실행 로그 `runs/`, `log/`, 생성기 전체 로그 `tgen/log/`, E2 SM 라이브러리 `flexric_sm/`, 개인키 `*/certs/`, `core/etc/tls/*.key` | 없음 (.gitignore) | 실행 · 빌드 때 생성 |
@@ -39,14 +39,14 @@
 4. **도구**: `git git-lfs cmake ninja-build build-essential python3.10 python3.10-venv openssl curl xz-utils`. FlexRIC: `libsctp-dev libpcre2-dev flex bison python3-dev`(FlexRIC README 참고. sqlite3는 번들). Open5GS 소스 빌드(선택)는 `./core.sh build`가 필요한 패키지를 알려 준다.
 5. **계정**: 스택을 돌릴 계정 하나를 정한다. `docker` 그룹에 넣고(`sudo usermod -aG docker <계정>`), 저널을 읽을 수 있게 한다(`sudo usermod -aG systemd-journal <계정>`. `ue_table.py`가 Open5GS 저널에서 전화기를 찾는다).
    그 계정에 sudo가 없어도 된다. 그 경우 `core.sh`와 `scripts/mig.sh`만 sudo가 있는 계정에서 실행한다.
-6. **디스크**: 처음 서버의 실측으로 엔진 · ONNX 12 GB(4K · FHD · MIG 엔진을 모두 만든 상태), Python venv 8.4 GB, OAI 소스 · 빌드 2.8 GB, L1 빌드 0.6 GB, 테스트 벡터 0.85 GB. 여기에 Docker 이미지가 더해진다.
+6. **디스크**: 처음 서버의 실측으로 엔진 · ONNX 12 GB(4K · FHD · MIG 엔진을 모두 만든 상태. 슬롯 단위 전환용 엔진 다섯 개는 0.24 GB), Python venv 8.4 GB, OAI 소스 · 빌드 2.8 GB, L1 빌드 0.6 GB, 테스트 벡터 0.85 GB. 여기에 Docker 이미지가 더해진다.
    트래픽 생성기를 켠 실행은 전체 로그가 **시간당 26~29 GB**(측정) 쌓인다(5절).
 
 ## 2. 클론
 
 ```bash
 git lfs install                                   # Aerial의 testVectors/*.h5 는 git-lfs 객체다
-git clone --recursive -b demo https://github.com/MySprtlty/dgist-ai-ran.git <패키지>      # 슬롯 단위 버전은 -b demo-slot-level
+git clone --recursive -b demo-slot-level https://github.com/MySprtlty/dgist-ai-ran.git <패키지>      # 슬롯 단위 전환이 없는 버전은 -b demo
 cd <패키지>
 ./oai/fetch_oai.sh            # OAI 87c016b + FlexRIC ef6d722f 얕은 클론 + 패치 → ./openairinterface5g (약 1분)
 vi .env                       # 서버에 맞게 고친다 (7절)
@@ -54,7 +54,7 @@ vi .env                       # 서버에 맞게 고친다 (7절)
 
 서브모듈이 비어 있으면 `git submodule update --init --recursive`. 다른 브랜치로 옮길 때는 `git checkout <브랜치> && git submodule update --init --recursive` 뒤에 `./dgist.sh build-l1`을 다시 한다(두 브랜치의 L1 소스가 다르다).
 
-## 3. 빌드 (순서대로. 4~5시간 가운데 대부분은 엔진)
+## 3. 빌드 (순서대로. 2~3시간. 등급별 엔진 (6')까지 만들면 3시간쯤 더 든다)
 
 ```bash
 ./dgist.sh build-l1                               # (1) cuphycontroller_scf, dapp_tenant_main, dapp_agent_test, ru_emulator, test_mac. 재구성은 FULL=1 ./dgist.sh build-l1   ~40분
@@ -63,15 +63,20 @@ vi .env                       # 서버에 맞게 고친다 (7절)
 ./ric.sh build                                    # (3) FlexRIC nearRT-RIC + xApp (build_dgist) + E2 SM 라이브러리 → flexric_sm/
 ./scripts/setup_venvs.sh                          # (4) va_service/yolo_env (서비스 · 대시보드 · 엔진 내보내기), xapp_ppo venv
 ./scripts/make_certs.sh                           # (5) HTTPS 인증서 CN=10.45.0.1 (전화기에 ca.crt를 설치하거나 경고를 넘긴다)
-./scripts/build_yolo_engines.sh fhd               # (6) YOLO26 n/s/m/l/x × SM 등급(.env DAPP_TENANT_CLASSES_FHD) 엔진. GPU가 비어 있어야 한다  ~3시간
+./scripts/build_yolo_engines.sh fhd132            # (6) 슬롯 단위 전환용 엔진: YOLO26 n/s/m/l/x 모델마다 하나(132 SM). GPU가 비어 있어야 한다  엔진 하나에 3~8분
+./scripts/build_yolo_engines.sh fhd               # (6') 선택: 등급별 엔진(.env DAPP_TENANT_CLASSES_FHD). .env DAPP_TENANT_ENGINE_SM=0 으로 돌릴 때만 필요하다  ~3시간
 for nf in amf smf upf nrf ausf udm udr pcf nssf bsf scp; do ./core.sh install-config $nf; done   # (7) 코어 설정 (기존 /etc/open5gs를 백업한 뒤 바꾼다)
 ./dgist.sh check                                  # (8) 사전 점검: 이미지 · 엔진 · 인터페이스 · PTP · 코어 · 테스트 벡터 · 디스크
 ```
 
-- (6)은 가중치 `yolo26{n,s,m,l,x}.pt`를 ultralytics로 내려받아(인터넷 필요) ONNX로 내보내고, Aerial 컨테이너 안에서 SM 등급마다 엔진을 만든다.
-  `.env DAPP_INPUT=fhd`(기본)이면 `fhd`, `4k`로 바꿔 쓸 때만 `./scripts/build_yolo_engines.sh 4k`가 더 필요하다.
+- (6)은 가중치 `yolo26{n,s,m,l,x}.pt`를 ultralytics로 내려받아(인터넷 필요) ONNX로 내보내고, Aerial 컨테이너 안에서 엔진을 만든다. `fhd132`는 MPS 없이
+  GPU의 132 SM이 모두 보이는 상태에서 모델마다 엔진 하나를 만든다(`models/fhd132_26<m>/seg00_sm132.engine`). 숫자는 GPU의 SM 수와 같아야 하고(GH200 = 132),
+  다르면 스크립트가 멈춘다. `.env DAPP_TENANT_ENGINE_SM`도 같은 숫자여야 한다.
+  **이 프로파일은 이 패키지의 스크립트로 아직 실행해 본 적이 없다**(측정에 쓴 엔진은 같은 `trtexec` 명령을 손으로 실행해 만들었다).
+- (6')의 등급별 엔진은 `.env DAPP_TENANT_ENGINE_SM=0`으로 브랜치 `demo`의 규칙(추론 한 번에 SM 등급 하나)을 쓸 때만 필요하다. 4K 입력(`.env DAPP_INPUT=4k`)에는
+  슬롯 단위 전환이 없어서 `./scripts/build_yolo_engines.sh 4k`의 등급별 엔진을 쓴다.
+- `./dgist.sh check`는 `.env DAPP_TENANT_ENGINE_SM`이 132이면 `fhd132` 엔진 다섯 개를, 0이면 등급별 엔진을 찾는다.
 - 가입자: WebUI에 전화기 네 대의 IMSI(`.env`의 값) · K · OPc를 등록한다. 기존 서버에서 옮길 때는 그 서버의 MongoDB에서 내보낸다(이 저장소에는 없다).
-- `demo-slot-level` 브랜치는 엔진 단계가 하나 더 있다. 그 브랜치의 이 문서를 본다.
 
 ## 4. Baseline 모드 준비 (GPU를 MIG로 나눠 쓰는 비교 대상)
 
@@ -132,7 +137,7 @@ sudo <패키지>/scripts/mig.sh off                  # Ours로 돌아갈 때
 | CPU 코어 배정 | `.env BUILD_CPUS`(빌드, 격리되지 않은 코어), `OAI_CPUSET`, `DAPP_TENANT_CPU`, `DAPP_AGENT_CPU`. L1 · RU 에뮬레이터 · testMAC의 워커 코어는 `config/` 아래 yaml. `dgist.sh test`는 코어 65-71을 쓴다 | 격리 코어 4-64 |
 | 전화기 | `.env VA_IMSIS`, `NONVA_IMSIS`(각 2대), WebUI의 가입자 | — |
 | gNB | `config/gnb.conf`(AMF 주소, PLMN, 주파수, 전력 제어 목표) | — |
-| GPU | SM 등급 목록(`.env DAPP_TENANT_CLASSES*`, `DAPP_PUSCH_PROFILES`, `DAPP_PDSCH_PROFILES`)은 GH200(132 SM), MIG 4g = 64 SM / 3g = 60 SM 기준 | — |
+| GPU | SM 등급 목록(`.env DAPP_TENANT_CLASSES*`, `DAPP_PUSCH_PROFILES`, `DAPP_PDSCH_PROFILES`)과 `DAPP_TENANT_ENGINE_SM`(GPU의 SM 수)은 GH200(132 SM), MIG 4g = 64 SM / 3g = 60 SM 기준 | — |
 
 ## 8. 개발 흐름 (어디를 고치고 어떻게 커밋하나)
 

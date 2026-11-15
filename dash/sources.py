@@ -41,10 +41,17 @@ def load_cfg(root, env=None):
             try: mp[k] = float(v)
             except ValueError: pass
     host, _, port = e.get("VA_AGENT", "127.0.0.1:9810").partition(":")
+    # branch demo-slot-level (scripts/slot_level_env.sh): one-engine sets (FHD input only) + SM class per graph piece -> the tenant's class list is
+    # DAPP_TENANT_CLASSES_SL. A request's "sm" is then the class of its first piece, "sm_mean" the time-weighted mean over its pieces.
+    esm = _f(e, "DAPP_TENANT_ENGINE_SM", 0, int) if inp == "fhd" else 0
+    slp = esm > 0 and str(e.get("DAPP_AGENT_PIECE", "1")).strip() != "0"
+    cls_key = "DAPP_TENANT_CLASSES_SL" if slp else ("DAPP_TENANT_CLASSES_FHD" if inp == "fhd" else "DAPP_TENANT_CLASSES")
+    cls_def = "8,16,24,32,40,48,56,64,72,80,88,96,104" if slp else ""
     return {
         "root": str(root), "mode": e.get("DEMO_MODE", "ours"), "input": inp, "prb_total": 273, "tdd": "DDDDDDSUUU",
         "deadline_ms": _f(e, "VA_DEADLINE_MS", 200.0), "dl_fixed_ms": _f(e, "VA_VIEWER_DL_MS", 20.0),
-        "classes": _ints(e.get("DAPP_TENANT_CLASSES_FHD" if inp == "fhd" else "DAPP_TENANT_CLASSES", "")) or _ints(e.get("DAPP_TENANT_CLASSES", "24,40,48,56,64,72,80")),
+        "classes": _ints(e.get(cls_key, cls_def)) or _ints(e.get("DAPP_TENANT_CLASSES", "24,40,48,56,64,72,80")),
+        "slot_level": {"engine_sm": esm, "piece": bool(slp)},
         "pusch_profiles": _ints(e.get("DAPP_PUSCH_PROFILES", "")), "pdsch_profiles": _ints(e.get("DAPP_PDSCH_PROFILES", "")),
         "va_imsis": [x for x in e.get("VA_IMSIS", "").split(",") if x], "nonva_imsis": [x for x in e.get("NONVA_IMSIS", "").split(",") if x],
         "baseline_ran_sm": _f(e, "DASH_BASELINE_RAN_SM", 64, int), "baseline_yolo_sm": _f(e, "DASH_BASELINE_YOLO_SM", 60, int),

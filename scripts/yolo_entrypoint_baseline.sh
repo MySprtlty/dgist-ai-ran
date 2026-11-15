@@ -37,6 +37,9 @@ log "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} (privileged: nvidia-smi
 export CUDA_MPS_PIPE_DIRECTORY=/var CUDA_MPS_LOG_DIRECTORY=/var; echo quit | nvidia-cuda-mps-control 2>/dev/null; sleep 1
 export DAPP_TENANT=1 DAPP_AGENT=1 DAPP_TENANT_FREERUN=1 DAPP_TENANT_FIXED=$SM DAPP_TENANT_CLASSES=$SM
 export DAPP_PUSCH_PROFILES=16 DAPP_PDSCH_PROFILES=0 DAPP_AGENT_QOS=0 DAPP_AGENT_GRAPH_CHUNK=0 DAPP_AGENT_CHUNK_AHEAD=0
+# branch demo-slot-level: .env carries the slot-level keys of the Ours tenant and env_file passes them into this container too - the naive
+# server stays what it is on branch demo (one 60-SM engine per model, one class, no pieces)
+export DAPP_TENANT_ENGINE_SM=0 DAPP_AGENT_PIECE=0 DAPP_AGENT_AHEAD_US=0
 export DAPP_INPUT=fhd DAPP_TENANT_MODELS=$SPEC DAPP_AGENT_WARMUP=$M/imgfhd/fhd_0_q85.jpg,$M/imgfhd/fhd_1_q85.jpg
 export DAPP_AGENT_PORT=${DAPP_AGENT_PORT:-9810} DAPP_TENANT_CPU=${DAPP_TENANT_CPU:-45} DAPP_AGENT_CPU=${DAPP_AGENT_CPU:-46}
 export DAPP_TENANT_LOG=/tmp/dapp_tenant.log DAPP_TENANT_CSV=

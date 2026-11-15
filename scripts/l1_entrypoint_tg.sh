@@ -41,7 +41,8 @@ LP=$SDK/testVectors/multi-cell/launch_pattern_F08_${NC}C_$PAT.yaml
 T=$DG/config/tgen
 for f in cuphycontroller_$TGC.yaml l2_adapter_$TGC.yaml nvipc_multi_dgist_tg.yaml ru_dgist_tg.yaml testmac_dgist_tg.yaml; do [ -f $T/$f ] || { log "missing config/tgen/$f"; exit 1; }; done
 M=$SDK/cuPHY-CP/dapp_hook/models; ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26
-if [ $MODE = ours ]; then for m in n s m l x; do [ -e $M/$ESET$m/seg00_sm80.engine ] || log "warning: YOLO engine models/$ESET$m/seg00_sm80.engine missing (scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; done; fi
+. $DG/scripts/slot_level_env.sh; sl_init   # branch demo-slot-level: ESM > 0 = the one-engine sets of the slot-level tenant (.env DAPP_TENANT_ENGINE_SM)
+if [ $MODE = ours ] && [ $ESM = 0 ]; then for m in n s m l x; do [ -e $M/$ESET$m/seg00_sm80.engine ] || log "warning: YOLO engine models/$ESET$m/seg00_sm80.engine missing (scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; done; fi
 
 # 1. MPS: off for the green contexts (Ours), on for the static split inside the MIG 4g instance (Baseline, the researchers' recipe)
 export CUDA_MPS_PIPE_DIRECTORY=/var CUDA_MPS_LOG_DIRECTORY=/var
@@ -96,9 +97,10 @@ if [ $MODE = ours ]; then
     export DAPP_AGENT_WARMUP=$M/imgfhd/fhd_0_q85.jpg,$M/imgfhd/fhd_1_q85.jpg
     export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}
   fi
+  sl_env   # slot-level SM switching (scripts/slot_level_env.sh): one-engine sets + SM class per graph piece, or the slot-level keys pinned off
   [ -n "${TG_TENANT_CLASSES:-}" ] && export DAPP_TENANT_CLASSES=$TG_TENANT_CLASSES
   [ "${DAPP_SLOT_CSV:-1}" = 1 ] && ln -sfn $HOSTLOGD/dapp_tenant_slots.csv $RUN/dapp_tenant_slots.csv
-  WHAT="green contexts | PUSCH profiles $DAPP_PUSCH_PROFILES | PDSCH $DAPP_PDSCH_PROFILES | dApp classes $DAPP_TENANT_CLASSES | input $DAPP_INPUT ($ESET) | agent TCP $DAPP_AGENT_PORT"
+  WHAT="green contexts | PUSCH profiles $DAPP_PUSCH_PROFILES | PDSCH $DAPP_PDSCH_PROFILES | dApp classes $DAPP_TENANT_CLASSES | input $DAPP_INPUT ($ESET) | $RULE | agent TCP $DAPP_AGENT_PORT"
 else
   # Baseline: no dApp feature may reach the L1 (.env passes DAPP_* into the container). CUDA_DEVICE_MAX_CONNECTIONS = 8 = the image default
   # = the researchers' recipe (as in l1_entrypoint.sh, Baseline) = the research MIG arm; it MUST be set: cuphydriver context.cpp:412-413 formats the
@@ -125,7 +127,7 @@ if l1_ready; then touch /tmp/dgist_l1_ready; log "L1 is ready (6 cells)"
 else log "L1 did not come up: $(grep -E 'FATAL|ERR' $RUN/l1_console.log | tail -2 | cut -c1-200 | tr '\n' ';')"; fi
 if [ $MODE = ours ] && l1_ready; then
   for i in $(seq 1 480); do port_open && break; grep -qE 'tenant NOT started|FATAL' /tmp/dapp_tenant.log 2>/dev/null && break; kill -0 $L1 2>/dev/null || break; nap 1 || break; done
-  if port_open; then touch /tmp/dgist_tenant_ready; log "dApp tenant ready: agent on TCP $DAPP_AGENT_PORT | $(grep -E 'CUDA graphs captured|green contexts' /tmp/dapp_tenant.log 2>/dev/null | tail -1 | cut -c1-120)"
+  if port_open; then touch /tmp/dgist_tenant_ready; log "dApp tenant ready: agent on TCP $DAPP_AGENT_PORT | $(grep -E 'CUDA graphs captured|green contexts' /tmp/dapp_tenant.log 2>/dev/null | tail -1 | cut -c1-120)"; sl_ready
   else log "tenant did not start: $(grep -E 'tenant NOT started|FATAL|error' /tmp/dapp_tenant.log 2>/dev/null | tail -2 | cut -c1-200 | tr '\n' ';')"; fi
 fi
 

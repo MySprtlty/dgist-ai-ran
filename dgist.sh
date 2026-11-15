@@ -33,6 +33,10 @@ set -u
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a; . $D/scripts/paths.sh
 CL=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80}; [ "${DAPP_INPUT:-4k}" = fhd ] && CL=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}   # dApp SM classes of the input profile
+# slot-level SM switching (branch demo-slot-level, scripts/slot_level_env.sh): DAPP_TENANT_ENGINE_SM > 0 with the FHD input = one engine per model
+# (models/fhd<N>_26<m>/seg00_sm<N>.engine); SLP = 1 = the SM class is chosen per graph piece (DAPP_AGENT_PIECE, default 1), classes DAPP_TENANT_CLASSES_SL
+ESM=${DAPP_TENANT_ENGINE_SM:-0}; case "$ESM" in ''|*[!0-9]*) ESM=0 ;; esac; [ "${DAPP_INPUT:-4k}" = fhd ] || ESM=0
+SLP=0; [ $ESM -gt 0 ] && [ "${DAPP_AGENT_PIECE:-1}" != 0 ] && { SLP=1; CL=${DAPP_TENANT_CLASSES_SL:-8,16,24,32,40,48,56,64,72,80,88,96,104}; }
 OUT=$D/runs; CUR=$OUT/current_run; L1C=dgist-l1; GNBC=dgist-gnb; YOLOC=dgist-yolo; PHYLOG=/tmp/phy.log; T=$D/aerial-cuda-accelerated-ran; mkdir -p $OUT
 MODE=${DEMO_MODE:-ours}; COMPOSE="docker compose"
 if [ "$MODE" = baseline ]; then   # our L1 build with dApp off on MIG 4g + naive YOLO on MIG 3g (docker-compose.baseline.yaml needs MIG_4G / MIG_3G from runs/mig.env)
@@ -82,7 +86,12 @@ check() {
   else
   [ "$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null)" = Disabled ] || { echo "!! GPU MIG mode is not Disabled (./all.sh mode ours / sudo -n scripts/mig.sh off)"; ok=0; }
   ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26
+  if [ $ESM -gt 0 ]; then   # slot-level: one engine per model serves every SM class
+    for m in n s m l x; do [ -e $T/cuPHY-CP/dapp_hook/models/fhd${ESM}_26$m/seg00_sm$ESM.engine ] || { echo "!! YOLO engine models/fhd${ESM}_26$m/seg00_sm$ESM.engine missing (DAPP_TENANT_ENGINE_SM=$ESM: scripts/build_yolo_engines.sh fhd$ESM)"; ok=0; }; done
+    [ $SLP = 1 ] && case "${DAPP_AGENT_GRAPH_CHUNK:-3}" in ''|0|*[!0-9]*) echo "!! DAPP_AGENT_PIECE=1 needs DAPP_AGENT_GRAPH_CHUNK > 0 (.env) - the tenant would run one SM class per inference"; ok=0 ;; esac
+  else
   for m in n s m l x; do [ -e $T/cuPHY-CP/dapp_hook/models/$ESET$m/seg00_sm${CL##*,}.engine ] || { echo "!! YOLO engine models/$ESET$m/seg00_sm${CL##*,}.engine missing (DAPP_INPUT=${DAPP_INPUT:-4k}: scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; ok=0; }; done
+  fi
   fi
   want=3840x2160; [ "${DAPP_INPUT:-4k}" = fhd ] && want=1920x1080; have=${VA_CAMERA_WIDTH:-3840}x${VA_CAMERA_HEIGHT:-2160}
   [ "$have" = "$want" ] || echo "   note: DAPP_INPUT=${DAPP_INPUT:-4k} expects $want frames but .env VA_CAMERA_WIDTH/HEIGHT = $have (such frames still run, whole-image views only)"
@@ -123,7 +132,7 @@ up)
   NAME=${2:-dgist_$(date +%m%d_%H%M)}; RUN=$OUT/$NAME
   [ -f $CUR ] && { echo "!! a run is registered as current ($(cat $CUR)): $0 down first"; exit 1; }
   if [ "$MODE" = baseline ]; then echo "== $NAME [BASELINE]: L1 (our build with every dApp feature off, $BUILD_DIR, config $( [ "$TG" = 1 ] && echo $TGC || echo $BASELINE_L1_CONFIG)) on MIG 4g + naive YOLO ${VA_MODEL:-26x}$([ "${VA_MODEL_SELECT:-0}" = 1 ] && echo " + the VA_MODEL_WEIGHTS models that have an engine") (whole MIG 3g instance) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
-  else echo "== $NAME [OURS]: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"; fi
+  else echo "== $NAME [OURS]: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}, $( [ $SLP = 1 ] && echo "slot-level: SM class per graph piece on one $ESM-SM engine per model" || { [ $ESM -gt 0 ] && echo "one SM class per inference on the $ESM-SM engines" || echo "one SM class per inference"; })) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"; fi
   [ "$TG" = 1 ] && echo "   + traffic generator: 5 RU-emulator cells with testMAC in the l1 container (L1 cells 0-4, config $TGC, initial load ${TRAFFIC_LOAD:-low}); the phones' cell is L1 cell $PC$( [ "$MODE" = baseline ] || echo "; PUSCH profiles ${TG_PUSCH_PROFILES:-16,24,32,40,48,56,64,72,88,104}")"
   check || { echo "precheck failed"; exit 1; }
   mkdir -p $RUN; echo "$NAME" > $CUR

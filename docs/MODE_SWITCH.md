@@ -1,4 +1,4 @@
-# Ours / Baseline 모드 전환·실행 매뉴얼 (2026-11-12, 트래픽 생성기 7장 추가 2026-11-13, Baseline L1 통일 · 패키지 기준 경로 2026-11-15)
+# Ours / Baseline 모드 전환·실행 매뉴얼 (2026-11-12, 트래픽 생성기 7장 추가 2026-11-13, Baseline L1 통일 · 패키지 기준 경로 2026-11-15, 브랜치 `demo-slot-level`)
 
 > 운용 절차의 기준 문서는 `MANUAL.md`다. 이 문서는 모드 전환과 트래픽 생성기의 배경 · 측정값을 남겨 둔다.
 
@@ -9,7 +9,7 @@
 |---|---|---|
 | GPU | 전체 132 SM, MIG 꺼짐 | MIG 4g.48gb(64 SM) + 3g.48gb(60 SM) |
 | L1 | 우리 cuphycontroller: 녹색 컨텍스트, FAPI 인지 YOLO 테넌트, xApp 에이전트 | **같은 우리 빌드**에서 dApp 기능을 모두 끈 것(MPS 고정 분할, 녹색 컨텍스트 · 훅 · 테넌트 없음; `config/cuphycontroller_dgist_base.yaml`) → MIG 4g, 컨테이너 `dgist-l1` |
-| YOLO | L1 안, 슬롯마다 24~88 SM | 컨테이너 `dgist-yolo` → MIG 3g, naive(60 SM 고정, QoS 거절·분할·모델 선택 없음) |
+| YOLO | L1 안, 추론의 조각마다 8~104 SM(슬롯 단위 SM 전환, `MANUAL.md` 1.2절 7번. `.env DAPP_TENANT_ENGINE_SM=0`이면 추론마다 24~88 SM) | 컨테이너 `dgist-yolo` → MIG 3g, naive(60 SM 고정, QoS 거절·분할·모델 선택 없음) |
 | xApp | PPO 슬라이싱 (`--xapp`) | 없음 |
 | 트래픽 생성기 (`TRAFFIC_GEN=1`, 7장) | 같은 L1에 에뮬레이터 5셀 추가 (모두 6셀) | 6셀 L1은 우리 빌드에서 dApp 기능을 끈 것 (MIG 4g), YOLO는 그대로 |
 | gNB·코어·VA/non-VA·뷰어·로그 | 동일 | 동일 |
@@ -52,7 +52,7 @@ sudo -n scripts/mig.sh off          # [root] 인스턴스 삭제, MIG 끔
 ```bash
 # 폰: VA https://10.45.0.1:8000/  non-VA https://10.45.0.1:8001/  (서비스를 재시작했으면 페이지 새로 고침 후 시작)
 #     소스: Start Camera(카메라) 또는 Video File(폰에 저장된 동영상; VA는 FHD로 자동 변환, 하향 트래픽 없음) → Start VA / Start Streaming → Full Screen
-# 뷰어(PC): https://<서버 IP>:8000/viewer   (/viewer/va = VA 2대, /viewer/ue1 = 한 대; 아래 줄 "26x · 60 SM" = Baseline, "80 SM" = Ours)
+# 뷰어(PC): https://<서버 IP>:8000/viewer   (/viewer/va = VA 2대, /viewer/ue1 = 한 대; 아래 줄 "26x · 60 SM" = Baseline, 요청마다 바뀌는 값 = Ours. 슬롯 단위 전환에서는 그 추론의 첫 조각 등급)
 # 대시보드(PC): http://<서버 IP>:8010/   ("측정 시작" → 이름 입력 … "측정 종료" → 요약; 왼쪽 위 배지가 Ours / Baseline, 기록·Replay는 같은 페이지)
 ./dash.sh start | status | stop    # 실험 대시보드 (스택과 따로 돈다; 모드를 바꿔도 다시 켤 필요 없음)
 ./va.sh status | ./nonva.sh status | ./va.sh logs

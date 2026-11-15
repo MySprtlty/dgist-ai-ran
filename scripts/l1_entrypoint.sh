@@ -22,7 +22,8 @@ for kv in SCF_FAPI_10_04:BOOL=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH:BOOL=OFF SCF
   grep -q "^$kv\$" $SDK/$BUILD_DIR/CMakeCache.txt || log "warning: $BUILD_DIR/CMakeCache.txt lacks $kv (the validated FAPI wire layout + dApp hook)"
 done
 M=$SDK/cuPHY-CP/dapp_hook/models; ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26   # input profile (.env DAPP_INPUT): 4k = batch-8 1280 tiles, fhd = batch-3 (2026-11-09)
-if [ $MODE = ours ]; then for m in n s m l x; do [ -e $M/$ESET$m/seg00_sm80.engine ] || log "warning: YOLO engine models/$ESET$m/seg00_sm80.engine missing (scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; done; fi
+. $DG/scripts/slot_level_env.sh; sl_init   # branch demo-slot-level: ESM > 0 = the one-engine sets of the slot-level tenant (.env DAPP_TENANT_ENGINE_SM)
+if [ $MODE = ours ] && [ $ESM = 0 ]; then for m in n s m l x; do [ -e $M/$ESET$m/seg00_sm80.engine ] || log "warning: YOLO engine models/$ESET$m/seg00_sm80.engine missing (scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; done; fi
 
 # 1. MPS: off for the green contexts (Ours), on for the static split inside the MIG 4g instance (Baseline, as the researchers' recipe)
 export CUDA_MPS_PIPE_DIRECTORY=/var CUDA_MPS_LOG_DIRECTORY=/var
@@ -56,7 +57,8 @@ if [ $MODE = ours ]; then
     export DAPP_AGENT_WARMUP=$M/imgfhd/fhd_0_q85.jpg,$M/imgfhd/fhd_1_q85.jpg
     export DAPP_TENANT_CLASSES=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}   # the FHD ladder (.env; 26s/26l sm80 = sm72-tactic engines, see build_yolo_engines.sh)
   fi
-  WHAT="dApp classes $DAPP_TENANT_CLASSES | input $DAPP_INPUT ($ESET) | agent TCP $DAPP_AGENT_PORT"
+  sl_env   # slot-level SM switching (scripts/slot_level_env.sh): one-engine sets + SM class per graph piece, or the slot-level keys pinned off
+  WHAT="dApp classes $DAPP_TENANT_CLASSES | input $DAPP_INPUT ($ESET) | $RULE | agent TCP $DAPP_AGENT_PORT"
 else
   # Baseline: no dApp feature may reach the L1 (.env passes DAPP_* into the container). CUDA_DEVICE_MAX_CONNECTIONS = 8 = the image default
   # = the researchers' recipe; it MUST be set: cuphydriver context.cpp formats the getenv() result without a null check and the L1 dies with
@@ -92,7 +94,7 @@ if l1_ready; then touch /tmp/dgist_l1_ready; log "L1 is ready ($MODE)"
 else log "L1 did not come up: $(grep -E 'FATAL|ERR' $RUN/l1_console.log 2>/dev/null | tail -2 | cut -c1-160 | tr '\n' ';')"; fi
 if [ $MODE = ours ]; then   # the gNB starts once the tenant has loaded its engines and the agent port is open (Baseline: L1 ready is enough)
   for i in $(seq 1 240); do port_open && break; grep -qE 'tenant NOT started|FATAL' /tmp/dapp_tenant.log $PHYLOG 2>/dev/null && break; kill -0 $L1 2>/dev/null || break; sleep 2; done
-  if port_open; then touch /tmp/dgist_tenant_ready; log "dApp tenant ready: xApp agent on TCP $DAPP_AGENT_PORT | $(grep -E 'CUDA graphs captured' /tmp/dapp_tenant.log 2>/dev/null | tail -1 | cut -c1-90)"
+  if port_open; then touch /tmp/dgist_tenant_ready; log "dApp tenant ready: xApp agent on TCP $DAPP_AGENT_PORT | $(grep -E 'CUDA graphs captured' /tmp/dapp_tenant.log 2>/dev/null | tail -1 | cut -c1-90)"; sl_ready
   else log "dApp tenant did not start: $(grep -E 'tenant NOT started|FATAL' /tmp/dapp_tenant.log $PHYLOG 2>/dev/null | tail -1 | cut -c1-160)"; fi
 fi
 rc=0; while :; do wait $L1; r=$?; kill -0 $L1 2>/dev/null || { rc=$r; break; }; done

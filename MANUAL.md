@@ -367,7 +367,7 @@ Wi-Fi를 끄고 5G로 붙인다(인증서가 자체 서명이라 경고를 한 �
 
 | 묶음 | 주요 키 (현재 값) | 뜻 | 바꾼 뒤 |
 |---|---|---|---|
-| 이미지 · 빌드 | `AERIAL_IMAGE`, `OAI_IMAGE`, `BUILD_DIR`(`build.aarch64_f1002`), `L1_CONFIG`(`dgist`), `BUILD_CPUS`, `OAI_CPUSET` | 컨테이너 이미지, L1 빌드 디렉터리와 설정 이름, 빌드 · gNB가 쓰는 CPU 코어 | 설치할 때 정하는 값 (평소에는 그대로) |
+| 이미지 · 빌드 | `AERIAL_IMAGE`, `OAI_IMAGE`, `BUILD_DIR`(`build.aarch64_f1002`), `L1_TOOLCHAIN`(`grace-cross`), `L1_CONFIG`(`dgist`), `BUILD_CPUS`, `OAI_CPUSET` | 컨테이너 이미지, L1 빌드 디렉터리 · 툴체인과 설정 이름, 빌드 · gNB가 쓰는 CPU 코어 | 설치할 때 정하는 값 (평소에는 그대로) |
 | 모드 | `DEMO_MODE`(`ours`), `BASELINE_L1_CONFIG`(`dgist_base`), `BASELINE_YOLO_SM`(`auto`) | Ours / Baseline 선택, Baseline L1의 설정 이름(`config/cuphycontroller_<이름>.yaml`), Baseline YOLO의 SM 수(`auto` = 조각 전체) | `DEMO_MODE`는 손으로 고치지 말고 `./all.sh mode` |
 | 생성기 | `TRAFFIC_GEN`(`1`), `TRAFFIC_LOAD`(`low`), `TRAFFIC_GEN_TV_DIR`, `TRAFFIC_GEN_LOG_DIR` | 생성기 스위치, 시작할 때의 부하 단계, 테스트 벡터와 전체 로그 위치(기본 `./tgen/testVectors`, `./tgen/log`. 패키지 기준 상대 경로나 절대 경로) | 스위치는 `./tgen.sh on\|off` 뒤 L1 + gNB 재시작. 부하는 `./tgen.sh load` |
 | L1 · dApp (Ours) | `DAPP_PUSCH_PROFILES`(`16,24,32,40,56`), `DAPP_PDSCH_PROFILES`(`24,40`) | sizer가 슬롯마다 고를 수 있는 PUSCH / PDSCH SM 후보. 생성기를 켠 6셀 실행에서는 PUSCH 후보가 시작 스크립트의 10단계(16~104)로 바뀐다 | L1 + gNB 재시작 |

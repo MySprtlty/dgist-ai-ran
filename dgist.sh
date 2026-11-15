@@ -20,7 +20,8 @@
 #   tgen on|off|load <level>|status  5-cell traffic generator (RU emulator + testMAC in dgist-l1), load low|mid|high|auto at run time = ./tgen.sh
 #   all up|down|status               everything in order                                                 = ./all.sh
 #   logs <target>                    readable live logs                                                  = ./logs.sh
-#   build-l1 [ninja targets]         incremental build of ./aerial-cuda-accelerated-ran/$BUILD_DIR in a throwaway Aerial container (FULL=1 reconfigures)
+#   build-l1 [ninja targets]         incremental build of ./aerial-cuda-accelerated-ran/$BUILD_DIR in a throwaway Aerial container (a build directory
+#                                    that is not configured yet is configured first, toolchain .env L1_TOOLCHAIN; FULL=1 reconfigures)
 #   build-oai                        rebuild $OAI_IMAGE from ./openairinterface5g
 # settings: .env | env: NO_CORE=1 (skip the Open5GS check), ALL_CPUS=1 (builds on every core)
 # modes (.env DEMO_MODE, 2026-11-12): ours = this L1 on the whole GPU (default) | baseline = the same L1 build with every dApp feature off on MIG 4g + a naive
@@ -220,8 +221,9 @@ ue-table|rntis) python3 $D/ue_table.py ;;
 build-l1)
   shift; CPUS=$BUILD_CPUS; [ "${ALL_CPUS:-0}" = 1 ] && CPUS=0-$(( $(nproc --all) - 1 ))
   echo "== L1 build in a throwaway $AERIAL_IMAGE container (cores $CPUS${FULL:+, FULL=1 reconfigure}) $(date +%T)"
-  docker run --rm --cpuset-cpus $CPUS -e BUILD_DIR=$BUILD_DIR -e FULL=${FULL:-0} -e JOBS=${JOBS:-} -v $T:/opt/nvidia/cuBB -v $D/scripts:/opt/dgist/scripts:ro -w /opt/nvidia/cuBB -u root $AERIAL_IMAGE bash /opt/dgist/scripts/build_l1.sh "$@" 2>&1 | tee $OUT/build_l1_$(date +%m%d_%H%M).log | tail -15
+  docker run --rm --cpuset-cpus $CPUS -e BUILD_DIR=$BUILD_DIR -e TOOLCHAIN=${L1_TOOLCHAIN:-grace-cross} -e FULL=${FULL:-0} -e JOBS=${JOBS:-} -v $T:/opt/nvidia/cuBB -v $D/scripts:/opt/dgist/scripts:ro -w /opt/nvidia/cuBB -u root $AERIAL_IMAGE bash /opt/dgist/scripts/build_l1.sh "$@" 2>&1 | tee $OUT/build_l1_$(date +%m%d_%H%M).log | tail -15; rc=${PIPESTATUS[0]}
+  [ $rc = 0 ] || { echo "!! L1 build failed (exit $rc) - the whole output: $(ls -t $OUT/build_l1_*.log | head -1)"; exit $rc; }
   ;;
 build-oai) [ "${ALL_CPUS:-0}" = 1 ] && export BUILD_CPUS=0-$(( $(nproc --all) - 1 )); bash $D/scripts/build_oai_image.sh ;;
-*) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

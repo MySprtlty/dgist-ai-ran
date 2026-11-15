@@ -4,7 +4,7 @@
 #   start | stop [--force] | restart | status | logs    (stop refuses while the gNB runs: the OAI E2 agent aborts the gNB when its RIC disappears)
 #   install-sm    copy the service-model libraries of our build into $FLEXRIC_SM_DIR (the gNB container mounts that directory
 #                 as /usr/local/lib/flexric, the RIC and the xApps load it with -p: all three must use the same build)
-#   build         (re)build FlexRIC: cmake + ninja into $FLEXRIC_BUILD on the housekeeping cores (about 10 min)
+#   build         (re)build FlexRIC: cmake + ninja into $FLEXRIC_BUILD on the housekeeping cores (about 1 min on 11 cores)
 # settings: .env FLEXRIC_BUILD, FLEXRIC_SM_DIR, RIC_IP | config/flexric.conf | logs: runs/ric/
 set -u
 [ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }

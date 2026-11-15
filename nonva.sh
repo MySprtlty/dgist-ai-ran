@@ -1,5 +1,5 @@
 #!/bin/bash
-# nonva.sh - the non-VA (live video streaming) service of the hsw setup, run from /home/nvidia/_dgist (nvidia account, no sudo)
+# nonva.sh - the non-VA (live video streaming) service of the hsw setup, run from this directory by the account that owns it (no sudo)
 #   The second phone opens https://10.45.0.1:8001/ and uploads 720p camera frames at 20 fps (JPEG 0.80); the server keeps the latest
 #   frame per UE and relays it as MJPEG to https://10.45.0.1:8001/viewer/<ue1|ue2> (any browser on the host or a UE). No inference.
 #   Per-frame UL latency -> CSV at Stop; telemetry "nonva" (/tmp/oai-service-telemetry/nonva_ue*.json) for the hsw PPO xApp.
@@ -10,7 +10,7 @@
 #   make-frame            (re)create the 1280x720 q80 test JPEG from the Aerial tree's 4K images
 # settings: .env NONVA_* | logs: runs/nonva_service/ (uvicorn) and runs/nonva_service_log/ (per-session CSV)
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
 V=$D/nonva_service; VENV=$D/va_service/yolo_env; R=$D/runs/nonva_service; PIDF=$R/uvicorn.pid

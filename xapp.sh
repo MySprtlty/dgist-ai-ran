@@ -17,9 +17,9 @@
 #                                text log ./log/moni_log/; no sub-command = foreground (Ctrl-C). Runs beside the PPO xApp (both are RIC clients)
 # settings: .env PPO_BUNDLE_NAME, PPO_GPU_SOURCE (19-input bundle), PPO_DAPP, PPO_MIN_PRBS, FLEXRIC_BUILD, FLEXRIC_SM_DIR | logs: runs/xapp/
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
-set -a; . $D/.env; set +a
+set -a; . $D/.env; set +a; . $D/scripts/paths.sh
 B=$D/openairinterface5g/openair2/E2AP/flexric/${FLEXRIC_BUILD:-build_dgist}
 X=$B/examples/xApp/c/slice/xapp_slice_ppo_ctrl; MONI=$B/examples/xApp/c/kpm_rc/xapp_ul_input_moni
 SM=${FLEXRIC_SM_DIR:-$D/flexric_sm}; CONF=$D/config/flexric_xapp.conf

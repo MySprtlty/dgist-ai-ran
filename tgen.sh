@@ -1,19 +1,19 @@
 #!/bin/bash
-# tgen.sh - 5-cell traffic generator of the demo (run as nvidia from /home/nvidia/_dgist), both modes (Ours / Baseline)
+# tgen.sh - 5-cell traffic generator of the demo (run from this directory by the account that owns it), both modes (Ours / Baseline)
 #   The l1 container then also runs the RU emulator + testMAC: 5 emulator cells (L1 cells 0-4, NIC loop aerial02 <-> aerial03) next to the
 #   phones' Benetel cell (L1 cell 5). The 5 cells carry test-vector traffic; only their UPLINK (PUSCH) load changes with the level.
 #   on | off                 .env TRAFFIC_GEN=1|0 - takes effect at the next ./all.sh up (the L1 has to start with 6 cells or with 1)
 #   load low|mid|high|auto   switch the load of the 5 cells WHILE they run (no restart): low = 1, mid = 2, high = 4 UEs per cell and uplink slot;
 #                            auto = a new level every 3 s (1 -> 2 -> 4 -> 3 UEs). Both tools change at the same frame, about 0.3 s later.
 #   status                   switch, processes, load level, the 5 cells' traffic, RU-emulator on-time figures, log size
-#   .env: TRAFFIC_GEN, TRAFFIC_LOAD (level at start), TRAFFIC_GEN_TV_DIR, TRAFFIC_GEN_LOG_DIR (full logs: several GB per hour, kept off the root disk)
+#   .env: TRAFFIC_GEN, TRAFFIC_LOAD (level at start), TRAFFIC_GEN_TV_DIR, TRAFFIC_GEN_LOG_DIR (full logs: several GB per hour; default ./tgen/log - ./tgen may be a link to a big disk)
 # Logs: ./logs.sh tgen | ru | testmac ; files runs/<run>/ru_console.log, testmac_console.log, tglog/ (full nvlog files)
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo)"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo)"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
-set -a; . $D/.env; set +a
+set -a; . $D/.env; set +a; . $D/scripts/paths.sh
 L1C=dgist-l1; RUN=$D/runs/$(cat $D/runs/current_run 2>/dev/null || echo manual)
-TGLOG=${TRAFFIC_GEN_LOG_DIR:-/data/dgist_tgen/log}
+TGLOG=$TRAFFIC_GEN_LOG_DIR
 c_up() { [ "$(docker inspect -f '{{.State.Running}}' $1 2>/dev/null)" = true ]; }
 live() { c_up $L1C && docker inspect -f '{{join .Config.Cmd " "}}' $L1C 2>/dev/null | grep -q l1_entrypoint_tg; }   # this L1 container was started with the generator
 procs() { local p; p=$(ps -eo args= | grep -oE '/(ru_emulator|test_mac) ' | tr -d '/ ' | sort -u | tr '\n' ' '); echo "${p:-none}"; }

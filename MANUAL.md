@@ -1,507 +1,468 @@
-# `_dgist` 운용 매뉴얼 (2026-11-13 정리)
+# DGIST AI-RAN 운용 매뉴얼 (2026-11-15 개정, 브랜치 `demo`)
 
-이 문서 하나로 세 가지를 한다.
+5G 기지국의 신호 처리(L1)와 영상 분석 AI(YOLO)를 **GPU 한 장**에서 함께 돌리는 DGIST AI-RAN 데모 스택의 운용 설명서다.
+실제 무선 장치(Benetel RU) 1셀에 전화기 4대를 붙여 쓰고, 같은 스택을 두 방식(**Ours** / **Baseline**)으로 띄워 비교한다.
+새 서버에 설치하는 방법은 `SETUP.md`에 있다.
 
-| 하고 싶은 일 | 장 |
+| 절 | 내용 |
 |---|---|
-| **Ours ↔ Baseline 전환** (+ 5셀 트래픽 생성기 켜고 끄기, 부하 단계) | 2장 |
-| **구성요소 켜고 끄기** (한 번에 / 모듈별, 순서, 전화기 4대) | 3장 |
-| **모니터링** (상태 명령, 로그, 기지국 뷰어·녹화) 과 **실험 대시보드** (측정 · Replay) | 4장, 5장 |
+| 0 | 기본 규칙 |
+| 1 | Baseline과 Ours 환경 소개 |
+| 2 | 모드 전환 (Ours ↔ Baseline) |
+| 3 | 대시보드와 기지국 뷰어 |
+| 4 | 모듈별 소개와 On / Off / Restart 명령 |
+| 5 | 설정 파일 `.env` |
+| 6 | 로그 보는 명령 |
+| 부록 | A 문제 해결 · B 관련 문서 |
 
-급하면 1장만 보면 된다. 실험 한 번의 전체 흐름은 6장, 막혔을 때는 9장.
+**용어**
 
-용어: **SM** = GPU 안의 연산 블록(스트리밍 멀티프로세서; 이 GH200은 132개). **MIG** = GPU를 고정 크기 조각(인스턴스)으로 나누는 NVIDIA 기능.
-**L1** = 기지국의 물리 계층 프로그램(`cuphycontroller`, GPU 사용). **gNB** = 그 위의 기지국 프로그램(OAI). **dApp** = L1 안에서 YOLO 추론을 돌리는 우리 모듈.
-**RIC / xApp** = 기지국을 밖에서 제어하는 서버 / 그 위의 제어 프로그램(여기서는 UE별 상향 자원(PRB)을 나누는 PPO xApp). **RNTI** = 기지국이 접속한 전화기에 붙이는 임시 번호.
-**VA** = 영상 분석 서비스(전화기 프레임 → YOLO), **non-VA** = 추론 없는 라이브 스트리밍 서비스.
+| 용어 | 뜻 |
+|---|---|
+| SM | GPU 안의 연산 묶음(Streaming Multiprocessor). 이 서버의 GPU는 132개다. "누가 몇 SM을 쓰는가"가 이 데모의 주제다 |
+| MIG | GPU를 고정 크기 조각으로 나누는 NVIDIA 기능. 여기서는 4g.48gb(64 SM)와 3g.48gb(60 SM) 두 조각을 만든다 |
+| L1 | 5G 물리 계층. NVIDIA Aerial의 `cuphycontroller`가 GPU로 상향(PUSCH) · 하향(PDSCH) 신호를 처리한다. 한 슬롯은 0.5 ms |
+| gNB | 기지국의 상위 계층(OAI). 누구에게 무선 자원(PRB)을 줄지 정하고, 그 내용을 슬롯마다 FAPI 메시지로 L1에 알린다 |
+| dApp | L1 프로세스 안에 넣은 우리 코드. SM 배분, YOLO 실행, 요청 접수(agent, TCP 9810)를 맡는다 |
+| RIC / xApp | 기지국을 밖에서 제어하는 틀(FlexRIC nearRT-RIC)과 그 위에서 도는 제어 프로그램 |
+| VA / non-VA | VA = 전화기가 FHD 영상을 올리면 YOLO 결과를 돌려주는 영상 분석 서비스(기한 200 ms). non-VA = 추론 없이 720p 영상만 올리는 서비스(기한 250 ms) |
+| RNTI | 기지국이 접속한 전화기에 붙이는 임시 번호. 다시 접속하면 바뀐다 |
 
 ## 0. 기본 규칙
 
-- 모든 명령은 **nvidia 계정으로 `/home/nvidia/_dgist`에서** 실행한다. 다른 계정에서는 `sudo -n -u nvidia -H bash -c 'cd /home/nvidia/_dgist && ./all.sh status'` 꼴로 부른다.
-- **root로 실행하지 않는다**(`sudo ./all.sh`, `sudo ./ric.sh` 금지). 프로세스와 파일이 root 소유가 되어 nvidia 계정의 스크립트가 멈출 수 없고(`all.sh down`이 RIC · 모니터를 못 내린다), 다음 `up`이 "이미 떠 있음"으로 건너뛴다. 스크립트가 root면 거부한다.
-- 예외는 둘뿐이다: **코어**(`core.sh`가 안에서 sudo를 부른다 → nvidia 비밀번호)와 **MIG 전환**(`scripts/mig.sh`, root 필요. nvidia 계정에는 이 권한이 없으므로 sudo가 되는 계정(troy)에서 실행).
-- 설정은 전부 `.env` 한 파일이다(8장).
-- **순서**: RIC는 gNB보다 먼저 켜고, gNB가 도는 동안 RIC를 내리거나 재시작하지 않는다(gNB가 죽는다). 코어는 보통 켜 둔 채로 둔다. `all.sh`가 이 순서를 지킨다.
-- GPU는 한 장을 같이 쓴다. 켜기 전에 `nvidia-smi`로 다른 사람의 프로세스가 없는지 본다. 연구실 스택(`nv-cubb`, `oai-gnb*` 컨테이너)과는 동시에 못 돈다(`./dgist.sh check`가 막는다).
+- 모든 명령은 **패키지 디렉터리**(이 저장소를 클론한 곳, 아래에서 `<패키지>`)에서 **그 디렉터리를 가진 계정**으로 실행한다. root나 sudo로 스크립트를 실행하면 거부한다.
+  다른 계정에서는 `sudo -n -u <계정> -H bash -c 'cd <패키지> && ./all.sh status'`처럼 쓴다.
+- 패키지 밖의 경로는 쓰지 않는다. `.env`의 경로 값은 패키지 기준 상대 경로이고(`scripts/paths.sh`가 절대 경로로 바꾼다), 주소 예시의 `<서버 IP>`는 이 서버의 유선망 주소다.
+- sudo가 필요한 것은 둘뿐이다: 5G 코어(`core.sh`가 안에서 sudo를 부른다)와 MIG 전환(`scripts/mig.sh`, sudo가 있는 계정으로 실행).
+- 설정은 `.env` 한 파일에 있다(5절).
+- **RIC가 gNB보다 먼저** 떠 있어야 한다. gNB가 도는 동안 RIC를 끄거나 재시작하지 않는다(gNB가 같이 죽는다).
+- GPU는 여러 사람이 같이 쓴다. 켜기 전에 `nvidia-smi`로 다른 작업이 없는지 본다. 연구실 스택(`nv-cubb`, `oai-gnb*` 컨테이너)과는 동시에 돌 수 없다(`./dgist.sh check`가 막는다).
+- 실험 이름은 매번 새로 짓는다. 로그가 `runs/<이름>/`에 쌓이므로 같은 이름을 다시 쓰면 이전 실험의 로그와 섞인다.
 
-## 1. 한 장 요약
+## 1. 환경 소개: Baseline과 Ours
 
-```bash
-cd /home/nvidia/_dgist                 # nvidia 계정
+### 1.1 무엇이 어디서 도는가 (두 모드 공통)
 
-# 지금 상태
-./all.sh status                        # 모드, 생성기, 코어, L1/gNB, VA/non-VA, RIC/xApp, UE 표
-./all.sh mode                          # 모드와 MIG 상태 한 줄
-./tgen.sh status                       # 5셀 트래픽 생성기 스위치와 부하 단계
-
-# 켜기 / 끄기
-./all.sh up <이름> --xapp              # Ours: 코어 → RIC → L1+gNB → VA → non-VA → (전화기 4대가 붙어 있으면) PPO xApp
-./all.sh up <이름>                     # Baseline: xApp 없음 (--xapp은 무시된다)
-./all.sh down                          # 전부 끄기 (코어는 둔다; 코어까지는 --core)
-
-# 모드 전환 (스택을 내린 뒤)
-./all.sh mode baseline                 # 또는 ours  → .env DEMO_MODE
-sudo -n /home/nvidia/_dgist/scripts/mig.sh on      # [troy 계정] Baseline = on, Ours = off
-
-# 트래픽 생성기
-./tgen.sh on | off                     # 다음 ./all.sh up 부터 적용 (L1이 6셀 또는 1셀로 시작)
-./tgen.sh load low|mid|high|auto       # 도는 중에 바로 바뀜
-
-# 보기
-./logs.sh all                          # gNB 사건 + xApp 결정 + L1 한 줄 (Ctrl-C로 나옴)
-./dash.sh start                        # 대시보드  http://10.150.21.161:8010/  (PC 브라우저)
-#   기지국 뷰어  https://10.150.21.161:8000/viewer   전화기: VA https://10.45.0.1:8000/  non-VA https://10.45.0.1:8001/
+```
+전화기 4대 (VA 2 + non-VA 2) ──5G──> Benetel RU ──프런트홀──> L1 [GPU] <──FAPI──> gNB <──> 5G 코어 <──> VA / non-VA 서비스
+VA 서비스 ──YOLO 요청 (TCP 9810)──> Ours: L1 안의 dApp   |   Baseline: YOLO 서버 (dgist-yolo)
+gNB <──E2──> nearRT-RIC <──> PPO 슬라이싱 xApp (Ours)
 ```
 
-## 2. 모드 전환: Ours ↔ Baseline
-
-### 2.1 두 모드의 차이
-
-| | Ours (`DEMO_MODE=ours`) | Baseline (`DEMO_MODE=baseline`) |
+| 구성 요소 | 실체 | 주소 · 비고 |
 |---|---|---|
-| GPU | 전체 132 SM, MIG 꺼짐 | MIG 인스턴스 둘: 4g.48gb(L1용, 64 SM) + 3g.48gb(YOLO용, 60 SM) |
-| L1 | 우리 빌드(`build.aarch64_f1002`): 녹색 컨텍스트(GPU 일부 SM만 쓰는 CUDA 컨텍스트), FAPI를 보고 YOLO에 SM을 내주는 스케줄러, xApp 에이전트 | 연구실 바닐라 cuBB 25-3(`BASELINE_TREE`, 읽기 전용) → MIG 4g. 생성기를 켜면 우리 빌드에서 dApp 기능을 모두 끈 것(2.5절) |
-| YOLO | L1 프로세스 안, 슬롯마다 24~88 SM(`.env DAPP_TENANT_CLASSES_FHD`; 전화기가 붙어 있으면 실제로는 80까지, 부록 B), QoS 거절 · 그래프 분할, 다섯 모델(26n~26x)을 모두 올려 두고 요청이 지정한 모델로 실행 | 별도 컨테이너 `dgist-yolo` → MIG 3g, 60 SM 고정, 도착 순서대로 실행(QoS 거절 · 분할 없음), 모델은 `VA_MODEL` 하나(`VA_MODEL_SELECT=1`이면 MIG 엔진이 있는 규칙 모델도 올린다, 3.7절) |
-| xApp | PPO 슬라이싱(`--xapp`) | 없음(RIC는 gNB 때문에 그대로 뜬다) |
-| gNB, 코어, VA / non-VA 서비스, 뷰어, 대시보드, 로그 | 같음 | 같음 |
+| 무선 장치 (RU) | Benetel RU, 실제 전파 1셀 | 프런트홀 NIC `aerial00`, RU 10.10.0.100, PTP 동기 |
+| L1 | 컨테이너 `dgist-l1` (`cuphycontroller`) | GPU 사용. Ours에서는 YOLO도 이 프로세스 안에서 돈다 |
+| YOLO 서버 (Baseline만) | 컨테이너 `dgist-yolo` | MIG 3g 조각에서 돈다 |
+| gNB | 컨테이너 `dgist-gnb` (OAI, 연구실 수정판: 서비스별 PRB 할당 + E2 agent) | 설정 `config/gnb.conf` |
+| 5G 코어 | Open5GS, 호스트의 systemd 서비스 | 전화기 망 10.45.0.0/16 (서버 쪽 주소 10.45.0.1), 가입자 관리 WebUI :9999 |
+| nearRT-RIC | FlexRIC, 호스트 프로세스 | 127.0.0.2 |
+| PPO 슬라이싱 xApp (Ours만) | 호스트 프로세스 | VA / non-VA 서비스의 상향 PRB 몫을 조절한다 |
+| VA 서비스 | 호스트 프로세스 | 전화기 `https://10.45.0.1:8000/`, 기지국 뷰어(PC) `https://<서버 IP>:8000/viewer` |
+| non-VA 서비스 | 호스트 프로세스 | 전화기 `https://10.45.0.1:8001/` |
+| 5셀 트래픽 생성기 (선택) | L1 컨테이너 안의 RU 에뮬레이터 + testMAC | 가상 셀 5개로 L1에 부하를 준다(1.3절) |
+| 대시보드 | 호스트 프로세스 | `http://<서버 IP>:8010/`, `https://<서버 IP>:8012/` (3절) |
 
-### 2.2 Ours → Baseline
+### 1.2 Ours와 Baseline의 차이
 
-```bash
-./all.sh down                                       # xApp, VA/non-VA, gNB, L1 내림 (코어 유지)
-./all.sh mode baseline                              # .env DEMO_MODE=baseline. MIG 명령을 안내해 준다
-sudo -n /home/nvidia/_dgist/scripts/mig.sh on       # [troy 계정] MIG 켜고 4g+3g 생성, runs/mig.env 에 UUID 기록
-./all.sh mode                                       # 확인: "mode: baseline | MIG: Enabled 2 instance(s)"
-./all.sh up <이름>                                   # L1(4g) + YOLO 서버(3g) + gNB + VA + non-VA
-```
+| | **Ours** (`DEMO_MODE=ours`) | **Baseline** (`DEMO_MODE=baseline`) |
+|---|---|---|
+| GPU | 132 SM 전체를 한 덩어리로 쓴다. MIG 꺼짐 | MIG로 고정 분할: 4g(64 SM) = L1, 3g(60 SM) = YOLO. 나머지 8 SM은 쓰지 않는다 |
+| L1 | 우리 빌드(`build.aarch64_f1002`). 슬롯마다 L1에 필요한 SM 수를 계산해 그만큼만 쓴다 | **같은 우리 빌드**에서 dApp 기능을 모두 끈 것: MPS와 고정 `mps_sm_*` 분할(연구실 Benetel 기준 설정값), green context · 훅 · 테넌트 없음(`config/cuphycontroller_dgist_base.yaml`). SM 수 고정 |
+| YOLO | L1 프로세스 안에서, L1이 쓰지 않는 SM으로 돈다. 추론 한 번마다 SM 등급 하나(24~88)를 고른다 | 별도 컨테이너의 단순 서버. 항상 60 SM, 도착 순서대로 하나씩 |
+| 요청 처리 | 기한을 지킬 수 없는 요청은 거절하고, 추론을 조각으로 나눠 L1 차례가 오면 조각 사이에서 멈춘다 | 거절 · 분할 없음 |
+| 모델 | 26n ~ 26x 다섯 개가 모두 올라가 있다 | MIG용 엔진을 빌드해 둔 모델만. 없는 모델의 요청은 `VA_MODEL`로 돈다 |
+| PUSCH 결과 순서 보장 | 켜짐 | 꺼짐 |
+| xApp | PPO 슬라이싱 xApp (`./all.sh up … --xapp`) | 없음 (RIC는 gNB 때문에 켜 둔다) |
+| gNB, 코어, VA / non-VA 서비스, 뷰어, 대시보드 | 같음 | 같음 |
 
-### 2.3 Baseline → Ours
+Ours가 GPU를 나누는 방법을 차례로 적으면:
 
-```bash
-./all.sh down
-./all.sh mode ours                                  # .env DEMO_MODE=ours
-sudo -n /home/nvidia/_dgist/scripts/mig.sh off      # [troy 계정] 인스턴스 삭제, MIG 끔
-./all.sh mode                                       # 확인: "mode: ours | MIG: Disabled 0 instance(s)"
-./all.sh up <이름> --xapp                            # 우리 L1 + gNB + VA + non-VA (+ 전화기 4대가 붙어 있으면 PPO xApp)
-```
+1. **슬롯마다 L1 몫 정하기 (sizer)**: gNB가 보내는 FAPI 메시지에는 다음 슬롯의 작업량이 들어 있다. 이것을 보고 PUSCH · PDSCH 처리에 줄 SM 수를
+   미리 정해 둔 후보(`DAPP_PUSCH_PROFILES`, `DAPP_PDSCH_PROFILES`) 가운데서 고른다.
+2. **남는 SM으로 YOLO 돌리기 (tenant)**: 추론을 시작할 때 그 시점에 남는 SM에 맞는 등급을 고른다. 등급 88은 엔진은 있지만 실제 상향 트래픽이 있는
+   실행에서는 선택된 적이 없어 실질 최대는 80이다.
+3. **요청 접수 (agent, TCP 9810)**: VA 서비스와 가상 카메라가 프레임을 보내는 창구다. 기한(`VA_DEADLINE_MS`) 검사와 추론 분할이 여기서 이뤄진다.
+4. **PUSCH 결과 순서 보장 (in-order gate, 2026-11-14)**: PUSCH 결과가 상향 슬롯 순서대로 gNB에 가도록 L1이 잠깐(최대 3000 µs) 잡아 둔다. YOLO와 같이 돌 때
+   이웃한 두 슬롯의 결과가 뒤바뀌면 gNB가 재전송 정보를 버려 재전송이 연쇄로 늘어나던 문제를 막는다.
+5. **sizer의 YOLO 항 (2026-11-14)**: YOLO 요청이 들어와 있는 동안에는 지정한 슬롯의 PUSCH 계획에 여유 시간을 더 잡는다(`DAPP_SIZER_YOLO_US`, 현재 프레임 안
+   7 · 8 · 17 · 18번 슬롯에 120 µs). YOLO가 옆 SM에서 돌면 PUSCH가 조금 늦게 끝나는 것을 계획에 반영한 것이다.
+6. **요청마다 모델 고르기 (VA 서비스의 규칙)**: `VA_MODEL_SELECT=1`이면 VA 서비스가 `VA_MODEL_WEIGHTS` 비율로 모델을 섞는다
+   (현재 26n : 26s : 26m : 26l : 26x = 10 : 10 : 60 : 10 : 10). Baseline에서도 같은 규칙이 돌지만 엔진이 있는 모델만 실제로 쓰인다.
 
-`--xapp`은 그 순간 전화기 4대가 붙어 있어야 시작된다. "RNTI mapping not possible"이 나오면 전화기가 붙은 뒤에 `./xapp.sh start && ./xapp.sh moni start`.
+> **슬롯 단위 SM 전환**(추론 하나의 조각마다 SM 등급을 바꾸는 방식)은 이 브랜치(`demo`)에 없다. 그 코드와 설정은 브랜치 `demo-slot-level`에 있다(`demo` + 슬롯 단위 전환).
+> 이 매뉴얼의 절차는 모두 "추론 한 번에 등급 하나" 기준이다.
 
-### 2.4 전환이 됐는지 확인
+### 1.3 5셀 트래픽 생성기 (두 모드 공통, 선택)
 
-- `./all.sh status` 첫 줄 `mode : …`, `./dgist.sh status` 첫 줄(Baseline이면 MIG UUID와 컨테이너 `dgist-l1`, `dgist-yolo`, `dgist-gnb`).
-- 기지국 뷰어 칸 아래 줄: "26x · 60 SM" = Baseline, "· 80 SM" = Ours.
-- 대시보드는 `.env DEMO_MODE`를 2초마다 읽어 화면이 따라 바뀐다.
+RU 에뮬레이터와 testMAC(가짜 무선 장치와 가짜 상위 계층)이 **같은 L1 안에서** 가상 셀 5개(L1 셀 0~4)를 돌려 GPU에 5G 부하를 만든다.
+전화기 셀은 그대로 Benetel RU이고 L1 셀 번호만 0 → 5로 바뀐다(모두 6셀). 부하 단계에 따라 바뀌는 것은 5셀의 **상향(PUSCH)** 뿐이다.
+가상 셀의 테스트 벡터(187개 파일, 0.85 GB)는 git에 없고 `scripts/fetch_testvectors.sh`가 `tgen/testVectors/`에 설치한다(`SETUP.md`).
 
-### 2.5 5셀 트래픽 생성기 (두 모드 공통)
-
-RU 에뮬레이터와 testMAC(가짜 무선 장치와 가짜 상위 계층)이 **같은 L1 안에서** 셀 5개(L1 셀 0~4)를 돌려 GPU에 5G 부하를 만든다.
-전화기 4대의 셀은 그대로 Benetel RU이고 L1 셀 번호만 0 → 5로 바뀐다(모두 6셀). 부하 단계에 따라 바뀌는 것은 5셀의 **상향(PUSCH)** 뿐이다.
-
-```bash
-./tgen.sh status                     # 스위치, 실행 여부, 부하 단계, 5셀 DL/UL 합, RU 정시율, 로그 크기
-./tgen.sh on | off                   # .env TRAFFIC_GEN=1|0 → 반영: ./all.sh down && ./all.sh up <이름>  (L1·gNB 재시작, 전화기 재접속)
-./tgen.sh load low|mid|high|auto     # 실행 중에 바로 반영(약 0.3초, 재시작 없음). 시작할 때의 단계는 .env TRAFFIC_LOAD
-./logs.sh tgen | ru | testmac        # 5셀의 초당 DL/UL 줄 + 단계 전환 기록 | RU 에뮬레이터 | testMAC
-```
-
-| 단계 | 셀 · UL 슬롯당 PUSCH UE 수 | 5셀 UL 합 (측정) |
+| 단계 | 가상 셀 · 상향 슬롯당 PUSCH UE 수 | 5셀 상향 합 (측정) |
 |---|---|---|
 | `low` | 1 | 245 Mbps |
 | `mid` | 2 | 494 Mbps |
 | `high` | 4 | 979 Mbps |
 | `auto` | 3초마다 1 → 2 → 4 → 3 | 3 UE일 때 741 Mbps |
 
-5셀 DL 합은 단계와 무관하게 약 6.6~6.7 Gbps다(측정). 켜고 끄는 것은 재시작이 필요하고, 부하 단계만 실행 중에 바뀐다.
+5셀 하향 합은 단계와 무관하게 약 6.6~6.7 Gbps다(측정). 모드와 생성기 스위치로 네 가지 구성이 나온다:
 
-**네 가지 구성**
+| 구성 | L1 |
+|---|---|
+| Ours, 전화기 셀만 | 우리 빌드, 1셀 |
+| Ours + 생성기 | 우리 빌드, 6셀. YOLO가 받는 SM 수가 부하에 따라 달라진다 |
+| Baseline, 전화기 셀만 | 우리 빌드에서 dApp 기능을 모두 끈 것, 1셀, MIG 4g (`config/cuphycontroller_dgist_base.yaml`) |
+| Baseline + 생성기 | 우리 빌드에서 dApp 기능을 모두 끈 것, 6셀, MIG 4g (`config/tgen/cuphycontroller_dgist_tgbase.yaml`) |
 
-| 구성 | 만드는 법 (스택을 내린 뒤) | L1 |
-|---|---|---|
-| Ours, 전화기 셀만 | `mode ours` + `tgen off` | 우리 빌드, 1셀 |
-| Ours + 생성기 | `mode ours` + `tgen on` | 우리 빌드, 6셀. YOLO SM 수가 부하에 따라 바뀜 |
-| Baseline, 전화기 셀만 | `mode baseline` + `tgen off` | 연구실 바닐라 빌드, 1셀, MIG 4g |
-| Baseline + 생성기 | `mode baseline` + `tgen on` | **우리 빌드에서 dApp 기능을 모두 끈 것**, 6셀, MIG 4g (바닐라 빌드에는 Benetel 셀과 에뮬레이터 셀을 한 L1에 올리는 수정이 없다) |
+> Baseline의 L1은 네 구성 모두 Ours와 **같은 바이너리**다(2026-11-15부터. 그 전의 "Baseline, 전화기 셀만"은 연구실의 순정 cuBB 25-3 빌드였다).
+> "Baseline, 전화기 셀만"을 이 바이너리로 실행한 측정은 아직 없다(설정 파일과 시작 스크립트의 정적 검사만 했다). 처음 켤 때 `runs/<이름>/entrypoint.log`와 `./dgist.sh status`를 확인한다.
 
-예: Baseline, 고부하로 시작
+### 1.4 이전 판(2026-11-13)과 달라진 것
 
-```bash
-./all.sh down && ./all.sh mode baseline
-sudo -n /home/nvidia/_dgist/scripts/mig.sh on       # [troy 계정]
-./tgen.sh on
-./all.sh up base_high
-./tgen.sh load high                                 # 또는 .env TRAFFIC_LOAD=high 로 두고 시작
-```
+- L1 (Ours): PUSCH 결과 순서 보장(in-order gate)과 sizer의 YOLO 항이 들어갔다(1.2절 4 · 5번, 설정은 5절).
+- VA 서비스: 규칙 기반 모델 선택이 켜진 상태가 기본이다(10 : 10 : 60 : 10 : 10).
+- 대시보드: 읽기 전용 6개 탭 → 9개 탭. HTTPS 주소(:8012), "뷰어 화면" · "컴포넌트 제어" · "데모 영상" 탭, Capture(MP4 내려받기), Non-VA QoS(250 ms)가 추가됐다(3절).
+- 값 정정: non-VA 전송은 15 fps, MIG 4g 조각은 64 SM.
+- 자급자족(2026-11-15): 연구실 트리(`BASELINE_TREE`)와 호스트 고정 경로(`/home/…`, `/data/…`)를 쓰지 않는다. Baseline L1은 모든 구성에서 우리 빌드이고,
+  생성기의 테스트 벡터와 전체 로그는 패키지의 `tgen/` 아래에 둔다.
 
-### 2.6 전환할 때 주의
+## 2. 모드 전환
 
-- 스택이 떠 있으면 `mode`가 거부한다. GPU에 프로세스가 하나라도 있으면 `mig.sh on`도 `off`도 거부한다(다른 사람의 프로세스도 포함: 먼저 `nvidia-smi`).
-- `mig.sh`는 GPU 전체를 바꾼다: 호스트의 MPS 데몬을 모두 끄고, 모드가 바로 안 바뀌면 GPU를 리셋한다. 다른 사람이 GPU를 쓰는 시간에는 실행하지 않는다.
-- Baseline의 YOLO 엔진은 MIG 3g 안에서 한 번 빌드해 둔다: `scripts/build_yolo_engines_mig.sh x`(MIG 켠 뒤, 10~15분). 26x용 `models/migfhd26x/seg00_sm60.engine`은 이미 있다. `VA_MODEL`을 바꾸면 그 모델 것을 빌드한다(없으면 `mode`와 `check`가 알려 준다). `VA_MODEL_SELECT=1`로 모델을 섞으려면 그 모델들 것도 빌드한다: `scripts/build_yolo_engines_mig.sh n s m l`(3.7절).
-- 생성기를 켠 실행은 전체 로그가 `/data/dgist_tgen/log/<이름>/`에 시간당 26~29 GB 쌓인다(측정). 시작 전 `df -h / /data`, 끝난 실행은 지워서 관리한다.
-- `./tgen.sh status`로 스위치를 확인하고 켠다. `.env TRAFFIC_GEN=1`이면 `./all.sh up`이 6셀로 뜬다.
-- 4g 인스턴스의 SM 수는 64다(2026-11-12 실측). `scripts/mig.sh`와 `docker-compose.baseline.yaml`의 주석, 슬롯 맵 렌더러의 기본 벽(`--wall 72`)에는 실측 전의 값 72가 남아 있다.
+지금 상태는 `./all.sh mode`가 한 줄로 알려 준다(예: `mode: ours | MIG: Disabled 0 instance(s)`).
+전환은 항상 **스택을 내린 뒤**에 한다. MIG 명령만 sudo로 실행한다(스택을 돌리는 계정에 비밀번호 없는 sudo가 없으면 `./all.sh mode`는 실행할 MIG 명령을 알려 주기만 한다. 그 명령을 sudo가 있는 계정에서 실행한다).
 
-더 보기: `docs/MODE_SWITCH.md`(모드별 L1 설정, 생성기의 GPU 메모리 · MTU 8192 이유 · 파일럿 결과).
-
-## 3. 구성요소 켜고 끄기
-
-### 3.1 한 번에
+**Ours → Baseline**
 
 ```bash
-./all.sh up <이름> [--xapp]     # 이미 떠 있는 것은 건너뛰고 꺼진 것만 올린다. 끝줄 "== all up" 또는 "== FAILED components: …"
-./all.sh down [--core]          # 끝줄 "== all down (core left running)" 또는 "== still running: …"
-./all.sh restart <이름>         # down + up
-./all.sh status
+./all.sh down                                      # xApp, 서비스, gNB, L1, RIC를 내린다 (코어는 그대로)
+./all.sh mode baseline                             # .env DEMO_MODE=baseline
+sudo <패키지>/scripts/mig.sh on                     # [sudo가 있는 계정] MIG를 켜고 4g + 3g 조각을 만든다
+./all.sh mode                                      # "mode: baseline | MIG: Enabled 2 instance(s)" 확인
+./all.sh up <이름>                                  # dApp을 끈 L1(4g) + 단순 YOLO 서버(3g) + gNB + VA + non-VA
 ```
 
-- 이름은 실행 로그 디렉터리 `runs/<이름>/`가 된다(생략하면 `all_<월일_시분>`).
-- 코어가 꺼져 있으면 `up`이 sudo 비밀번호를 묻는다.
-- L1이 준비될 때까지 gNB는 시작하지 않는다(최대 약 10분 기다림). 끝에 "running - a COTS UE can attach now"가 나오면 전화기를 붙인다.
+**Baseline → Ours**
 
-### 3.2 순서
+```bash
+./all.sh down
+./all.sh mode ours                                 # .env DEMO_MODE=ours
+sudo <패키지>/scripts/mig.sh off                    # [sudo가 있는 계정] 조각을 지우고 MIG를 끈다
+./all.sh mode                                      # "mode: ours | MIG: Disabled 0 instance(s)" 확인
+./all.sh up <이름> --xapp                           # 우리 L1 + gNB + VA + non-VA (+ PPO xApp)
+```
 
-**켜기**: 코어 → **RIC** → L1 + gNB → VA → non-VA → (전화기 접속 · 스트리밍) → PPO xApp → (모니터)
-**끄기**: xApp → 모니터 → non-VA → VA → gNB + L1 → RIC → (코어)
+`--xapp`은 그 시점에 전화기 4대가 붙어 있어야 xApp을 띄운다. "RNTI mapping not possible"이 나오면 전화기가 붙은 뒤 `./xapp.sh start`를 따로 실행한다.
 
-- gNB가 도는 동안 RIC를 내리면 gNB가 죽는다(OAI E2 에이전트, `e2_agent.c:225`). `ric.sh stop`은 gNB가 돌면 거부한다.
-- 코어를 재시작하면 옛 임시 ID(GUTI)를 가진 전화기가 "Authentication failure"로 못 붙을 수 있다 → 전화기 전원 재시작.
-- gNB만 재시작하면 전화기는 스스로 다시 붙는다(코어에 세션을 가진 채 Service Request. 이 경로의 OAI NULL 참조 결함은 패치했다: `docs/patches/oai_pdusession_nas_null.patch`).
-- 전화기 데모 중에는 L1/gNB를 재빌드하거나 재시작하지 않는다. L1 재빌드(`./dgist.sh build-l1`)는 전화기가 없는 시간에 한다.
+**5셀 트래픽 생성기 켜고 끄기** (어느 모드에서나)
 
-### 3.3 모듈별 스위치
+```bash
+./tgen.sh status                       # 스위치, 실행 여부, 부하 단계, 5셀 DL/UL 합
+./tgen.sh on | off                     # .env TRAFFIC_GEN=1|0. 다음 ./all.sh up 부터 적용 (L1 · gNB 재시작, 전화기 재접속)
+./tgen.sh load low|mid|high|auto       # 실행 중에 바로 바뀐다 (약 0.3초). 시작할 때의 단계는 .env TRAFFIC_LOAD
+```
 
-| 모듈 | 켜기 | 끄기 | 상태 / 로그 |
-|---|---|---|---|
-| 코어 (Open5GS, 호스트 서비스) | `./core.sh up` (sudo) | `./core.sh down` (sudo) | `./core.sh status`, `./logs.sh core` |
-| nearRT-RIC (127.0.0.2) | `./ric.sh start` | `./ric.sh stop` (gNB가 돌면 거부) | `./ric.sh status`, `./logs.sh ric` |
-| L1 + gNB (컨테이너 `dgist-l1`, `dgist-gnb`; Baseline은 `dgist-yolo`도) | `./dgist.sh up [이름]` | `./dgist.sh down` | `./dgist.sh status`, `./dgist.sh ue`, `./logs.sh gnb\|mac\|l1\|dapp` |
-| 5셀 트래픽 생성기 (L1 컨테이너 안) | `./tgen.sh on` 뒤 L1 재시작 | `./tgen.sh off` 뒤 L1 재시작 | `./tgen.sh status`, `./logs.sh tgen\|ru\|testmac` |
-| VA 서비스 (:8000) | `./va.sh start` | `./va.sh stop` | `./va.sh status`, `./logs.sh va` |
-| non-VA 서비스 (:8001) | `./nonva.sh start` | `./nonva.sh stop` | `./nonva.sh status`, `./logs.sh nonva` |
-| PPO 슬라이싱 xApp: `xapp_slice_ppo_ctrl` + Python 액터 (+ compute writer, guard; Ours만) | `./xapp.sh start` | `./xapp.sh stop` | `./xapp.sh status`, `./xapp.sh trace`, `./logs.sh ppo\|xapp` |
-| 모니터 xApp `xapp_ul_input_moni` (읽기 전용) | `./xapp.sh moni start` (전경: `./xapp.sh moni`) | `./xapp.sh moni stop` | `./xapp.sh moni status`, `./logs.sh moni` |
-| 가상 카메라 (GPU 부하만 추가, 무선 미사용) | `./vcam.sh start <N> [fps] [모델]` | `./vcam.sh stop` | `./vcam.sh status` |
-| 실험 대시보드 (:8010, 스택과 따로 돈다) | `./dash.sh start` | `./dash.sh stop` | `./dash.sh status`, `./dash.sh logs` |
-| **전체** | `./all.sh up [이름] [--xapp]` | `./all.sh down [--core]` | `./all.sh status` |
+**전환이 됐는지 확인**
 
-`./dgist.sh <모듈> …`로도 같은 스크립트를 부를 수 있다(`./dgist.sh va start`, `./dgist.sh ric status`). 켜기 전에 `./dgist.sh check`가 빠진 것을 `!!` 줄로 알려 준다.
+- `./all.sh status`의 첫 줄 `mode`와 둘째 줄 `traffic gen`.
+- 뷰어 화면 아래 줄의 SM 수: Baseline은 항상 60 SM, Ours는 요청마다 다르다(최대 80).
+- 대시보드는 `.env DEMO_MODE`를 2초마다 읽어 화면이 따라 바뀐다.
 
-### 3.4 전화기 4대
+**주의**
 
-Wi-Fi를 끄고 5G로 붙인 뒤(인증서는 자체 서명이라 경고를 한 번 승인):
+- 스택이 떠 있으면 `./all.sh mode <모드>`가 거부한다(`!! stack is up - ./all.sh down first`).
+- GPU에 프로세스가 하나라도 있으면(다른 사람 것 포함) `mig.sh on`도 `off`도 거부한다. 먼저 `nvidia-smi`를 본다.
+- `mig.sh`는 GPU 전체를 바꾼다: 호스트의 MPS 데몬을 모두 끄고, 바로 안 바뀌면 GPU를 리셋한다. 다른 사람이 GPU를 쓰는 시간에는 실행하지 않는다.
+- Baseline의 YOLO 엔진은 MIG 3g 조각 안에서 모델마다 한 번 빌드해 둔다. MIG를 켠 뒤
+  `scripts/build_yolo_engines_mig.sh <n|s|m|l|x>`(26x 기준 7~15분). 없는 엔진은 `./all.sh mode`가 알려 준다.
+- 생성기를 켠 실행은 전체 로그가 `tgen/log/<이름>/`(`.env TRAFFIC_GEN_LOG_DIR`)에 시간당 26~29 GB 쌓인다(측정). 시작 전에 `df -h tgen/log`를 보고, 끝난 실행은 정리한다. `tgen`은 큰 디스크를 가리키는 링크여도 된다.
+- 4g 조각의 SM 수는 64다(실측).
+
+## 3. 대시보드와 기지국 뷰어
+
+### 3.1 대시보드란
+
+연구자용 측정 · 시각화 웹 페이지다. PC 브라우저로 들어가 **측정 시작**(이름 입력) → **측정 종료**를 누르면 그 사이의 모든 지표가 저장되고, 같은 페이지에서 다시 재생(Replay)된다.
+
+| 주소 | 용도 |
+|---|---|
+| `http://<서버 IP>:8010/` | 평소에 보는 주소 (연구실 유선망 전용) |
+| `https://<서버 IP>:8012/` | 같은 페이지의 HTTPS. **Capture**(MP4 내려받기)는 이 주소에서만 된다. 인증서 경고를 한 번 넘긴다 |
+
+```bash
+./dash.sh start | stop | restart       # 켜기 | 끄기(진행 중인 측정은 파일을 닫은 뒤 종료) | 재시작
+./dash.sh status                       # 프로세스, 주소, 응답 중인 데이터 출처, 진행 중인 측정
+./dash.sh logs | list                  # 서버 로그 | 저장된 측정 목록 (runs/dash/)
+./dash.sh sim [ours|baseline]          # 연습용 두 번째 페이지(:8011 / :8013, 가짜 숫자, "SIMULATION" 배지). 끄기: ./dash.sh sim stop
+```
+
+- 대시보드는 스택과 따로 돈다. `all.sh up / down`과 무관하게 켜 둬도 되고, 스택이 내려가 있으면 지표가 "대기"로 보인다.
+- **하향 트래픽을 만들지 않는다.** 전화기 망(10.45.0.0/16)에서 온 요청은 403으로 거절하고, 서비스의 데이터는 서버 안(루프백)에서만 읽는다.
+- Ours / Baseline 두 모드에서 그대로 쓴다. Baseline에는 슬롯 CSV와 xApp 로그가 없어서 SM 배분은 고정 값(L1 64 / YOLO 60)으로 그리고, GPU 부하율 같은 일부 값은 추정값으로 표시한다.
+
+### 3.2 측정 절차
+
+1. 실험 세팅을 끝낸다(전화기 4대 접속, VA 2대 Start VA, non-VA 2대 Start Streaming, 필요하면 xApp · 가상 카메라).
+2. 오른쪽 위 **측정 시작** → 이름 입력(예: `ours_low_1`). 점검 목록에서 빠진 데이터 출처를 확인하고 시작한다.
+3. 측정 중에는 모든 카드에 **지금 값**(최근 1초)과 **측정 시작 후 누적 평균**이 같이 나온다. 그래프는 `누적 평균 | 순간값 | 둘 다`, 구간은 `전체 | 5분 | 1분`에서 고른다.
+4. **측정 종료** → 결과 요약 창. 기록은 `runs/dash/<이름>_<날짜_시각>/`에 남고 "기록 · Replay" 탭 목록에 올라온다.
+
+측정은 한 번에 하나다. 디스크 여유가 2 GB 미만이면 시작을 거부하고, 측정 중 1 GB 아래로 내려가면 스스로 종료한다. 기록은 전화기 4대 기준 시간당 약 0.13 GB다.
+
+### 3.3 탭
+
+| 탭 | 내용 |
+|---|---|
+| 종합 | 핵심 다섯 가지(VA QoS 충족률, 셀 상향 Throughput, GPU YOLO 요청, mAP 유지율, 측정 시간), UE별 E2E Latency, GPU SM 슬롯 맵, PRB 슬라이싱, UE 현황 표 |
+| VA 서비스 | 화질 · FPS · 프레임 크기, QoS 충족률, Latency 추이(상향 / 추론 / E2E), 선택된 모델 표시등과 모델 사용 비율 |
+| Non-VA 서비스 | QoS 충족률(기한 250 ms), 상향 Latency(평균 · p90 · p99), Throughput, PRB 사용 |
+| GPU · 슬롯 | 슬롯별 SM 배분(최근 80 슬롯), YOLO 요청 부하, SM 사용 추이, 모델 × SM 표, 가상 카메라 |
+| 무선 · 슬라이싱 | 서비스별 · UE별 PRB와 Throughput, UE 무선 상태(RNTI, SNR, MCS, BLER, RSRP 등) |
+| 뷰어 화면 | 기지국 뷰어의 네 화면(VA 2 + non-VA 2)을 대시보드 안에서 본다. 실시간 전용 |
+| 컴포넌트 제어 | 모듈 On / Off / 재시작 버튼 (3.4절) |
+| 기록 · Replay | 저장된 측정 목록과 재생. 다른 PC에서 받은 `.replay.jsonl`도 재생된다 |
+| 데모 영상 | 발표 영상용 카드 12개: UE별 Latency 막대 4개, GPU SM 배분, PRB 슬라이싱, 누적 평균 그래프 6개 (맨 오른쪽 탭, 키 `9`) |
+
+FHD 화면에서 종합 · VA · Non-VA · 기록 탭은 한 화면에 들어온다. GPU · 무선 탭은 브라우저 배율을 70~80 %로 줄이면 한 화면에 들어온다.
+
+### 3.4 Capture와 컴포넌트 제어
+
+**Capture (그래프 · 지표 · 뷰어 화면을 MP4로 내려받기)**
+
+1. `https://<서버 IP>:8012/`로 들어가 오른쪽 위 **Capture**를 누르고, 받을 항목에 표시한 뒤 **Capture 시작**.
+2. 원하는 때에 **Capture 종료**. 항목마다 MP4 하나가 **페이지를 연 PC의 다운로드 폴더**로 내려온다(서버에는 남지 않는다).
+
+- 모든 파일이 같은 시작 · 종료 시각으로 잘려 길이가 같다. 파일 이름은 `<모드>_cap_<날짜_시각>_<번호>_<탭>_<제목>.mp4`.
+- Chrome / Edge가 필요하고, 녹화하는 동안 그 브라우저 탭을 앞에 둔다. 한 번에 최대 20분(`DASH_CAP_MAX_MIN`).
+- Replay 중에도 된다(뷰어 화면만 실시간 전용). "측정 시작"과는 별개라서 측정 중이 아니어도 된다.
+
+**컴포넌트 제어 탭**
+
+버튼을 누르면 확인 창(실행할 명령, 영향, 거절 사유)이 뜨고, "실행"을 누르면 4절의 운영 스크립트를 대시보드를 띄운 계정으로 그대로 실행한다.
+대상은 L1 + gNB, 5G 코어, VA, Non-VA, PPO xApp, 트래픽 생성기(스위치 + 부하 단계)다. 한 번에 한 동작만 돌고, 기록은 `runs/dash/control.jsonl`과 `runs/dash/control/`에 남는다.
+
+- **로그인이 없다.** 대시보드 주소를 열 수 있는 연구실 유선망의 PC는 누구나 이 버튼을 누를 수 있다. 발표 · 촬영 중 실수를 막으려면
+  `.env`에 `DASH_CTL=0`(탭 끔) 또는 `DASH_CTL_DRYRUN=1`(명령을 기록만 하고 실행하지 않음)을 넣고 `./dash.sh restart`.
+- 모드 전환(MIG), RIC, 가상 카메라, 모니터 xApp은 버튼이 없다. 터미널에서 한다.
+- 이미 있는 실험 이름으로 L1을 켜는 것, xApp이 도는 중에 L1을 끄는 것, L1 / gNB가 떠 있는데 코어를 끄는 것은 거절한다. 코어 버튼은 그 계정에 비밀번호 없는 sudo가 없으면 거절하고 터미널 명령을 보여 준다.
+
+더 자세한 것(지표 정의와 출처, 저장 파일 형식, 문제 해결)은 `dash/README.md`에 있다.
+
+### 3.5 기지국 뷰어 (`/viewer`)
+
+`https://<서버 IP>:8000/viewer`를 **PC에서** 열면 전화기 네 대의 화면이 한 번에 보인다(VA만: `/viewer/va`, 한 대만: `/viewer/ue1`).
+전화기에서 열면 하향 트래픽이 생기므로 PC에서만 연다. non-VA 화면이 안 나오면 `https://<서버 IP>:8001/`의 인증서 경고를 한 번 넘긴다.
+
+- VA 화면은 상향 + 추론 + 고정 하향 시간(`VA_VIEWER_DL_MS`)이 `VA_DEADLINE_MS`(200 ms) 안에 들어온 프레임만 갱신한다. 넘기면 그 프레임에서 멈추고 "QoS 미달" 표시가 뜬다.
+- non-VA 화면은 상향 시간이 `NONVA_DEADLINE_MS`(250 ms)를 넘으면 멈춘다.
+- **전체 녹화 / 녹화 종료**(화면별 버튼도 있다): 화면마다 FHD MP4 하나가 뷰어를 연 PC에 저장된다. 녹화는 브라우저 안에서 이뤄지므로 상향 · 하향 트래픽이 늘지 않는다. Chrome / Edge, 최대 20분.
+
+## 4. 모듈별 소개와 On / Off / Restart
+
+### 4.1 한 번에 켜고 끄기 (`all.sh`)
+
+```bash
+./all.sh status                  # 전체 상태: 모드, 생성기, 모듈별 up / DOWN, UE 표
+./all.sh up <이름> [--xapp]      # 코어(꺼져 있으면) → RIC → L1 + gNB → VA → non-VA (→ PPO xApp)
+./all.sh down [--core]           # 반대 순서로 모두 내린다. 코어는 --core를 붙일 때만 내린다
+./all.sh restart <새 이름>       # down 뒤 up
+```
+
+- `<이름>`이 곧 로그 디렉터리 `runs/<이름>/`이다. 생략하면 `all_<월일_시분>`.
+- gNB는 L1이 준비된 뒤에 뜬다(L1 준비에 몇 분 걸린다). 끝에 `== all up`이 나오면 정상이고, 문제가 있으면 `== FAILED components: …`가 나온다.
+- 코어가 꺼져 있으면 `up`이 코어를 켜면서 sudo 비밀번호를 물을 수 있다.
+
+### 4.2 모듈별 명령
+
+| 모듈 | 하는 일 | On | Off | Restart |
+|---|---|---|---|---|
+| 5G 코어 (Open5GS) | 전화기의 등록 · 인증과 데이터 통로를 맡는다. 평소에는 켜 둔다 | `./core.sh up` | `./core.sh down` | `./core.sh down` 뒤 `./core.sh up` |
+| nearRT-RIC (FlexRIC) | gNB와 xApp 사이의 제어 중계기. gNB가 시작하면서 여기에 접속하므로 gNB보다 먼저 켠다 | `./ric.sh start` | `./ric.sh stop` | `./ric.sh restart` |
+| L1 + gNB | GPU 신호 처리(L1)와 기지국 상위 계층(gNB). 한 스위치로 같이 뜬다. Ours에서는 L1 안의 YOLO(dApp)가, Baseline에서는 `dgist-yolo` 컨테이너가 함께 뜬다 | `./dgist.sh up <이름>` | `./dgist.sh down` | `./dgist.sh down` 뒤 `./dgist.sh up <새 이름>` |
+| 5셀 트래픽 생성기 | L1 안에서 가상 셀 5개를 돌려 GPU에 5G 부하를 준다. 스위치는 다음 L1 시작 때 적용된다 | `./tgen.sh on` | `./tgen.sh off` | 부하만 바꿀 때: `./tgen.sh load low\|mid\|high\|auto` |
+| VA 서비스 | VA 전화기의 프레임을 받아 YOLO 요청으로 넘기고 결과를 돌려준다. 기지국 뷰어도 여기서 나온다 | `./va.sh start` | `./va.sh stop` | `./va.sh restart` |
+| non-VA 서비스 | non-VA 전화기가 올리는 720p 영상을 받는다(추론 없음) | `./nonva.sh start` | `./nonva.sh stop` | `./nonva.sh restart` |
+| PPO 슬라이싱 xApp (Ours만) | 100 ms마다 전화기 4대의 무선 상태와 YOLO 쪽 정보(모델, YOLO에 준 SM 수)를 보고 상향 PRB 할당량(합계 273)을 정해 gNB에 내린다. 전화기 4대가 붙은 뒤에 켠다 | `./xapp.sh start` | `./xapp.sh stop` | `./xapp.sh restart` |
+| 모니터 xApp | 연구실의 읽기 전용 xApp. UE · 서비스별 상향 PRB와 처리량을 초마다 기록한다 | `./xapp.sh moni start` | `./xapp.sh moni stop` | `moni stop` 뒤 `moni start` |
+| 가상 카메라 | 무선을 거치지 않고 FHD 영상 N줄기를 YOLO에 직접 넣어 요청 수만 늘린다 | `./vcam.sh start <N> [fps] [모델]` | `./vcam.sh stop` | `./vcam.sh restart <N> [fps] [모델]` |
+| 대시보드 | 측정 · 시각화 웹 페이지(3절). 스택과 따로 돈다 | `./dash.sh start` | `./dash.sh stop` | `./dash.sh restart` |
+| GPU 분할 (MIG) | Baseline용 고정 분할. 스택을 내린 뒤 sudo가 있는 계정으로 | `sudo <패키지>/scripts/mig.sh on` | `sudo <패키지>/scripts/mig.sh off` | 없음 |
+
+모든 모듈에 `status`가 있다(`./va.sh status`, `./ric.sh status`, `./xapp.sh status`, `./tgen.sh status`, `./core.sh status` …). `./dgist.sh core|va|nonva|ric|xapp|tgen …`으로 불러도 같다(예: `./dgist.sh va restart`).
+
+### 4.3 순서와 주의
+
+- **켜는 순서**: 코어 → RIC → L1 + gNB → VA → non-VA → (전화기 접속) → PPO xApp → (모니터 xApp). 끄는 순서는 반대다. `all.sh`가 이 순서를 지킨다.
+- gNB가 도는 동안 `./ric.sh stop`과 `./ric.sh restart`는 거부된다. RIC가 내려가면 gNB가 죽기 때문이다. RIC를 다시 켜야 하면 `./dgist.sh down`부터 한다.
+- L1 + gNB를 다시 켜면 전화기가 다시 접속한다. 코어를 다시 켜면 전화기를 껐다 켜야 할 수 있다("Authentication failure").
+- VA / non-VA 서비스를 재시작했으면 전화기 페이지를 새로 고친 뒤 다시 시작한다. 전화기에서 Stop을 누르기 전에 서비스를 내리면 그 세션의 프레임 로그는 저장되지 않는다.
+- PPO xApp은 전화기의 RNTI를 알아야 뜬다. 전화기가 다시 접속해 RNTI가 바뀌면 보조 프로세스(guard)가 5초 간격으로 확인해 다시 띄운다. 전화기가 떨어져 있던 뒤에는 `./xapp.sh status`로 확인하고, 멈춰 있으면 `./xapp.sh start`.
+- 전화기로 데모를 하는 동안에는 L1 / gNB를 재시작하거나 빌드하지 않는다.
+
+### 4.4 전화기 4대
+
+Wi-Fi를 끄고 5G로 붙인다(인증서가 자체 서명이라 경고를 한 번 승인한다).
 
 | 전화기 | 주소 | 누르는 순서 |
 |---|---|---|
 | VA 2대 | `https://10.45.0.1:8000/` | UE1 / UE2 선택 → Start Camera(또는 Video File) → Start VA |
 | non-VA 2대 | `https://10.45.0.1:8001/` | UE1 / UE2 선택 → Start Camera(또는 Video File) → Start Streaming |
 
-서비스를 재시작했으면 전화기 페이지를 새로 고친 뒤 다시 시작한다. 누가 누구인지는 `python3 ue_table.py`.
+- 누가 누구인지는 `python3 ue_table.py` 또는 `./all.sh status`의 UE 표로 본다.
+- 동영상 파일을 쓸 때: `Restart Video`는 누르는 즉시 처음부터 다시 재생한다. `Start video at [시:분]` → `Set`은 그 시각에 처음부터 시작한다.
+  **네 대를 같은 순간에 시작하려면** 전화기마다 Start VA / Start Streaming을 먼저 누른 뒤 같은 시각을 예약한다(서버 시계에 맞춘다).
+  두 기능 모두 전화기 안의 동영상만 다루므로 서버 요청도 하향 트래픽도 없다.
 
-**동영상 파일로 할 때 (2026-11-14)**: 두 페이지 모두 `Video File` 아래에 단추가 있다.
-
-- `Restart Video` — 누르는 즉시 영상을 처음부터 다시 재생한다(전체 화면에서는 왼쪽 위 단추). 송신은 끊기지 않는다.
-- `Start video at [시:분]` → `Set` — 그 시각이 되면 영상이 처음부터 시작된다(예: 10:00 → 10:00:00). 지난 시각을 고르면 내일로 잡힌다. `Cancel`로 취소.
-  **네 대를 같은 순간에 시작하려면 폰마다 Start VA / Start Streaming을 먼저 누른 뒤 같은 시각을 예약한다**(그러면 모두 기지국 서버 시계로 맞춘다;
-  `Clock:` 줄에 "base station clock"이라고 나온다). 예약해 둔 동안 페이지를 앞에 둔다(화면이 꺼지거나 다른 앱으로 가면 늦게 시작할 수 있다).
-- 두 기능은 폰 안의 동영상만 다룬다: 서버로 가는 요청도, 내려오는 트래픽도 없다. 헤드리스 Chromium으로만 확인했다(시작 오차 ±2 ms); 실제 폰에서는 아직.
-
-### 3.5 자주 쓰는 흐름
+### 4.5 전화기 없이 해 보는 시험
 
 ```bash
-# (A) 서비스만 다시 (.env 의 VA_* / NONVA_* 를 바꾼 뒤; 전화기 페이지 새로 고침)
-./va.sh restart ; ./nonva.sh restart
-
-# (B) xApp만
-./xapp.sh stop                 # 쿼터를 지우고(원상복구) 종료
-./xapp.sh start                # 전화기 4대가 붙어 있어야 한다. 기본은 6G 번들, 19입력 번들은 .env PPO_BUNDLE_NAME 을 바꾼 뒤
-#   전화기가 다시 붙어 RNTI가 바뀌면 guard가 5초 안에 감지해 PPO xApp을 다시 띄운다. 모니터: ./xapp.sh moni stop; ./xapp.sh moni start
-#   모니터 xApp은 ./xapp.sh moni start 로만 띄운다 (빌드 디렉터리에서 직접 실행하면 우리 RIC(127.0.0.2)에 붙지 못한다)
-
-# (C) gNB가 죽었을 때 (docker ps 에 dgist-gnb 없음) — RIC는 그대로 둔 채
-./dgist.sh down ; ./dgist.sh up <이름> ; ./xapp.sh restart        # RIC가 먼저 떠 있어야 한다 (./ric.sh status)
-
-# (D) L1 + gNB만 다시 (DAPP_* / L1_CONFIG / 생성기 스위치를 바꾼 뒤)
-./dgist.sh down ; ./dgist.sh up <이름>          # 서비스는 떠 있는 채로 두면 첫 프레임에서 새 L1에 다시 붙는다
+./dgist.sh test 26x 10 20        # YOLO에 직접 요청: 모델 26x, 초당 10개, 20초
+./va.sh test2 60 10              # VA 서비스 경로 시험 (UE 2개 흉내, 60프레임, 초당 10개; 무선 미사용)
+./nonva.sh test ue1 100 20       # non-VA 서비스 경로 시험
+./vcam.sh start 2 ; ./vcam.sh status ; ./vcam.sh stop     # 가상 카메라 2대 (GPU 요청만 늘어난다)
 ```
 
-### 3.6 설정을 바꿨을 때 무엇을 다시 켜나
+### 4.6 실험 한 번의 흐름 (예: Ours + 생성기 저부하)
 
-| `.env`에서 바꾼 것 | 다시 켤 것 |
+```bash
+./all.sh mode ; ./tgen.sh status ; nvidia-smi ; df -h / /data      # 0) 모드, 생성기 스위치, GPU, 디스크 확인
+./dash.sh status                                                   # 1) 대시보드 (꺼져 있으면 ./dash.sh start)
+./all.sh up ours_low_1                                             # 2) 스택 (이름은 새로)
+#    3) 전화기 4대: VA 2대 Start VA, non-VA 2대 Start Streaming  →  python3 ue_table.py 로 4대 확인
+./xapp.sh start                                                    # 4) PPO xApp (전화기가 붙은 뒤)
+#    5) PC 브라우저: 대시보드 "측정 시작", 필요하면 뷰어 "전체 녹화"
+./tgen.sh load mid                                                 # 6) (필요하면) 부하 전환
+#    7) 대시보드 "측정 종료", 전화기에서 Stop
+./all.sh down                                                      # 8) 정리
+```
+
+## 5. 설정 파일 `.env`
+
+패키지 디렉터리의 `.env` 한 파일이 모든 설정을 담는다. docker compose, 운영 스크립트, L1 컨테이너가 모두 이 파일을 읽는다.
+
+- 형식: 한 줄에 `KEY=값` 하나, 주석은 `#`으로 시작하는 별도 줄(값 뒤에 주석을 붙이지 않는다).
+- 값을 바꿔도 **그 값을 읽는 모듈을 재시작해야** 반영된다(아래 표의 마지막 열).
+- `VA_IMSIS`, `NONVA_IMSIS`는 전화기 식별 번호다. 값을 문서나 메신저에 옮기지 않는다.
+
+| 묶음 | 주요 키 (현재 값) | 뜻 | 바꾼 뒤 |
+|---|---|---|---|
+| 이미지 · 빌드 | `AERIAL_IMAGE`, `OAI_IMAGE`, `BUILD_DIR`(`build.aarch64_f1002`), `L1_CONFIG`(`dgist`), `BUILD_CPUS`, `OAI_CPUSET` | 컨테이너 이미지, L1 빌드 디렉터리와 설정 이름, 빌드 · gNB가 쓰는 CPU 코어 | 설치할 때 정하는 값 (평소에는 그대로) |
+| 모드 | `DEMO_MODE`(`ours`), `BASELINE_L1_CONFIG`(`dgist_base`), `BASELINE_YOLO_SM`(`auto`) | Ours / Baseline 선택, Baseline L1의 설정 이름(`config/cuphycontroller_<이름>.yaml`), Baseline YOLO의 SM 수(`auto` = 조각 전체) | `DEMO_MODE`는 손으로 고치지 말고 `./all.sh mode` |
+| 생성기 | `TRAFFIC_GEN`(`1`), `TRAFFIC_LOAD`(`low`), `TRAFFIC_GEN_TV_DIR`, `TRAFFIC_GEN_LOG_DIR` | 생성기 스위치, 시작할 때의 부하 단계, 테스트 벡터와 전체 로그 위치(기본 `./tgen/testVectors`, `./tgen/log`. 패키지 기준 상대 경로나 절대 경로) | 스위치는 `./tgen.sh on\|off` 뒤 L1 + gNB 재시작. 부하는 `./tgen.sh load` |
+| L1 · dApp (Ours) | `DAPP_PUSCH_PROFILES`(`16,24,32,40,56`), `DAPP_PDSCH_PROFILES`(`24,40`) | sizer가 슬롯마다 고를 수 있는 PUSCH / PDSCH SM 후보. 생성기를 켠 6셀 실행에서는 PUSCH 후보가 시작 스크립트의 10단계(16~104)로 바뀐다 | L1 + gNB 재시작 |
+| | `DAPP_INPUT`(`fhd`), `DAPP_TENANT_CLASSES_FHD`(`24,40,48,56,64,72,80,88`), `DAPP_TENANT_CLASSES` | YOLO 입력 형식(`fhd` = FHD 한 장을 3장 묶음으로 추론, `4k` = 4K 타일 8장)과 YOLO SM 등급 목록(`fhd`일 때 `_FHD` 쪽, `4k`일 때 뒤쪽 키) | L1 + gNB 재시작 |
+| | `DAPP_AGENT_PORT`(`9810`), `DAPP_AGENT_QOS`(`1`), `DAPP_AGENT_GRAPH_CHUNK`(`3`), `DAPP_AGENT_CHUNK_AHEAD`(`2`) | 요청 창구 포트, 기한 검사(거절) 켬, 추론 분할 설정(0 = 분할 끔) | L1 + gNB 재시작 |
+| | `DAPP_SIZER_YOLO_US`(`7:120,8:120,17:120,18:120`) | sizer의 YOLO 항: `프레임 안 슬롯 번호:여유 µs`. 비우면 꺼짐 | L1 + gNB 재시작 |
+| | `DAPP_SLOT_CSV`(`1`), `DAPP_TENANT_CPU`, `DAPP_AGENT_CPU`, `PRACH_FORCE_THR0`(`20.0`) | 슬롯별 CSV 기록(분당 약 5 MB, 슬롯 맵 · 대시보드용), dApp 스레드의 CPU 코어, PRACH 검출 임계값 | L1 + gNB 재시작 |
+| VA 서비스 | `VA_MODEL`(`26x`), `VA_MODEL_SELECT`(`1`), `VA_MODEL_WEIGHTS`(`10,10,60,10,10`) | 기본 모델, 규칙 기반 모델 선택 켬, 모델 비율(순서 26n, 26s, 26m, 26l, 26x) | `./va.sh restart` (Baseline에서는 L1 + gNB 재시작도) |
+| | `VA_DEADLINE_MS`(`200`), `VA_TARGET_FPS`(`15`), `VA_CAMERA_WIDTH/HEIGHT`(`1920×1080`), `VA_JPEG_QUALITY`(`0.90`), `VA_MAX_INFLIGHT`(`4`) | QoS 기한, 전화기의 전송 FPS · 해상도 · JPEG 화질, 동시에 떠 있을 수 있는 프레임 수 | `./va.sh restart` + 전화기 페이지 새로 고침 |
+| | `VA_TRACK`, `VA_QOS_DROP_MISSED`, `VA_DISPLAY_CONF`, `VA_ENCODE_WORKERS`, `VA_FILE_WIDTH/HEIGHT`, `VA_PORT`(`8000`), `VA_AGENT`, `VA_BACKEND`(`dapp`) | 전화기 화면의 박스 추적 · 기한 넘긴 결과 버리기 · 표시 문턱, JPEG 인코딩 워커 수, 동영상 파일 크기, 서비스 포트, YOLO 창구 주소 | 위와 같음 |
+| non-VA 서비스 | `NONVA_PORT`(`8001`), `NONVA_WIDTH/HEIGHT`(`1280×720`), `NONVA_FPS`(`15`), `NONVA_JPEG_QUALITY`(`0.65`) | 서비스 포트, 전화기의 전송 해상도 · FPS · 화질 (`NONVA_VIEWER_FPS`: 뷰어 화면 갱신 FPS) | `./nonva.sh restart` + 전화기 페이지 새로 고침 |
+| FlexRIC | `FLEXRIC_BUILD`, `FLEXRIC_SM_DIR`, `RIC_IP`(`127.0.0.2`) | RIC 빌드 디렉터리, 서비스 모델 라이브러리 위치, RIC 주소 | 설치할 때 정하는 값 (평소에는 그대로) |
+| PPO xApp | `PPO_BUNDLE_NAME`, `VA_IMSIS`, `NONVA_IMSIS`, `XAPP_GUARD`(`1`), `XAPP_GUARD_S`(`5`), `PPO_MIN_PRBS`(`5`), `PPO_DAPP`(`1`), `PPO_GPU_SOURCE` | 정책 묶음(현재 것은 무선 지표 18개 + YOLO 모델 + YOLO에 준 SM 수를 입력으로 쓴다), 어느 전화기가 어느 서비스인지, guard 켬과 확인 주기(초), 최소 PRB, dApp에 접속해 결정마다 YOLO 모델 · SM을 함께 기록 | `./xapp.sh restart` |
+| RU · 코어 | `RU_IP`, `FH_IF`(`aerial00`), `UE_SUBNET`(`10.45.0.0/16`), `NO_CORE`(`0`) | RU 주소, 프런트홀 NIC, 전화기 망, 1 = 이 서버에 코어가 없어도 켠다 | 설치할 때 정하는 값 (평소에는 그대로) |
+
+**파일에 없어도 되는 키** (넣지 않으면 괄호 안의 기본값)
+
+| 대상 | 키 |
 |---|---|
-| `VA_*` (모델, 모델 선택 규칙, QoS 기한, 해상도, 뷰어, 녹화) | `./va.sh restart` + 전화기 페이지 새로 고침 |
-| `NONVA_*` | `./nonva.sh restart` + 전화기 페이지 새로 고침 |
-| `DAPP_*`, `L1_CONFIG`, `BASELINE_*`, `TRAFFIC_GEN`, (Baseline에서) `VA_MODEL`, `VA_MODEL_SELECT`, `VA_MODEL_WEIGHTS` | `./dgist.sh down && ./dgist.sh up <이름>` |
-| `DEMO_MODE` | 2장 절차 (`./all.sh mode …`로 바꾼다) |
-| `PPO_*`, `XAPP_GUARD*`, `VA_IMSIS`, `NONVA_IMSIS` | `./xapp.sh restart` |
-| `DASH_*` | `./dash.sh restart` |
+| L1 (Ours) | `DAPP_PUSCH_INORDER`(Ours 1, Baseline 0: 순서 보장 켜기 / 끄기), `DAPP_PUSCH_INORDER_US`(3000: 한 슬롯을 기다리는 한도 µs), `DAPP_SIZER_YOLO_HOLD_MS`(1000) |
+| 뷰어 | `VA_VIEWER`(1), `VA_VIEWER_DL_MS`(20), `VA_VIEWER_FIT`(1), `VA_VIEWER_REC_MAX_MIN`(20), `NONVA_DEADLINE_MS`(250), `NONVA_VIEWER_QOS_FREEZE`(1) |
+| 대시보드 | `DASH_PORT`(8010), `DASH_TLS_PORT`(8012), `DASH_CTL`(1), `DASH_CTL_DRYRUN`(0), `DASH_VIEWER`(1), `DASH_CAP_FPS`(30), `DASH_CAP_MBPS`(6), `DASH_CAP_MAX_MIN`(20), `DASH_MIN_FREE_GB`(2.0), `DASH_BASE_MODEL`(26x) → 바꾼 뒤 `./dash.sh restart` |
+| 가상 카메라 | `VCAM_FPS`(10), `VCAM_INFLIGHT`(4), `VCAM_JPEG_QUALITY`(0.70) |
 
-### 3.7 요청마다 모델 고르기 (규칙 기반 모델 선택)
+## 6. 로그 보는 명령
 
-기본은 모든 VA 요청이 `VA_MODEL` 하나로 실행된다. `.env`의 아래 두 줄을 바꾸면 VA 서비스가 요청마다 모델을 정해진 비율로 섞어 보낸다(두 모드 공통, L1은 받은 이름의 모델을 실행).
+### 6.1 지금 상태
 
 ```bash
-VA_MODEL_SELECT=1                   # 0 = 끔(기본), 1 = 켬
-VA_MODEL_WEIGHTS=10,10,10,10,60     # 26n,26s,26m,26l,26x 순서: 요청 100개(= 값의 합)마다 정확히 10 · 10 · 10 · 10 · 60개, 어느 요청이 어느 모델인지는 무작위
+./all.sh status                  # 전체 한 화면: 모드, 생성기, 모듈별 up / DOWN, UE 표
+./dgist.sh status                # L1 / gNB: Err.ind · FATAL 수, 전화기 셀의 초당 DL / UL, 접속 단계별 횟수
+./tgen.sh status                 # 생성기: 부하 단계, 5셀 DL / UL 합
+./va.sh status ; ./nonva.sh status ; ./xapp.sh status
 ```
+
+정상일 때: L1 `Err.ind 0 FATAL 0`, `gNB: NGSetup 1`, 전화기 4대가 한 번씩 붙었으면 `RA 4 RRC 4 PDU 4 RA-fail 0`. (`./all.sh up`은 끝 줄이 `== all up`이면 정상이다.)
+
+### 6.2 실시간 로그 (`logs.sh`)
+
+`./logs.sh <대상>`은 해당 로그를 따라가며 보여 준다(Ctrl-C로 끝냄). 빨강 = 오류, 초록 = 성공 · 접속, 노랑 = 경고.
+`-n 200`을 붙이면 지난 200줄부터 보여 주고, `--raw`를 붙이면 걸러 내지 않은 원본을 보여 준다.
 
 ```bash
-./va.sh restart                     # 적용 + 전화기 페이지 새로 고침 (Baseline은 ./dgist.sh down && ./dgist.sh up <이름> 도)
-./va.sh status                      # "model selection:" 줄 = 블록 구성과 지금까지 모델별 요청 수
-./va.sh test2 100 15                # 전화기 없이 확인: 끝의 "models:" 줄 = UE별 모델 요청 수
+./logs.sh all                    # gNB 사건 + xApp 결정 + 전화기 셀의 L1 줄을 한 화면에
+./logs.sh l1                     # L1: 준비 / 시작, 전화기 셀의 초당 DL / UL, Err.ind, FATAL
+./logs.sh gnb                    # gNB: 전화기 접속 / 해제, RRC, 코어 연결, E2
+./logs.sh dapp                   # YOLO(dApp): 처리 / 실패 / 대기 수, SM 후보별 사용 횟수
+./logs.sh va                     # VA 서비스 (nonva: non-VA 서비스)
+./logs.sh ppo                    # PPO xApp의 결정만 (xapp: 전체 로그)
+./logs.sh tgen                   # 생성기: 5셀의 초당 DL / UL과 부하 전환 기록 (ru, testmac: 각 콘솔)
+./logs.sh core                   # Open5GS: 등록, 세션, 인증
+./logs.sh ue                     # UE 표를 2초마다 갱신
 ```
 
-- 값의 합이 블록 크기다. `1,1,1,1,6`이면 요청 10개마다 1 · 1 · 1 · 1 · 6개, `0,0,0,50,50`이면 26l과 26x만 반반이다.
-- VA UE 두 대와 가상 UE의 요청이 도착 순서대로 같은 블록을 채운다. UE 한 대만 보거나 블록 경계와 어긋난 구간을 세면 비율은 대략만 맞는다.
-- Ours는 L1이 다섯 모델을 모두 올려 두므로 바로 된다. Baseline은 MIG 엔진이 있는 모델만 올라간다(지금은 26x뿐): MIG를 켠 뒤
-  `scripts/build_yolo_engines_mig.sh n s m l`(모델당 7~15분). 엔진이 없는 모델의 몫은 `VA_MODEL`로 실행되고 `./dgist.sh check`와 `./va.sh status`가 알려 준다.
-- 값이 잘못되면(5개가 아님, 숫자가 아님, 모두 0) 서비스는 뜨되 끈 것처럼 동작하고 `./logs.sh va`에 `!! VA_MODEL_SELECT=1 ignored` 한 줄이 남는다.
-- 전화기로 가는 응답은 늘지 않는다(필드 그대로, 전화기 페이지의 모델 표시는 `mix`). 섞인 모델은 뷰어 머리말과 대시보드 VA 서비스 탭에서 본다.
-- PPO xApp의 입력과 대시보드의 대체 추정값은 계속 `VA_MODEL` 하나를 쓴다. 실제 L1에서 섞어 돌릴 때의 모델별 지연과 Baseline 다중 모델 서버는 아직 측정 전이다(2026-11-13).
+그 밖의 대상: `mac`(UE별 MAC 통계), `ric`, `moni`(모니터 xApp). 전화기 셀은 L1 셀 0이고, 생성기를 켠 실행에서는 셀 5다.
 
-## 4. 모니터링
+### 6.3 끝난 실행을 파일로 확인
 
-### 4.1 상태 명령
-
-| 명령 | 보여 주는 것 |
-|---|---|
-| `./all.sh status` | 한 화면 요약: 모드, 생성기, 코어, L1 / gNB / dApp 에이전트 포트 / 실행 이름, VA / non-VA, RIC / PPO xApp(마지막 결정), 모니터 · compute writer · guard, L1 · GPU · gNB 줄, UE 표 |
-| `./dgist.sh status` | 컨테이너, RAN 프로세스, GPU 사용률 · 메모리, **L1 Err.ind / FATAL 수**, 전화기 셀의 초당 DL / UL · CRC, dApp 한 줄, gNB의 NG Setup과 UE 수(RA / RRC / PDU / RA 실패) |
-| `./dgist.sh ue` | 전화기 접속 단계별 첫 시각과 횟수(RA → RRC → PDU 세션), 실패 줄 |
-| `./tgen.sh status` | 생성기: 부하 단계, 5셀 DL / UL 합, RU 정시율, L1 Err.ind / FATAL, 전체 로그 크기, 최근 단계 전환 |
-| `./va.sh status` / `./nonva.sh status` | 프로세스 · 포트, dApp 에이전트 연결과 카운터, (모델 선택 규칙이 켜져 있으면) 모델별 요청 수, UE 세션, 최근 CSV, 뷰어 요약 |
-| `./ric.sh status` | RIC 프로세스와 E2 연결 |
-| `./xapp.sh status` / `trace [n]` / `dapp` | xApp 상태 / 최근 n개 결정(dApp 값 포함) / dApp → xApp 피드 확인 |
-| `./xapp.sh moni power [초]` | UE별 RSRP · PH · 송신 전력 · 감당 PRB 대 실제 grant · MCS / BLER / SNR 표 (CSV `log/moni_log/ue_power_*.csv`) |
-| `python3 ue_table.py` | RNTI, IMSI, UE IP, in-sync, RSRP, MCS, BLER, SNR, 어느 서비스로 보내는지 |
-| `./vcam.sh status`, `./dash.sh status`, `./core.sh status` | 가상 카메라, 대시보드(응답 중인 데이터 출처, 진행 중인 측정), 코어 |
-
-정상일 때: `./all.sh up` 끝줄 `== all up`; `./dgist.sh status`의 **Err.ind 0, FATAL 0**, `gNB: NGSetup 1`, 전화기 4대면 `RA 4 RRC 4 PDU 4 RA-fail 0`.
-Err.ind는 L1이 슬롯을 제때 처리하지 못했다는 신호다. 숫자가 계속 늘면 `./logs.sh l1`. (생성기를 켠 Ours 파일럿 9분에서 Err.ind 10이 한 번 나왔고 원인은 아직 모른다.)
-
-### 4.2 실시간 로그 (`logs.sh`)
-
-`./logs.sh <대상> [-n N] [--raw]` — 따라 보기(Ctrl-C로 나옴). 빨강 = 오류 / 실패, 초록 = 성공 / 접속, 노랑 = 경고 / HOLD.
-
-| 대상 | 내용 |
-|---|---|
-| `all` | gNB 사건 + xApp 결정 + 전화기 셀의 L1 줄을 한 화면에 |
-| `gnb` / `mac` | 전화기 접속 · 해제, RRC, NGAP, E2, 슬라이스 쿼터 / UE별 MAC 통계 줄 |
-| `l1` | L1 콘솔: 준비 / START, 전화기 셀의 초당 DL / UL, Err.ind, FATAL / ERR / WRN (전화기 셀 = 셀 0, 생성기를 켜면 셀 5) |
-| `tgen` / `ru` / `testmac` | 생성기: 5셀의 초당 줄 + 단계 전환 / RU 에뮬레이터 정시율 / testMAC |
-| `dapp` | L1 안의 dApp: 에이전트 ok / fail / 대기열, SM 프로파일 줄 (Ours) |
-| `va` / `nonva` | 서비스: 프레임, 전화기 진단, 에이전트 연결, 오류 |
-| `ric` / `xapp` / `ppo` / `moni` | RIC / xApp 전체 / xApp 결정만(STORED · unchanged · HOLD) / 모니터 xApp의 초당 UE · 서비스 UL 수치 |
-| `core` (= `amf`, `smf`, `upf`) | Open5GS: 등록, PDU 세션, 인증, 해제 |
-| `ue` | UE 표를 2초마다 갱신 |
-
-### 4.3 기지국 뷰어와 녹화
-
-PC 브라우저(연구실 LAN)에서 `https://10.150.21.161:8000/viewer` — 한 페이지에 4칸: 위 줄 VA ue1 · ue2(프레임 + 박스), 아래 줄 non-VA ue1 · ue2(720p 중계).
-`/viewer/va`는 VA 2대만, `/viewer/ue1`은 한 대만 크게. non-VA만 따로 보려면 8001 포트의 `/viewer`(`/viewer/ue1`, `/viewer/ue2`). non-VA 칸은 브라우저가 8001 포트에서 직접 받으므로 `https://10.150.21.161:8001/`의 인증서 경고도 한 번 승인한다.
-
-- VA 칸은 **QoS를 만족한 결과만** 화면을 갱신한다: 상향(실측) + AI(실측) + 하향(고정 `VA_VIEWER_DL_MS`) ≤ `VA_DEADLINE_MS`. 미달이면 화면이 멈추고 "QoS 미달" 배지가 뜬다.
-- 칸 아래 줄에 모델과 YOLO SM 수가 나온다("26x · 60 SM" = Baseline, "· 80 SM" = Ours).
-- non-VA 칸도 같은 식으로 멈춘다(2026-11-14): **상향 지연(실측) ≤ `NONVA_DEADLINE_MS`(250 ms)** 인 프레임만 화면을 갱신하고, 넘으면 멈춘 채 "QoS 미달 · 화면 유지 N s"
-  배지가 뜬다(non-VA에는 추론 · 하향이 없어 상향만 본다). 타일 "상향 지연 / 250 ms"와 "QoS 충족률"(최근 100 프레임). 끄려면 `.env`에 `NONVA_VIEWER_QOS_FREEZE=0`.
-- 화면 맞춤(2026-11-14): 창 크기에 맞춰 4칸이 스크롤 없이 한 화면에 들어온다(그림 왼쪽, 숫자 오른쪽). 브라우저 창을 최대로 하거나 F11. 창이 작으면
-  이전처럼 스크롤된다(1680 × 945 창에서는 맞춰지고 1366 × 680 창에서는 스크롤). 끄려면 `.env`에 `VA_VIEWER_FIT=0`.
-- **뷰어는 PC에서만 연다.** 전화기에서 열면 그 전화기로 하향 트래픽이 생긴다.
-
-**녹화**: 머리줄 오른쪽 **전체 녹화** → 보이는 칸 전부를 같은 순간에 녹화 시작, **녹화 종료** → 칸마다 FHD(1920×1080) MP4 한 개씩 내려받는다(Chrome이 처음 한 번 "여러 파일 다운로드"를 물으면 허용).
-칸마다 **녹화 시작** ↔ **녹화 종료 mm:ss** 단추로 따로 찍을 수도 있다. 끝난 파일은 페이지 아래 "녹화 파일" 목록에서 다시 받을 수 있다(탭을 닫거나 새로 고치면 사라진다).
-
-- 파일: H.264 30 fps, 6 Mbit/s(칸 하나 분당 약 45 MB), 소리 없음, 이름 `<모드>_<va|nonva>_<ue>_<날짜>_<시각>.mp4`. 전체 녹화로 만든 파일들은 시작 시각과 길이가 같다.
-- 녹화는 전부 뷰어를 연 브라우저 안에서 한다. 서버와 전화기는 녹화를 모른다: 상향 · 하향 트래픽, 서버 CPU, GPU는 그대로다.
-- 녹화분은 끝날 때까지 브라우저 메모리에 있다(4칸 × 20분 ≈ 3.6 GB). 20분이 지나면 스스로 끝내고 저장한다(`VA_VIEWER_REC_MAX_MIN`). 긴 시연은 나눠 찍는다.
-- Chrome / Edge 최신판을 쓰고, 녹화 중에는 뷰어 탭을 앞에 둔다.
-- 단추가 안 보이면 서비스가 옛 버전으로 떠 있는 것이다: `./va.sh restart ; ./nonva.sh restart` 뒤 페이지 새로 고침.
-- 헤드리스 Chromium으로만 확인했다(4칸 3분: 5418 / 5418 프레임). 실제 뷰어 PC, 실제 전화기 4대 화면, PowerPoint에서 열기는 아직 확인하지 않았다.
-
-더 보기: `va_service/README.md`(뷰어 판정 규칙, "뷰어 녹화" 절, `VA_VIEWER*` 설정).
-
-### 4.4 전화기 없이 해 보는 시험 (무선 미사용)
+`phy_warn.log`, `l1_persec.log`, `dapp_tenant.log`, `oai.log`는 **스택을 내릴 때** `runs/<이름>/`에 정리된다. 도는 중에는 6.1 · 6.2절의 명령을 쓴다.
 
 ```bash
-./dgist.sh test 26x 10 20          # YOLO에 직접 부하: 모델, req/s, 초
-./va.sh test2 60 10                # UE 대역 2개로 VA 경로 시험 (프레임 60장, 10 req/s; 끝의 models: 줄 = 모델별 요청 수)
-./nonva.sh test ue1 100 20         # non-VA 경로 시험
-./vcam.sh start 2 ; ./vcam.sh status ; ./vcam.sh stop      # 가상 카메라 2대 × 10 fps = GPU에 +20 req/s
+R=runs/<이름>
+grep -c 'Send Err.ind' $R/phy_warn.log ; grep -c FATAL $R/phy_warn.log     # L1 오류 수 (정상: 0, 0)
+grep -a 'in-order gate' $R/l1_console.log | tail -2                        # 순서 보장: ON / OFF, 10초마다 held · timeout · out-of-order 수
+grep -a 'sizer YOLO term' $R/l1_console.log                                # sizer의 YOLO 항이 적용됐는지
+tail -n 3 $R/dapp_tenant.log                                               # YOLO: agent ok / fail / rejected, PUSCH · PDSCH 후보별 사용 횟수
+cat $R/tgen_load.log                                                       # 생성기 부하 전환 시각
+./dgist.sh ue <이름>                                                       # 전화기 접속 단계별 첫 시각과 횟수 (이름을 빼면 지금 또는 마지막 실행)
 ```
 
-## 5. 실험 대시보드
+- 순서 보장이 정상이면 `timeout 0 out-of-order 0 setup-failed 0`이다. Baseline + 생성기 실행은 `PUSCH in-order gate OFF`로 나온다.
+- L1 로그(`l1_console.log`, `phy_warn.log`)의 시각은 UTC다(한국 시각 − 9시간).
 
-연구자용 측정 · 시각화 웹 페이지다. 스택과 따로 돌므로 한 번 켜 두면 된다(스택이 내려가 있으면 지표가 "대기"로 보인다).
-
-```bash
-./dash.sh start            # → PC 브라우저: http://10.150.21.161:8010/   (평문 HTTP, 연구실 LAN 전용)
-./dash.sh status           # 프로세스, URL, 응답 중인 데이터 출처, 진행 중인 측정, 저장된 측정
-./dash.sh stop             # 진행 중인 측정은 요약과 파일을 닫은 뒤 종료
-./dash.sh restart | logs | list        # 재시작 | 서버 로그 | 저장된 측정 목록
-./dash.sh sim [ours|baseline]          # 연습용 두 번째 인스턴스(:8011, 가짜 숫자, "SIMULATION" 배지). 끄기: ./dash.sh sim stop
-```
-
-- 스택에 대해 **읽기 전용**이다: 아무것도 켜거나 끄거나 바꾸지 않는다.
-- **하향 트래픽을 만들지 않는다**: UE로 아무것도 보내지 않고, UE 망(`10.45.0.0/16`)에서 온 요청은 403으로 거절한다.
-- Ours / Baseline 두 모드에서 같은 화면을 쓴다.
-
-### 5.1 측정 절차
-
-1. 실험 세팅을 끝낸다(전화기 4대 접속, VA 2대 Start VA, non-VA 2대 Start Streaming, 필요하면 xApp · 생성기 · 가상 카메라).
-2. 오른쪽 위 **측정 시작** → 이름 입력(모드와 부하를 이름에 넣는다, 예 `ours_low_1`). 점검 목록에서 빠진 출처를 확인하고 시작.
-3. 측정 중에는 모든 카드에 **지금 값**(최근 1초)과 **측정 시작 후 누적 평균**이 같이 나온다. 그래프는 `누적 평균 | 순간값 | 둘 다`, 구간 `전체 | 5분 | 1분`.
-4. **측정 종료** → 결과 요약 창. 기록이 `runs/dash/<이름>_<시각>/`에 저장되고 "기록 · Replay" 탭 목록에 올라온다.
-
-측정은 한 번에 하나다(브라우저 여러 대가 같은 상태를 본다). 디스크 여유가 2 GB 미만이면 시작을 거부하고, 1 GB 아래로 내려가면 스스로 종료한다.
-
-### 5.2 탭
-
-| 탭 | 내용 |
-|---|---|
-| 종합 | VA QoS 충족률, 셀 UL Throughput, GPU YOLO 요청, mAP 유지율, UE별 E2E Latency, GPU SM 슬롯 맵, PRB 슬라이싱, UE 현황 표 |
-| VA 서비스 | UE별 화질 · FPS, QoS 충족률, Latency 추이(UL / Inference / E2E), 선택된 모델, 모델 사용 비율 |
-| Non-VA 서비스 | UE별 화질 · FPS, Uplink Latency(평균 · p90 · p99), Throughput, PRB 사용 |
-| GPU · 슬롯 | 슬롯별 GPU SM 배분(최근 80 슬롯), YOLO 요청 부하, SM 사용 추이, 모델 × SM 조합, 가상 카메라 |
-| 무선 · 슬라이싱 | PRB 슬라이싱 막대, 서비스별 PRB 할당 · 사용 추이, UE별 PRB · Throughput, UE 무선 상태(SNR, MCS, BLER, RSRP, PH) |
-| 기록 · Replay | 저장된 측정 목록(재생, 요약, 파일 받기), 다른 PC에서 받은 `.replay.jsonl` 열기 |
-
-### 5.3 기록과 Replay
-
-`runs/dash/<이름>_<시각>/`에 `.replay.jsonl`, `.summary.json`, `.summary.txt`, `.timeseries.csv`, `.frames.csv`, `.slots.csv.gz`가 남는다(UE 4대 기준 시간당 약 0.13 GB).
-`.replay.jsonl` 하나만 있으면 다른 PC의 같은 페이지에서도 다시 재생된다. 목록은 `./dash.sh list`.
-
-### 5.4 모드 · 생성기에 따른 차이
-
-- **Baseline**에는 슬롯 CSV와 xApp이 없다. 그래서 GPU 슬롯 맵은 MIG 고정 분할(L1 / YOLO)로, GPU 부하율은 "요청률 × 추론 시간" 추정으로, UE별 PRB는 gNB 로그 표본(약 1 %)으로 나온다.
-- **생성기**를 켜면 위쪽에 `tgen` 표시와 5셀 UL / DL 합 · 부하 단계가 나오고, 전화기 셀 수치는 L1 셀 5에서 읽는다.
-- 두 모드를 비교할 때는 측정을 모드마다 따로 한다(이름에 모드를 넣는다).
-
-더 보기: `dash/README.md`(지표 정의 · 출처 · 한계).
-
-### 5.5 그 밖의 측정 도구
-
-```bash
-python3 scripts/quota_exp.py 0 120 --no-control --label <라벨>     # 2분 기록(UL / AI 백분위, QoS, 무선, 셀) → runs/quota_exp/
-python3 scripts/quota_exp.py 100 90 --label va100                  # 고정 쿼터 실험 (PPO xApp을 멈춘 상태에서)
-./dgist.sh slotmap <이름> [--from-sec S --sec D --slowdown 20 --fps 60 --lang ko]     # GPU 슬롯 맵 영상 runs/<이름>/slotmap.mp4 (Ours, .env DAPP_SLOT_CSV=1, 끝난 실행)
-```
-
-## 6. 실험 한 번의 흐름 (예)
-
-```bash
-# 0) 확인: 모드, 생성기 스위치, GPU, 디스크
-./all.sh mode ; ./tgen.sh status ; nvidia-smi ; df -h / /data
-# 1) 대시보드 (이미 떠 있으면 생략)
-./dash.sh start
-# 2) 스택
-./all.sh up ours_low --xapp            # Baseline이면: ./all.sh up base_low
-# 3) 전화기 4대: VA 2대 Start VA, non-VA 2대 Start Streaming  →  python3 ue_table.py 로 4대 확인
-./xapp.sh start && ./xapp.sh moni start        # (Ours) 2)에서 xApp이 시작되지 않았으면
-# 4) PC 브라우저: 대시보드 "측정 시작" (이름 ours_low_1), 뷰어 "전체 녹화"
-# 5) (생성기를 켠 경우) 부하 전환
-./tgen.sh load mid ; ./tgen.sh load high
-# 6) 대시보드 "측정 종료", 뷰어 "녹화 종료"
-# 7) 정리
-./dgist.sh status                      # Err.ind / FATAL 확인
-./all.sh down                          # 끝줄의 "L1 Err.ind N, FATAL N | UE: …" 가 이 실행의 요약
-```
-
-측정하는 동안에는 같은 호스트에서 빌드나 대량 파일 검색 같은 무거운 작업을 하지 않는다. L1 전용 코어에 다른 스레드가 올라가 Err.ind(0x34)가 쏟아진 일이 있다(2026-11-13 측정).
-
-## 7. 로그와 결과물 위치
+### 6.4 로그와 결과물 위치
 
 | 내용 | 위치 |
 |---|---|
-| L1 / gNB 실행 로그 (`l1_console.log`, `phy_warn.log`, `l1_persec.log`, `entrypoint.log`, 내린 뒤 `oai.log`) | `runs/<이름>/` (Baseline은 `aerial_log/phy.log`도) |
-| Baseline YOLO 서버 | `runs/<이름>/yolo_entrypoint.log`, `yolo_console.log`, `yolo_tenant.log` |
-| dApp 슬롯 CSV (Ours, `DAPP_SLOT_CSV=1`) · 슬롯 맵 영상 | `runs/<이름>/dapp_tenant_slots.csv`, `slotmap.mp4` |
-| 생성기 (`ru_console.log`, `testmac_console.log`, `tgen_load.log`, `l1_persec_emu.log`, `ru_table.txt`) | `runs/<이름>/` |
-| 생성기 전체 nvlog (시간당 26~29 GB) | `/data/dgist_tgen/log/<이름>/` |
+| L1 / gNB: `l1_console.log`(콘솔 전체), `entrypoint.log`(시작 과정), 내린 뒤 `phy_warn.log`(경고 · 오류만), `l1_persec.log`(전화기 셀의 초당 DL / UL), `oai.log`(gNB) | `runs/<이름>/` |
+| YOLO (Ours): 10초마다 한 줄 요약, 슬롯별 CSV | `runs/<이름>/dapp_tenant.log`, `dapp_tenant_slots.csv` |
+| YOLO 서버 (Baseline) | `runs/<이름>/yolo_entrypoint.log`, `yolo_console.log`, `yolo_tenant.log` |
+| 생성기 (`ru_console.log`, `testmac_console.log`, `tgen_load.log`, `l1_persec_emu.log`) | `runs/<이름>/` |
+| 생성기 전체 로그 (시간당 26~29 GB) | `tgen/log/<이름>/` (`.env TRAFFIC_GEN_LOG_DIR`, `runs/<이름>/tglog` 링크로도 열린다) |
 | VA / non-VA 서버 로그 | `runs/va_service/uvicorn.log`, `runs/nonva_service/uvicorn.log` |
-| VA / non-VA 세션 CSV (전화기가 Stop을 누를 때) | `runs/va_service_log/`, `runs/nonva_service_log/` |
-| RIC | `runs/ric/` |
-| PPO xApp 콘솔, guard, compute writer | `runs/xapp/` |
-| PPO 결정 trace | `xapp_ppo/xapp_gpu_aware_no_lending_6G/logs/` (`./xapp.sh trace`) |
-| C xApp 로그 / 모니터 로그 / UE 전력 CSV | `log/ppo_output_log/`, `log/moni_log/` |
-| 대시보드 측정 기록 | `runs/dash/<이름>_<시각>/` (연습용은 `runs/dash_sim/`), 서버 로그 `runs/dash_service/` |
-| 뷰어 녹화 MP4 | 뷰어를 연 PC의 다운로드 폴더 (서버에는 남지 않는다) |
-| `quota_exp.py` 결과 · 가상 카메라 상태 | `runs/quota_exp/`, `runs/vcam/` |
-| MIG 인스턴스 UUID (Baseline) | `runs/mig.env` |
-| 빌드 로그 | `runs/build_*.log` |
+| VA / non-VA 세션 CSV (전화기에서 Stop을 누를 때 저장) | `runs/va_service_log/`, `runs/nonva_service_log/` |
+| RIC, PPO xApp | `runs/ric/`, `runs/xapp/` (PPO 결정 기록: `./xapp.sh trace`) |
+| 모니터 xApp | `log/moni_log/` |
+| 대시보드 측정 기록, 제어 기록 | `runs/dash/<이름>_<날짜_시각>/`, `runs/dash/control.jsonl` |
+| Capture · 뷰어 녹화 MP4 | 페이지를 연 PC의 다운로드 폴더 (서버에는 남지 않는다) |
+| MIG 조각 정보 (Baseline) | `runs/mig.env` |
 
-## 8. 설정 (`.env`) 요약
+## 부록 A. 문제 해결
 
-| 묶음 | 키 | 뜻 |
-|---|---|---|
-| 모드 | `DEMO_MODE` | `ours` / `baseline` (`./all.sh mode`로 바꾼다) |
-| 생성기 | `TRAFFIC_GEN`, `TRAFFIC_LOAD`, `TRAFFIC_GEN_TV_DIR`, `TRAFFIC_GEN_LOG_DIR` | 스위치(`./tgen.sh on\|off`), 시작할 때의 부하 단계, 시험 벡터와 전체 로그 위치(`/data`) |
-| L1 / gNB | `AERIAL_IMAGE`, `OAI_IMAGE`, `BUILD_DIR`, `L1_CONFIG`, `OAI_CPUSET`, `BUILD_CPUS` | 이미지, 우리 빌드 디렉터리, L1 설정 이름, gNB 코어 |
-| dApp (Ours) | `DAPP_INPUT`, `DAPP_TENANT_CLASSES`, `DAPP_TENANT_CLASSES_FHD`, `DAPP_SLOT_CSV`, `DAPP_AGENT_*`, `DAPP_*_PROFILES` | 입력 프로파일(`4k` / `fhd`), YOLO SM 클래스 사다리, 슬롯 CSV, 에이전트(포트 9810, QoS, 분할) |
-| Baseline | `BASELINE_TREE`, `BASELINE_L1_CONFIG`, `BASELINE_YOLO_SM` | 연구실 바닐라 트리, L1 설정, YOLO SM(`auto` = 인스턴스 전체) |
-| VA | `VA_MODEL`, `VA_MODEL_SELECT`, `VA_MODEL_WEIGHTS`, `VA_DEADLINE_MS`, `VA_TARGET_FPS`, `VA_CAMERA_WIDTH/HEIGHT`, `VA_JPEG_QUALITY`, `VA_PORT`, `VA_AGENT`, `VA_VIEWER*`, `VA_VIEWER_REC*` | 모델(고정 또는 규칙 선택, 3.7절), QoS 기한, 전화기 송신 속도 · 해상도 · 화질, dApp 에이전트 주소(두 모드 모두 포트 9810), 뷰어와 녹화 |
-| non-VA | `NONVA_PORT`, `NONVA_WIDTH/HEIGHT`, `NONVA_FPS`, `NONVA_JPEG_QUALITY`, `NONVA_VIEWER_FPS`, `NONVA_DEADLINE_MS`, `NONVA_VIEWER_QOS_FREEZE` | 720p 20 fps 중계, QoS 기한(250 ms)과 뷰어 정지 |
-| RIC / xApp | `RIC_IP`, `FLEXRIC_BUILD`, `FLEXRIC_SM_DIR`, `PPO_BUNDLE_NAME`, `PPO_GPU_SOURCE`, `PPO_DAPP`, `PPO_MIN_PRBS`, `XAPP_GUARD`, `XAPP_GUARD_S`, `VA_IMSIS`, `NONVA_IMSIS` | RIC 주소, PPO 번들, guard, 전화기 SIM → 서비스 대응 |
-| 무선 / 코어 | `RU_IP`, `FH_IF`, `UE_SUBNET`, `NO_CORE` | Benetel RU, 프런트홀 NIC, UE 망 |
-| 그 밖 (선택) | `DASH_*`, `VCAM_*` | 대시보드, 가상 카메라 |
-
-바꾼 뒤 무엇을 다시 켜는지는 3.6절.
-
-## 9. 문제 해결
-
-| 증상 | 할 일 |
+| 증상 | 조치 |
 |---|---|
-| `all.sh up` 끝에 `FAILED components: ric` | 타이밍 오경보인 경우가 있다(E2 SETUP 대기). `./ric.sh status`로 RIC가 떠 있는지 확인 |
-| `!! a run is registered as current (…)` | 앞 실행이 정리되지 않았다: `./dgist.sh down` 뒤 다시 |
-| `precheck failed` | `./dgist.sh check`의 `!!` 줄을 하나씩 해결(MIG 상태, 엔진, 다른 L1 컨테이너, PTP, 프런트홀 링크, 코어) |
-| `!! stack is up` (`mode`) / `mig.sh`가 거부 | `./all.sh down` 먼저 / GPU에 남은 프로세스 확인 `nvidia-smi` |
-| `Baseline engine missing` | MIG 켠 뒤 `scripts/build_yolo_engines_mig.sh <n\|s\|m\|l\|x>` |
-| xApp "RNTI mapping not possible" | 전화기 4대가 붙은 뒤 `./xapp.sh start` (`./xapp.sh rntis`로 대응 확인) |
-| 전화기가 "Authentication failure"로 못 붙음 | 코어를 재시작한 뒤라면 전화기 전원 재시작 |
-| gNB가 죽음 (`docker ps`에 `dgist-gnb` 없음) | 3.5 (C). RIC가 먼저 떠 있어야 한다(`./ric.sh status`) |
-| `all.sh down` 끝에 `still running: …` | 나열된 것을 해당 스크립트로 내린다. root로 띄운 프로세스는 nvidia 계정이 못 내린다(0장) |
-| 뷰어에 non-VA 칸이 안 보임 | `https://10.150.21.161:8001/` 인증서를 한 번 승인. non-VA 서비스가 떠 있는지 `./nonva.sh status` |
-| 뷰어에 녹화 단추가 없음 / "녹화 불가" | `./va.sh restart ; ./nonva.sh restart` 뒤 새로 고침, Chrome / Edge 사용 |
-| 대시보드가 403 | UE 망에서 접속했다. 연구실 LAN의 PC에서 `http://10.150.21.161:8010/` |
-| 대시보드 지표가 "대기" | 스택이나 그 서비스가 내려가 있다: `./dash.sh status`의 출처 목록, `./all.sh status` |
-| 생성기 L1이 시작하다 죽음 | `./logs.sh testmac`, `./logs.sh ru`, `runs/<이름>/entrypoint.log`. 원인 추적용: `TG_L1_GDB=1 ./dgist.sh up <이름>`(측정에는 쓰지 않는다) |
-| 모니터 xApp이 영원히 재시도 | 빌드 디렉터리에서 직접 띄운 것이다(스크립트가 세지 못한다). `pgrep -af xapp_ul_input_moni`로 찾아 끝내고 `./xapp.sh moni start` |
+| `./all.sh up` 끝에 `FAILED components: ric`만 나온다 | E2 연결을 기다리는 시간이 짧아서 생기는 오경보일 수 있다. `./ric.sh status`와 `./all.sh status`로 RIC가 up인지 확인한다 |
+| `!! a run is registered as current (…)` | 이전 실행이 남아 있다. `./dgist.sh down` 뒤 다시 |
+| `precheck failed` / `== fix the !! lines first` | `./dgist.sh check`가 알려 주는 `!!` 줄(떠 있는 다른 L1 스택, PTP, 프런트홀 링크, 코어, 빠진 엔진 · 설정 파일 등)을 먼저 해결한다 |
+| `!! stack is up - ./all.sh down first` | 모드 전환은 스택을 내린 뒤에 한다 |
+| `mig.sh`가 거부한다 | GPU에 프로세스가 남아 있다. `nvidia-smi`로 확인한다 |
+| `Baseline engine missing: …` | MIG를 켠 뒤 `scripts/build_yolo_engines_mig.sh <모델>` |
+| "RNTI mapping not possible" | 전화기 4대가 붙은 뒤 `./xapp.sh start` |
+| 전화기가 "Authentication failure" | 코어를 재시작한 뒤다. 전화기를 껐다 켠다 |
+| gNB만 죽었다 (`docker ps`에 `dgist-gnb` 없음) | RIC는 그대로 두고 `./dgist.sh down` → `./dgist.sh up <새 이름>` → `./xapp.sh restart` |
+| `./all.sh down` 끝에 `== still running: …` | 적힌 모듈을 해당 스크립트로 한 번 더 내린다 |
+| 뷰어에 non-VA 화면이 없다 | PC에서 `https://<서버 IP>:8001/`을 한 번 열어 인증서 경고를 넘긴다 |
+| 대시보드가 403 | 전화기 망에서 연 것이다. 연구실 유선망의 PC에서 연다 |
+| 대시보드 지표가 "대기" | 그 데이터를 내는 모듈이 꺼져 있다. `./dash.sh status`의 출처 목록을 본다 |
+| 생성기를 켠 L1이 뜨다 죽는다 | `./logs.sh testmac`, `./logs.sh ru`, `runs/<이름>/entrypoint.log`를 본다 |
 
-## 부록 A. 스크립트별 명령
+## 부록 B. 관련 문서
 
-| 스크립트 | 명령 |
+| 문서 | 내용 |
 |---|---|
-| `all.sh` | `up [이름] [--xapp]` · `down [--core]` · `status` · `restart [이름]` · `mode [ours\|baseline]` · `tgen …` |
-| `dgist.sh` (L1 + gNB) | `check` · `up [이름]` · `down` · `status` · `ue [이름]` · `logs [l1\|gnb]` · `test [모델] [req/s] [초]` · `slotmap <이름> […]` · `build-l1 [타겟]` · `build-oai` · `core\|va\|nonva\|ric\|xapp\|tgen\|all …`(그 스크립트로 넘김) |
-| `tgen.sh` | `on` · `off` · `load low\|mid\|high\|auto` · `status` |
-| `scripts/mig.sh` (root) | `on` · `off` · `status` |
-| `core.sh` | `up` · `down` · `status` (sudo) · `config` · `diff` · `build` · `subs` · `logs` (자세한 것은 부록 B "코어") |
-| `ric.sh` | `start` · `stop [--force]` · `restart` · `status` · `logs` · `install-sm` · `build` |
-| `va.sh` | `start [local]` · `stop` · `restart` · `status` · `logs` · `test [ue] [n] [req/s]` · `test2 [n] [req/s]` · `bg start [--fps N]` · `bg stop` · `bg status` · `make-frame` |
-| `nonva.sh` | `start` · `stop` · `restart` · `status` · `logs` · `test [ue] [n] [fps]` · `make-frame` |
-| `xapp.sh` | `rntis` · `start [VA1,VA2 NV1,NV2]` · `stop` · `restart` · `status` · `logs` · `trace [n]` · `dapp` · `compute [restart]` · `guard`(내부용) · `moni [start\|stop\|status\|logs\|power [초]] [VA NV]` |
-| `vcam.sh` | `start <N> [fps] [모델]` · `stop` · `restart` · `status` · `logs` · `make-frames <이미지 폴더\|영상> [개수]` · `dry-run` |
-| `dash.sh` | `start` · `stop` · `restart` · `status` · `logs` · `list` · `sim [ours\|baseline]` · `sim stop` · `sim logs` |
-| `logs.sh` | `<대상> [-n N] [--raw]` — `gnb mac l1 tgen ru testmac dapp va nonva ric xapp ppo moni core\|amf\|smf\|upf ue all` |
-| `ue_table.py` | `python3 ue_table.py` (`--rntis` = xApp용 대응 한 줄) |
-
-모듈별 문서: `README.md`(무엇이 어디서 도는가, 디렉터리), `SETUP.md`(새 서버 설치), `docs/MODE_SWITCH.md`, `dash/README.md`, `va_service/README.md`, `nonva_service/README.md`, `xapp_ppo/README.md`.
-
-## 부록 B. 배경 메모
-
-**Baseline의 구성 상세** — L1은 연구실 바닐라 cuBB 25-3 바이너리(`BASELINE_TREE=/home/nvidia/hsw/25_3_hsw/...`, 읽기 전용 마운트, MPS)다. 설정은 연구실 config 디렉터리의 사본 `config/baseline_cuphy_config/`를 덮어 마운트하고, 그중 `cuphycontroller_baseline.yaml`은 연구실 `config_benetal` yaml에서 `mps_sm_pusch`만 120 → 64로 바꾼 것이다(4g 인스턴스가 64 SM). 이 빌드는 PRACH 임계값 20이 하드코딩되어 있다(순정 `25_3`은 가짜 RA가 분당 100건 생긴다). YOLO는 우리 테넌트 바이너리를 naive 모드로 띄운 것이다: 인스턴스 전체(60 SM, 자동 감지) 고정, FAPI 없음, QoS 거절 없음, 분할 없음, 모델 1개(batch-3 FHD 엔진, 디코드 · NMS는 Ours와 같음), 도착 순서대로 실행. VA 서비스는 Ours와 같은 포트(9810)로 붙는다. `./dgist.sh up`은 모드에 맞게 `docker-compose.yaml` 또는 `docker-compose.baseline.yaml`을 쓰고, 생성기를 켜면 `docker-compose.tgen.yaml` / `docker-compose.tgen.baseline.yaml`을 덧붙인다. 파일: `docker-compose.baseline.yaml`, `scripts/l1_entrypoint_baseline.sh`, `scripts/yolo_entrypoint_baseline.sh`, `scripts/mig.sh`, `scripts/build_yolo_engines_mig.sh`.
-
-**생성기와 Baseline** — Baseline + 생성기의 L1 설정은 `config/tgen/cuphycontroller_dgist_tgbase.yaml`(`use_green_contexts 0`, `mps_sm_pusch 60`, `mps_sm_pdsch 62`, Benetel NIC `mtu 8192`)이고 Ours + 생성기는 `config/tgen/cuphycontroller_dgist_tg.yaml`이다. `mtu 8192`는 6셀 L1을 MIG 4g의 메모리(46.5 GiB)에 넣기 위한 것이다(이유와 측정값은 `docs/MODE_SWITCH.md` 7장). 시험 벡터는 `/data/dgist_tgen/testVectors`(`TRAFFIC_GEN_TV_DIR`)에 있어야 한다.
-
-**입력 프로파일 `DAPP_INPUT=4k|fhd` (2026-11-09)** — `4k` = 3840×2160, batch-8 타일(1280 크롭 6 + 전체 2, 엔진 `models/full26*`), `fhd` = 1920×1080, batch-3(1280×1080 크롭 2 + 전체 1, 엔진 `models/fhd26*`, `scripts/build_yolo_engines.sh fhd`). `VA_CAMERA_WIDTH/HEIGHT`를 같이 맞춘다(`check`가 불일치를 알려 준다; 다른 크기의 프레임도 전체 보기만으로 처리는 된다). `fhd`의 SM 클래스는 `DAPP_TENANT_CLASSES_FHD`다(기본 24,40,48,56,64,72,80; 2026-11-11부터 88 추가 가능). 88은 (P132,N24) 틈으로, UL 작업이 4슬롯 안에 없는 D 4~7 슬롯에만 생긴다. 클래스는 추론 전체 구간의 최소 틈으로 고르므로, UE가 붙어 UL 제어가 매 프레임 있으면 사실상 80까지 쓰이고 UL이 없는 프레임에서만 88이 선택된다(검증 기록 `prof/tenant/fhd/class88_2026-11-11.md`). 바꾼 뒤 `./dgist.sh down; ./dgist.sh up`.
-
-**엔진 로드 규칙 (2026-11-10)** — 테넌트는 모든 엔진을 primary context에서 역직렬화한다(`DAPP_TENANT_ENGINE_CTX=prim` 기본, 단독 측정 비용 26x +2.7 %). 클래스별 green context에서 역직렬화하면 TensorRT 10.3(Myelin)이 그 시점 context의 SM 수로 GEMM 그리드를 정해 프로세스 전체에 캐시하므로 먼저 로드된 클래스의 그리드가 다른 클래스에 적용된다. fhd26s / fhd26l의 sm80 엔진은 고유 sm80 tactic으로 빌드하면 같은 모델의 다른 클래스와 한 프로세스에서 "Cask Gemm execution"으로 실패하므로 `scripts/build_yolo_engines.sh`가 sm72 timing cache(`models/fhd26<m>/sm72.timing.cache`)로 빌드한다(26s 3.7 / 26l 8.1 ms, 고유 tactic과 같음).
-
-**슬롯 맵 영상 (`./dgist.sh slotmap`, 2026-11-11)** — `runs/<이름>/dapp_tenant_slots.csv`를 GPU Slot Map 영상으로 렌더링한다. CSV는 슬롯(0.5 ms)마다 한 줄: `t_ns`(벽시계), `gap_P` / `gap_N`(그 슬롯에 YOLO에 제공된 틈, 여유 SM = P−N−8, 5G 예약 = 132−여유), `run_cls`(추론 중 점유 SM), `queue`, `model`. Ours 레인은 이 기록 그대로이고, Baseline 레인은 같은 5G 예약 · 같은 요청에 MIG 벽을 씌운 **계산값**이다(추론 시간 ×1.3, 벽의 기본값 72 / 60; `--wall`, `--ai-wall`, `--baseline-factor`로 바꿀 수 있다). 10 실초 = 1/20 배속 200초 영상. `.env DAPP_SLOT_CSV=0`이면 CSV를 쓰지 않는다(분당 약 5 MB).
-
-**코어** — `core.sh`는 `up | down | status`(sudo) 말고도 `config`(설정 복사본 `core/etc/` 목록, 라이브와의 차이), `diff [nf]`, `install-config <nf>`(복사본을 `/etc/open5gs`에 설치 + 유닛 재시작, 백업 남김), `build`(소스 `open5gs/` meson 빌드; dev 패키지 필요), `subs`(가입자 목록), `logs`가 있다. `./core.sh`는 첫 인자만 넘기므로 인자가 붙는 `diff <nf>`, `install-config <nf>`는 `bash scripts/core.sh diff amf` 꼴로 부른다. 가입자 추가는 WebUI `http://<host>:9999`.
-
-**RIC** — 우리 빌드 `build_dgist`(E2AP_V2, KPM_V2_03), RIC IP 127.0.0.2(`config/flexric.conf`; 연구실의 옛 모니터 프로세스들이 127.0.0.1을 폴링하므로 분리). SM 라이브러리는 `flexric_sm/`에 두고 gNB 컨테이너에 마운트한다(`./ric.sh install-sm`; 빌드 뒤 한 번).
-
-**PPO xApp** — 번들은 `.env PPO_BUNDLE_NAME`(기본 6G 20입력: YOLO 모델과 SM 수를 우리 dApp에서 받는다). RNTI는 `.env VA_IMSIS` / `NONVA_IMSIS`로 자동 대응한다. `moni power`는 `ue_power.py`(UE별 RSRP · PCMAX · PH · 송신 전력 · 감당 PRB 대 실제 grant · MCS / BLER / SNR 표)다. 그 밖의 설정: `PPO_GPU_SOURCE`(19입력 번들용), `PPO_DAPP`, `PPO_MIN_PRBS`. `ue_table.py`는 AMF / SMF 저널을 읽으므로 nvidia 계정이 `systemd-journal` 그룹에 있어야 한다(2026-11-05 적용).
-
-**가상 카메라** — N개의 FHD JPEG 스트림을 전화기 프레임과 같은 RUN 경로로 dApp 에이전트에 직접 보낸다(개방 루프: fps 유지, inflight 4, 넘치면 건너뜀). 상태 `runs/vcam/status.json`, 프레임 `va_service/vcam_frames/`, 설정 `.env VCAM_FPS`(10), `VCAM_INFLIGHT`, `VCAM_FRAMES`, `VCAM_JPEG_QUALITY`(0.70).
+| `SETUP.md` | 새 서버에 설치하는 방법 |
+| `dash/README.md` | 대시보드 상세: 지표 정의와 출처, 저장 파일, Replay, Capture, 컴포넌트 제어, 데모 영상 탭 |
+| `docs/MODE_SWITCH.md` | 모드별 L1 설정, 생성기의 배경(GPU 메모리, MTU) |
+| `docs/CHANGES_DGIST_AERIAL.md`, `docs/CHANGES_HSW_OAI.md`, `docs/patches/` | Aerial(L1)과 OAI(gNB)에 넣은 변경 |
+| `va_service/README.md`, `nonva_service/README.md`, `xapp_ppo/README.md` | 각 서비스와 PPO xApp |
+| `aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/docs/XAPP_INTERFACE.md` | YOLO 요청 창구(agent, TCP 9810)의 메시지 형식 |

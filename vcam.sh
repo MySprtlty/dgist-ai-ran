@@ -1,5 +1,5 @@
 #!/bin/bash
-# vcam.sh - virtual cameras: extra YOLO load for the demo without any uplink (run as nvidia from /home/nvidia/_dgist). 2026-11-12
+# vcam.sh - virtual cameras: extra YOLO load for the demo without any uplink (run from this directory by the account that owns it). 2026-11-12
 #   N FHD JPEG streams go straight to the dApp agent (TCP 9810, role "vcam") on the same RUN path as the phones' frames, so only the
 #   GPU request rate rises; the cell, the phones and the VA service's own agent connection are untouched. Open loop: each camera
 #   offers its fps whatever the latency is (inflight cap like the phone page, skipped frames counted).
@@ -11,7 +11,7 @@
 #   dry-run <N> [fps] [sec]   pacing test without the agent (no GPU load)
 # settings (.env, optional): VCAM_FPS, VCAM_INFLIGHT (4), VCAM_FRAMES (va_service/vcam_frames), VCAM_JPEG_QUALITY (0.70); VA_MODEL, VA_DEADLINE_MS, VA_AGENT are shared with the VA service
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo)"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo)"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
 V=$D/va_service; VENV=$V/yolo_env; R=$D/runs/vcam; PIDF=$R/vcam.pid; mkdir -p $R

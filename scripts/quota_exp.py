@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""quota_exp.py <VA_PRBS> <seconds> [--label NAME] [--every SEC]   (run as nvidia from /home/nvidia/_dgist; PPO xApp must be stopped)
+"""quota_exp.py <VA_PRBS> <seconds> [--label NAME] [--every SEC]   (run from the package directory by the account that owns it; PPO xApp must be stopped)
 Fixed-quota experiment (2026-11-12): holds the VA slice at VA_PRBS PRBs (non-VA gets 273 - VA_PRBS) with the lab's
 xapp_slice_quota_ctrl (SLICE_MODE=fixed), samples every --every seconds the VA service's rolling 60-s latency figures
 (/viewer_status last60: UL / sum p50 p90 p99, QoS, req/s, KB, Mbps per VA UE), the non-VA receiver stats, the gNB per-UE radio
@@ -73,7 +73,7 @@ def main():
         print("!! RNTI mapping unknown (runs/xapp/rntis.txt missing and ue_table.py failed)"); return 1
     B = D / "openairinterface5g" / "openair2" / "E2AP" / "flexric" / e.get("FLEXRIC_BUILD", "build_dgist")
     Q = B / "examples" / "xApp" / "c" / "slice" / "xapp_slice_quota_ctrl"
-    SM = Path(e.get("FLEXRIC_SM_DIR") or (D / "flexric_sm")); CONF = D / "config" / "flexric_xapp.conf"
+    SM = D / (e.get("FLEXRIC_SM_DIR") or "flexric_sm"); CONF = D / "config" / "flexric_xapp.conf"   # a relative .env path is relative to the package directory
     label = a.label or f"va{a.va_prbs}"
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out = D / "runs" / "quota_exp"; out.mkdir(parents=True, exist_ok=True)

@@ -55,7 +55,7 @@ hsw 연구실의 `yolo_service`(전화기 카메라 → HTTPS → GH200에서 YO
 ## 실행 (`../va.sh`)
 
 ```bash
-cd /home/nvidia/_dgist
+cd <패키지 디렉터리>
 ./va.sh start            # yolo_env 활성화 + uvicorn (HTTPS, certs/server.*) 백그라운드 기동 → https://10.45.0.1:8000/
 ./va.sh status           # 프로세스·포트·에이전트 연결·카운터·에이전트 추정치·UE 세션·최근 CSV
 ./va.sh test ue1 25 5    # 전화기 대역(ue_sim.py): 4K 프레임 25장을 5 req/s로 → 전화기와 같은 CSV
@@ -78,7 +78,7 @@ Video File(아래 절), 영상과 박스만 크게 보려면 Full Screen.
 # ../.env
 VA_MODEL_SELECT=1                   # 0 = 끔(기본, 모든 요청이 VA_MODEL), 1 = 켬
 VA_MODEL_WEIGHTS=10,10,10,10,60     # 26n,26s,26m,26l,26x 순서
-cd /home/nvidia/_dgist && ./va.sh restart     # Baseline 모드면 ./dgist.sh down && ./dgist.sh up <이름> 도
+./va.sh restart     # Baseline 모드면 ./dgist.sh down && ./dgist.sh up <이름> 도
 ```
 
 - **뜻**: 요청을 값의 합(위 예: 100개)만큼씩 블록으로 끊고, 블록마다 정확히 10개는 26n, 10개는 26s, 10개는 26m, 10개는 26l, 60개는 26x로 보낸다.
@@ -153,7 +153,7 @@ Start video at: [시:분]  Set / Cancel   고른 시각이 되면 0초부터 재
 
 ## 기지국 뷰어 (`/viewer`, 2026-11-11)
 
-non-VA 서비스의 `/viewer`(최신 프레임 MJPEG 중계)에 해당하는 VA 쪽 화면. PC 브라우저에서 `https://10.150.21.161:8000/viewer`(호스트 LAN) 또는
+non-VA 서비스의 `/viewer`(최신 프레임 MJPEG 중계)에 해당하는 VA 쪽 화면. PC 브라우저에서 `https://<서버 IP>:8000/viewer`(호스트 LAN) 또는
 UE에서 `https://10.45.0.1:8000/viewer`(자체 서명 인증서 경고 1회 수락). **`/viewer` 한 페이지에 UE 4대**: 위 줄 VA ue1·ue2(박스, QoS 정지 규칙),
 아래 줄 non-VA ue1·ue2(720p 중계, 수신 fps·Mbps·KB·UL). non-VA 영상은 브라우저가 8001 포트에서 직접 받으므로 그 인증서도 한 번 수락해야 한다
 (안 보이면 칸 안에 안내가 뜸). `/viewer/va`는 VA 2대만, `/viewer/ue1`은 한 UE만 크게.

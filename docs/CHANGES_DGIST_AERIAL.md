@@ -1,6 +1,6 @@
 # DGIST Aerial(cuPHY-CP) 변경점 — 기능 → 파일
 
-트리: `_dgist/aerial-cuda-accelerated-ran/` = `/home/troy/build/aerial-cuda-accelerated-ran` 브랜치 `hybrid`의 작업 트리 복사본 (2026-11-05, prof/·sweep 로그 제외).
+트리: `aerial-cuda-accelerated-ran/` = 서브모듈(포크 `MySprtlty/aerial-cuda-accelerated-ran`의, 이 저장소 브랜치와 같은 이름의 브랜치). 아래 표는 2026-11-05 기준이다.
 기준: NVIDIA Aerial CUDA-Accelerated RAN **Release 25-3** (커밋 `654c249`). NVIDIA 파일의 변경은 `docs/patches/aerial_25-3_dgist_nvidia_files.patch`
 (30 파일, +1449/-46, yaml 제외), 우리 고유 파일은 `cuPHY-CP/dapp_hook/` 아래에 있다. 빌드물: `build.aarch64_f1002/` (Ninja, Release,
 `SCF_FAPI_10_04=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH=OFF SCF_FAPI_10_04_SRS=ON ENABLE_DAPP_HOOK=ON`; 트리와 같은 마운트 경로 `/opt/nvidia/cuBB`라

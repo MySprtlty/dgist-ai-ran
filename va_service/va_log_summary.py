@@ -4,7 +4,7 @@
 # split of AI (wait, decode, infer) and the QoS-met share. Files of one minute form a group (ue1 + ue2 of the same run). Read-only.
 import csv, glob, os, re, statistics as st, sys
 from collections import defaultdict
-D = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "/home/nvidia/_dgist/runs/va_service_log"
+D = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runs", "va_service_log")
 pref = sys.argv[sys.argv.index("--group") + 1] if "--group" in sys.argv else ""
 groups = defaultdict(list)
 for f in sorted(glob.glob(D + "/va_ul_dl_latency_ue*_*.log")):

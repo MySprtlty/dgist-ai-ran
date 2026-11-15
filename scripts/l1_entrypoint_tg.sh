@@ -11,8 +11,8 @@
 # -> testMAC right after the gNB's CONFIG.request for cell 5 (wait_all_cell_config: no slot indication before every cell is configured).
 # Load level at run time: scripts/tgen_load.py (./tgen.sh load low|mid|high|auto) writes the control word both tools map.
 # Markers for docker's healthcheck: /tmp/dgist_l1_ready, /tmp/dgist_tenant_ready (Ours). Small logs: /opt/dgist/runs/$RUN_NAME/ (= ./runs/<name>/);
-# the full nvlog files (several GB per hour) go to /opt/dgist/tglog/$RUN_NAME/ (= .env TRAFFIC_GEN_LOG_DIR/<name>/ on /data), not to the root disk.
-# The two validated 1-cell entrypoints (l1_entrypoint.sh, l1_entrypoint_baseline.sh) are not used and not changed by this path.
+# the full nvlog files (several GB per hour) go to /opt/dgist/tglog/$RUN_NAME/ (= .env TRAFFIC_GEN_LOG_DIR/<name>/ on the host; default ./tgen/log, which may sit on a big disk).
+# The 1-cell entrypoint (l1_entrypoint.sh, both modes) is not used by this path.
 set -u; umask 022
 SDK=/opt/nvidia/cuBB; DG=/opt/dgist; CFG=$SDK/cuPHY-CP/cuphycontroller/config; PHYLOG=/tmp/phy.log
 BUILD_DIR=${BUILD_DIR:-build.aarch64_f1002}; MODE=${DEMO_MODE:-ours}; NAME=${RUN_NAME:-manual}; RUN=$DG/runs/$NAME
@@ -20,7 +20,10 @@ NC=5; PC=5                                   # emulator cells 0..NC-1, phone cel
 PAT=${TRAFFIC_GEN_PATTERN:-tmp_fluct}; BF=${TRAFFIC_GEN_BLOCK_FRAMES:-1}; BR=${TRAFFIC_GEN_BLOCK_REPEAT:-300}
 LOADF=/dev/shm/dgist_tgen_load               # ipc: host -> the same file on the host (dashboard, tgen.sh)
 [ "$MODE" = baseline ] && TGC=${TG_BASELINE_L1_CONFIG:-dgist_tgbase} || TGC=${TG_L1_CONFIG:-dgist_tg}
-LOGD=$DG/tglog/$NAME; HOSTLOGD=${TRAFFIC_GEN_LOG_DIR:-/data/dgist_tgen/log}/$NAME
+LOGD=$DG/tglog/$NAME
+# host path of $LOGD for the links in the run directory: dgist.sh exports TRAFFIC_GEN_LOG_DIR absolute (scripts/paths.sh) and the tgen compose
+# files pass it; a relative value (docker compose run by hand) is relative to the package directory = two levels above runs/<name>/
+HL=${TRAFFIC_GEN_LOG_DIR:-./tgen/log}; case "$HL" in /*) ;; *) HL=../../${HL#./} ;; esac; HOSTLOGD=$HL/$NAME
 OWN=$(stat -c %u:%g $DG/runs); B=$SDK/$BUILD_DIR/cuPHY-CP
 BIN=$B/cuphycontroller/examples/cuphycontroller_scf; RUBIN=$B/ru-emulator/ru_emulator/ru_emulator; TMBIN=$B/testMAC/testMAC/test_mac
 log() { local m="[dgist-l1 tgen $(date +%T)] $*"; echo "$m"; echo "$m" >> $RUN/entrypoint.log 2>/dev/null; }
@@ -40,7 +43,7 @@ for f in cuphycontroller_$TGC.yaml l2_adapter_$TGC.yaml nvipc_multi_dgist_tg.yam
 M=$SDK/cuPHY-CP/dapp_hook/models; ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26
 if [ $MODE = ours ]; then for m in n s m l x; do [ -e $M/$ESET$m/seg00_sm80.engine ] || log "warning: YOLO engine models/$ESET$m/seg00_sm80.engine missing (scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; done; fi
 
-# 1. MPS: off for the green contexts (Ours), on for the static split inside the MIG 4g instance (Baseline, as the researchers' recipe)
+# 1. MPS: off for the green contexts (Ours), on for the static split inside the MIG 4g instance (Baseline, the researchers' recipe)
 export CUDA_MPS_PIPE_DIRECTORY=/var CUDA_MPS_LOG_DIRECTORY=/var
 echo quit | nvidia-cuda-mps-control 2>/dev/null; sleep 1
 if [ $MODE = ours ]; then
@@ -55,7 +58,7 @@ cp $T/cuphycontroller_$TGC.yaml $T/l2_adapter_$TGC.yaml $T/nvipc_multi_dgist_tg.
 cp $T/ru_dgist_tg.yaml $SDK/cuPHY-CP/ru-emulator/config/ && cp $T/testmac_dgist_tg.yaml $SDK/cuPHY-CP/testMAC/testMAC/ || { log "copy of the RU-emulator / testMAC yaml failed"; exit 1; }
 chown $OWN $CFG/cuphycontroller_$TGC.yaml $CFG/l2_adapter_$TGC.yaml $CFG/nvipc_multi_dgist_tg.yaml $SDK/cuPHY-CP/ru-emulator/config/ru_dgist_tg.yaml $SDK/cuPHY-CP/testMAC/testMAC/testmac_dgist_tg.yaml
 
-# 3. logs: nvlog files of the three programs on /data (AERIAL_LOG_PATH), reachable under the usual /tmp names; a link to the host path in the run dir
+# 3. logs: nvlog files of the three programs in the log directory (AERIAL_LOG_PATH), reachable under the usual /tmp names; a link to the host path in the run dir
 export AERIAL_LOG_PATH=$LOGD
 for f in phy.log ru.log testmac.log dapp_tenant_slots.csv; do : > $LOGD/$f; chown $OWN $LOGD/$f; ln -sfn $LOGD/$f /tmp/$f; done
 ln -sfn $HOSTLOGD $RUN/tglog
@@ -98,7 +101,7 @@ if [ $MODE = ours ]; then
   WHAT="green contexts | PUSCH profiles $DAPP_PUSCH_PROFILES | PDSCH $DAPP_PDSCH_PROFILES | dApp classes $DAPP_TENANT_CLASSES | input $DAPP_INPUT ($ESET) | agent TCP $DAPP_AGENT_PORT"
 else
   # Baseline: no dApp feature may reach the L1 (.env passes DAPP_* into the container). CUDA_DEVICE_MAX_CONNECTIONS = 8 = the image default
-  # = the researchers' recipe (l1_entrypoint_baseline.sh) = the research MIG arm; it MUST be set: cuphydriver context.cpp:412-413 formats the
+  # = the researchers' recipe (as in l1_entrypoint.sh, Baseline) = the research MIG arm; it MUST be set: cuphydriver context.cpp:412-413 formats the
   # getenv() result without a null check and the L1 dies with SIGSEGV when the variable is missing (measured 2026-11-13, run tg_base_dbg1).
   # The mps_sm_* values of config/tgen/cuphycontroller_dgist_tgbase.yaml are those of the research MIG arm (fullstack_run.sh MIG_SM=1).
   for v in $(compgen -e | grep '^DAPP_'); do unset $v; done

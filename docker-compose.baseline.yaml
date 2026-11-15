@@ -1,6 +1,7 @@
 # _dgist BASELINE mode (.env DEMO_MODE=baseline, 2026-11-12): the same 1-cell COTS-UE stack with the GPU split by MIG
-#   l1   = the researchers' VANILLA cuBB 25-3 cuphycontroller (their tree ${BASELINE_TREE}, their build.aarch64, config_benetal, MPS)
-#          on the MIG 4g instance (72 SMs)  -> container dgist-l1   (no dApp hook, no green contexts, no FAPI-aware scheduler)
+#   l1   = OUR L1 build (./aerial-cuda-accelerated-ran/$BUILD_DIR, the same binary as in Ours) with every dApp feature off: MPS with the
+#          static mps_sm_* split, no green contexts, dApp hook disabled, no tenant (config/cuphycontroller_<BASELINE_L1_CONFIG>.yaml =
+#          the researchers' Benetel baseline values) on the MIG 4g instance (64 SMs)  -> container dgist-l1
 #   yolo = NAIVE YOLO server: the stand-alone tenant of our tree with every scheduling feature off, one batch-3 FHD engine of .env VA_MODEL
 #          built for the MIG 3g instance (60 SMs) -> container dgist-yolo, agent TCP ${DAPP_AGENT_PORT} (the VA service connects as in Ours)
 #   gnb  = hsw OAI gNB, unchanged -> container dgist-gnb (no slicing xApp in this mode; all.sh skips it)
@@ -28,18 +29,19 @@ services:
       - RUN_NAME=${RUN_NAME:-manual}
       - NVIDIA_VISIBLE_DEVICES=${MIG_4G}
       - CUDA_VISIBLE_DEVICES=${MIG_4G}     # privileged containers see every MIG instance: CUDA must be pinned to the 4g one
+      - DEMO_MODE=baseline                 # the entrypoints choose the Baseline path (same value as .env when driven by dgist.sh)
       - NVIDIA_DRIVER_CAPABILITIES=all
     devices:
       - /dev/gdrdrv:/dev/gdrdrv
     volumes:
-      - ${BASELINE_TREE}:/opt/nvidia/cuBB:ro
-      - ./config/baseline_cuphy_config:/opt/nvidia/cuBB/cuPHY-CP/cuphycontroller/config:ro   # the lab's config dir + cuphycontroller_baseline.yaml (mps_sm_pusch fitted to the 4g instance)
+      - ./aerial-cuda-accelerated-ran:/opt/nvidia/cuBB
+      - ./config:/opt/dgist/config:ro
       - ./scripts:/opt/dgist/scripts:ro
       - ./runs:/opt/dgist/runs
       - /dev/hugepages:/dev/hugepages
       - /lib/modules:/lib/modules:ro
       - /usr/src:/usr/src:ro
-    command: ["bash", "/opt/dgist/scripts/l1_entrypoint_baseline.sh"]
+    command: ["bash", "/opt/dgist/scripts/l1_entrypoint.sh"]
     stop_grace_period: 40s
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/dgist_l1_ready"]

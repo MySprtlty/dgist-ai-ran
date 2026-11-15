@@ -1,12 +1,14 @@
-# Ours / Baseline 모드 전환·실행 매뉴얼 (2026-11-12, 트래픽 생성기 7장 추가 2026-11-13)
+# Ours / Baseline 모드 전환·실행 매뉴얼 (2026-11-12, 트래픽 생성기 7장 추가 2026-11-13, Baseline L1 통일 · 패키지 기준 경로 2026-11-15)
 
-모든 명령은 `/home/nvidia/_dgist`에서 **nvidia 계정**으로 실행한다. 예외는 MIG 전환(`scripts/mig.sh`) 하나로, root가 필요하다
-(troy 계정에서 `sudo -n`; nvidia 계정에 `sudo` NOPASSWD로 이 스크립트만 허용하면 `all.sh mode`가 알아서 전환한다).
+> 운용 절차의 기준 문서는 `MANUAL.md`다. 이 문서는 모드 전환과 트래픽 생성기의 배경 · 측정값을 남겨 둔다.
+
+모든 명령은 패키지 디렉터리(이 저장소를 클론한 곳)에서 **그 디렉터리를 가진 계정**으로 실행한다. 예외는 MIG 전환(`scripts/mig.sh`) 하나로, root가 필요하다
+(sudo가 있는 계정에서 `sudo scripts/mig.sh on|off`; 스택 계정에 `sudo` NOPASSWD로 이 스크립트만 허용하면 `all.sh mode`가 알아서 전환한다).
 
 | | Ours (`DEMO_MODE=ours`, 기본) | Baseline (`DEMO_MODE=baseline`) |
 |---|---|---|
 | GPU | 전체 132 SM, MIG 꺼짐 | MIG 4g.48gb(64 SM) + 3g.48gb(60 SM) |
-| L1 | 우리 cuphycontroller: 녹색 컨텍스트, FAPI 인지 YOLO 테넌트, xApp 에이전트 | 연구실 바닐라 cuBB 25-3(`/home/nvidia/hsw/25_3_hsw`, 읽기 전용) → MIG 4g, 컨테이너 `dgist-l1` |
+| L1 | 우리 cuphycontroller: 녹색 컨텍스트, FAPI 인지 YOLO 테넌트, xApp 에이전트 | **같은 우리 빌드**에서 dApp 기능을 모두 끈 것(MPS 고정 분할, 녹색 컨텍스트 · 훅 · 테넌트 없음; `config/cuphycontroller_dgist_base.yaml`) → MIG 4g, 컨테이너 `dgist-l1` |
 | YOLO | L1 안, 슬롯마다 24~88 SM | 컨테이너 `dgist-yolo` → MIG 3g, naive(60 SM 고정, QoS 거절·분할·모델 선택 없음) |
 | xApp | PPO 슬라이싱 (`--xapp`) | 없음 |
 | 트래픽 생성기 (`TRAFFIC_GEN=1`, 7장) | 같은 L1에 에뮬레이터 5셀 추가 (모두 6셀) | 6셀 L1은 우리 빌드에서 dApp 기능을 끈 것 (MIG 4g), YOLO는 그대로 |
@@ -25,8 +27,8 @@
 ```bash
 ./all.sh down                       # xApp, VA/non-VA, gNB, L1 내림 (코어 유지)
 ./all.sh mode baseline              # .env DEMO_MODE=baseline
-sudo -n scripts/mig.sh on           # [root] MIG 켜고 4g+3g 생성, runs/mig.env 기록  (troy 계정에서)
-./all.sh up <이름>                   # 바닐라 L1(4g) + naive YOLO(3g) + gNB + VA + non-VA
+sudo -n scripts/mig.sh on           # [root] MIG 켜고 4g+3g 생성, runs/mig.env 기록  (sudo가 있는 계정에서)
+./all.sh up <이름>                   # dApp을 끈 L1(4g) + naive YOLO(3g) + gNB + VA + non-VA
 ```
 
 ## 2. Baseline → Ours
@@ -50,8 +52,8 @@ sudo -n scripts/mig.sh off          # [root] 인스턴스 삭제, MIG 끔
 ```bash
 # 폰: VA https://10.45.0.1:8000/  non-VA https://10.45.0.1:8001/  (서비스를 재시작했으면 페이지 새로 고침 후 시작)
 #     소스: Start Camera(카메라) 또는 Video File(폰에 저장된 동영상; VA는 FHD로 자동 변환, 하향 트래픽 없음) → Start VA / Start Streaming → Full Screen
-# 뷰어(PC): https://10.150.21.161:8000/viewer   (/viewer/va = VA 2대, /viewer/ue1 = 한 대; 아래 줄 "26x · 60 SM" = Baseline, "80 SM" = Ours)
-# 대시보드(PC): http://10.150.21.161:8010/   ("측정 시작" → 이름 입력 … "측정 종료" → 요약; 왼쪽 위 배지가 Ours / Baseline, 기록·Replay는 같은 페이지)
+# 뷰어(PC): https://<서버 IP>:8000/viewer   (/viewer/va = VA 2대, /viewer/ue1 = 한 대; 아래 줄 "26x · 60 SM" = Baseline, "80 SM" = Ours)
+# 대시보드(PC): http://<서버 IP>:8010/   ("측정 시작" → 이름 입력 … "측정 종료" → 요약; 왼쪽 위 배지가 Ours / Baseline, 기록·Replay는 같은 페이지)
 ./dash.sh start | status | stop    # 실험 대시보드 (스택과 따로 돈다; 모드를 바꿔도 다시 켤 필요 없음)
 ./va.sh status | ./nonva.sh status | ./va.sh logs
 ./dgist.sh test 26x 10 20           # YOLO 서버 직접 부하 (Baseline은 dgist-yolo 안에서 ra_stub)
@@ -81,7 +83,7 @@ python3 scripts/quota_exp.py 100 90 --label va100                  # 고정 quot
 | VA / non-VA 서비스 | `runs/va_service/uvicorn.log`, `runs/nonva_service/uvicorn.log`; 폰 CSV `runs/va_service_log/`, `runs/nonva_service_log/` |
 | xApp | `runs/xapp/xapp.log`, `log/ppo_output_log/`, 모니터 `log/moni_log/` |
 | 측정 | `runs/quota_exp/*.csv`, `*.summary.txt`; 가상 카메라 `runs/vcam/` |
-| 트래픽 생성기 | `runs/<이름>/ru_console.log`, `testmac_console.log`, `tgen_load.log`, `l1_persec_emu.log`; 전체 nvlog `/data/dgist_tgen/log/<이름>/` |
+| 트래픽 생성기 | `runs/<이름>/ru_console.log`, `testmac_console.log`, `tgen_load.log`, `l1_persec_emu.log`; 전체 nvlog `tgen/log/<이름>/`(.env `TRAFFIC_GEN_LOG_DIR`) |
 | 대시보드 | 측정 기록 `runs/dash/<이름>_<시각>/` (`.replay.jsonl`, `.summary.txt/.json`, `.timeseries.csv`, `.frames.csv`, `.slots.csv.gz`), 서버 로그 `runs/dash_service/` |
 
 ## 6. 주의
@@ -89,7 +91,8 @@ python3 scripts/quota_exp.py 100 90 --label va100                  # 고정 quot
 - 순서를 지킨다. 스택이 떠 있으면 `mode`가 거부하고, GPU에 프로세스가 있으면 `mig.sh`가 거부한다.
 - `all.sh up` 끝의 `FAILED components: ric`는 타이밍 오경보다(RIC는 정상, E2 SETUP 대기 시간 문제).
 - Baseline 엔진 `models/migfhd26x/seg00_sm60.engine`은 한 번만 빌드하면 된다. `VA_MODEL`을 바꾸면 `scripts/build_yolo_engines_mig.sh <n|s|m|l>`(MIG 켠 뒤).
-- Baseline L1은 연구실 `25_3_hsw` 빌드를 쓴다(PRACH 임계값 20 하드코딩; 트래픽 생성기를 켜면 우리 빌드로 바뀐다 → 7장). 순정 `25_3`은 가짜 RA가 분당 100건 생긴다.
+- Baseline L1은 2026-11-15부터 모든 구성에서 Ours와 같은 우리 빌드다(dApp 기능만 끈다; PRACH 임계값은 `.env PRACH_FORCE_THR0`). 그 전에는 전화기 셀만일 때 연구실의 cuBB 25-3 빌드를 썼다.
+  전화기 셀만인 Baseline을 우리 빌드로 실행한 측정은 아직 없다.
 - 폰 재접속으로 RNTI가 바뀌면 `ue_table.py`가 현재 gNB 기동 이후의 등록만 보고 매핑한다(이전엔 id 재사용으로 잘못 잡혔음).
 - 대시보드(`dash.sh`)는 두 모드에서 같은 화면을 쓴다. Baseline에는 슬롯 CSV와 xApp이 없으므로 GPU 슬롯 맵은 MIG 고정 분할(L1 / YOLO)로, GPU 부하율은 요청률 × 추론 시간 추정으로, UE별 PRB는 gNB 로그 표본(~1 %)으로 나온다. 두 모드를 비교할 때는 측정 이름에 모드를 넣어 따로 기록한다 (상세 `dash/README.md`).
 
@@ -118,7 +121,7 @@ L1 셀 번호만 0 → 5로 바뀐다(모두 6셀). 5셀은 시험 벡터 트래
 
 | | Ours + 생성기 | Baseline + 생성기 |
 |---|---|---|
-| L1 | 우리 빌드, 녹색 컨텍스트, YOLO 테넌트 (1셀 때와 같음) | **우리 빌드(`build.aarch64_f1002`)에서 dApp 기능을 모두 끈 것** → MIG 4g, MPS. 연구실 바닐라 빌드에는 Benetel 셀 + 에뮬레이터 셀을 한 L1에 올리는 수정이 없어서 쓸 수 없다 |
+| L1 | 우리 빌드, 녹색 컨텍스트, YOLO 테넌트 (1셀 때와 같음) | **우리 빌드(`build.aarch64_f1002`)에서 dApp 기능을 모두 끈 것** → MIG 4g, MPS (전화기 셀만일 때와 같은 빌드) |
 | L1 설정 | `config/tgen/cuphycontroller_dgist_tg.yaml` | `config/tgen/cuphycontroller_dgist_tgbase.yaml`: `use_green_contexts 0`, `mps_sm_pusch 60`, `mps_sm_pdsch 62`, Benetel NIC `mtu 8192` |
 | YOLO | L1 안, 부하에 따라 SM 수가 바뀜 | `dgist-yolo` → MIG 3g, 60 SM 고정 (1셀 때와 같음) |
 | GPU 메모리 (측정) | L1+YOLO 한 프로세스 77,742 MiB (75.9 GiB) | L1 36,074 MiB (35.2 GiB) / MIG 4g 47,616 MiB (46.5 GiB), YOLO 1,660 MiB |
@@ -141,10 +144,10 @@ Baseline(3분): Err.ind 0, RU 늦은 슬롯 0. Ours(9분): Err.ind 10(한 슬롯
 폰 셀의 CRC 실패 비율은 Baseline(MTU 8192) 18.5 %, Ours(MTU 9000) 15.9 %와 21.7 %(다른 실행)로, 실행마다 달라지는 범위 안이다.
 
 **로그**: `runs/<이름>/ru_console.log`, `testmac_console.log`, `tgen_load.log`(단계 전환 시각), `l1_persec_emu.log`, `ru_table.txt`(종료 때 늦은 슬롯 표).
-전체 nvlog는 `/data/dgist_tgen/log/<이름>/`에 쌓인다(두 모드 모두 26~29 GB/시간 — 루트 디스크가 아니라 `/data`). 오래된 실행은 지워서 관리한다.
+전체 nvlog는 `tgen/log/<이름>/`(.env `TRAFFIC_GEN_LOG_DIR`)에 쌓인다(두 모드 모두 26~29 GB/시간; `tgen`은 큰 디스크를 가리키는 링크여도 된다). 오래된 실행은 지워서 관리한다.
 
 **주의**
 - 스택이 도는 동안 호스트에서 무거운 파일 검색(스레드를 많이 쓰는 재귀 grep 등)을 돌리지 않는다. 격리 코어에 스레드가 올라가 L1 슬롯 틱이 늦어지고 Err.ind(0x34)가 쏟아진 일이 있다(2026-11-13 측정).
 - L1이 시작하다 죽으면 `TG_L1_GDB=1 ./dgist.sh up <이름>`으로 gdb 아래에서 띄워 백트레이스를 `l1_console.log`에 남길 수 있다(원인 추적용, 측정에는 쓰지 않는다).
-- 시험 벡터는 `/data/dgist_tgen/testVectors`(.env `TRAFFIC_GEN_TV_DIR`)에 있어야 한다. 없으면 `./dgist.sh check`가 알려 준다.
+- 시험 벡터는 `tgen/testVectors`(.env `TRAFFIC_GEN_TV_DIR`)에 있어야 한다. `scripts/fetch_testvectors.sh`가 설치하고(`SETUP.md` 5절), 없으면 `./dgist.sh check`가 알려 준다.
 - 대시보드는 생성기가 켜지면 위쪽에 `tgen` 표시와 5셀 UL/DL 합·부하 단계를 보여 주고, 폰 셀 수치는 자동으로 L1 셀 5에서 읽는다.

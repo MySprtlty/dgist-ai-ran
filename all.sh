@@ -1,20 +1,20 @@
 #!/bin/bash
-# all.sh - one switch for the whole demo on this host (run as nvidia from /home/nvidia/_dgist)
+# all.sh - one switch for the whole demo on this host (run from this directory by the account that owns it)
 #   up [name] [--xapp]   idempotent: starts what is down, in order: core (sudo password if down) -> nearRT-RIC -> L1 + gNB (dgist.sh up) -> VA service
 #                        -> non-VA service [-> PPO slicing xApp, once 2 VA + 2 non-VA phones stream].  RIC before gNB: the OAI E2 agent
 #                        aborts the gNB if its RIC disappears, so never restart the RIC while the gNB runs.
 #   down [--core]        PPO xApp (+writer, guard) -> monitor -> non-VA -> VA -> gNB + L1 (dgist.sh down) -> nearRT-RIC  [-> core]; ends with what is still running
 #   status               everything on one screen
 #   restart [name]       down + up
-#   mode [ours|baseline] show or switch the demo mode (.env DEMO_MODE; stack must be down). baseline = vanilla cuBB 25-3 on MIG 4g + naive YOLO on MIG 3g,
+#   mode [ours|baseline] show or switch the demo mode (.env DEMO_MODE; stack must be down). baseline = the same L1 build with dApp off on MIG 4g + naive YOLO on MIG 3g,
 #                        no xApp; the MIG partition itself needs root: sudo -n scripts/mig.sh on|off (done here when sudo -n works, else printed)
 #   tgen on|off|load <level>|status   5-cell traffic generator next to the phones' cell (= ./tgen.sh): on/off = .env TRAFFIC_GEN, applies at the next up / restart;
 #                        load low|mid|high|auto switches the load of the 5 emulator cells while they run
 # Individual switches: ./core.sh ./dgist.sh ./va.sh ./nonva.sh ./ric.sh ./xapp.sh | logs: ./logs.sh <target>
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
-set -a; . $D/.env; set +a
+set -a; . $D/.env; set +a; . $D/scripts/paths.sh
 MODE=${DEMO_MODE:-ours}
 port_open() { (echo > /dev/tcp/127.0.0.1/$1) 2>/dev/null; }
 sctp_listen() { ss -lnS 2>/dev/null | grep -q ":$1 "; }
@@ -24,7 +24,7 @@ step() { echo; echo "######## $*  ($(date +%T))"; }
 case "${1:-status}" in
 up)
   shift; NAME=""; XAPP=0; for a in "$@"; do case $a in --xapp) XAPP=1 ;; *) NAME=$a ;; esac; done
-  echo "######## mode: $MODE$( [ "$MODE" = baseline ] && echo ' (vanilla cuBB on MIG 4g + naive YOLO on MIG 3g, no xApp)')"
+  echo "######## mode: $MODE$( [ "$MODE" = baseline ] && echo ' (our L1 build with dApp off on MIG 4g + naive YOLO on MIG 3g, no xApp)')"
   [ "${TRAFFIC_GEN:-0}" = 1 ] && echo "######## traffic generator: on - 5 emulator cells in the same L1 (6 cells), load at start ${TRAFFIC_LOAD:-low}; change while running: ./tgen.sh load low|mid|high|auto"
   [ "$MODE" = baseline ] && [ $XAPP = 1 ] && { echo "   note: --xapp ignored in baseline mode"; XAPP=0; }
   FAIL=""
@@ -36,7 +36,7 @@ up)
     step "L1 + gNB"; bash $D/dgist.sh up ${NAME:-all_$(date +%m%d_%H%M)} || FAIL="$FAIL l1/gnb"
   fi
   if port_open ${VA_PORT:-8000}; then echo "######## VA service: already up (:${VA_PORT:-8000})"; else step "VA service"; bash $D/va.sh start || FAIL="$FAIL va"; fi
-  if port_open ${NONVA_PORT:-8001}; then echo "######## non-VA service: already up (:${NONVA_PORT:-8001})$(pgrep -f 'nonva_service.*uvicorn|_dgist/va_service/yolo_env/bin/uvicorn app:app --host 0.0.0.0 --port '${NONVA_PORT:-8001} > /dev/null || echo ' - NOTE: not ours (another process holds the port)')"; else step "non-VA service"; bash $D/nonva.sh start || FAIL="$FAIL nonva"; fi
+  if port_open ${NONVA_PORT:-8001}; then echo "######## non-VA service: already up (:${NONVA_PORT:-8001})$(pgrep -f "nonva_service.*uvicorn|$D/va_service/yolo_env/bin/uvicorn app:app --host 0.0.0.0 --port ${NONVA_PORT:-8001}" > /dev/null || echo ' - NOTE: not ours (another process holds the port)')"; else step "non-VA service"; bash $D/nonva.sh start || FAIL="$FAIL nonva"; fi
   if c_up dgist-gnb; then
     echo "   waiting for the gNB's E2 SETUP ..."; for i in $(seq 1 30); do docker logs --tail 3000 dgist-gnb 2>&1 | grep -q 'E2 SETUP RESPONSE' && break; sleep 1; done
     docker logs --tail 3000 dgist-gnb 2>&1 | grep -q 'E2 SETUP RESPONSE' && echo "   gNB E2 agent connected to the RIC" || echo "   note: no E2 SETUP RESPONSE in the gNB log yet (./logs.sh gnb)"
@@ -58,7 +58,7 @@ down)
   if c_up dgist-gnb; then echo "!! gNB still running - leaving the RIC up (the E2 agent would abort the gNB)"; else step "nearRT-RIC (after the gNB)"; bash $D/ric.sh stop; fi
   [ $CORE = 1 ] && { step "core down"; bash $D/core.sh down; }
   step "status"; bash $0 status
-  left=""; sctp_listen 36422 && left="$left ric"; c_up dgist-l1 && left="$left l1"; c_up dgist-gnb && left="$left gnb"; port_open ${VA_PORT:-8000} && left="$left va:8000"; port_open ${NONVA_PORT:-8001} && left="$left :8001(not-ours?)"; pgrep -f '_dgist/.*xapp_slice_ppo_ctrl' > /dev/null && left="$left xapp"; pgrep -f '_dgist/.*xapp_ul_input_moni' > /dev/null && left="$left moni"; pgrep -f '_dgist/.*dapp_compute_writer' > /dev/null && left="$left writer"
+  left=""; sctp_listen 36422 && left="$left ric"; c_up dgist-l1 && left="$left l1"; c_up dgist-gnb && left="$left gnb"; port_open ${VA_PORT:-8000} && left="$left va:8000"; port_open ${NONVA_PORT:-8001} && left="$left :8001(not-ours?)"; pgrep -f "$D/.*xapp_slice_ppo_ctrl" > /dev/null && left="$left xapp"; pgrep -f "$D/.*xapp_ul_input_moni" > /dev/null && left="$left moni"; pgrep -f "$D/.*dapp_compute_writer" > /dev/null && left="$left writer"
   [ -z "$left" ] && echo "== all down$( [ $CORE = 1 ] || echo ' (core left running)')" || echo "== still running:$left" ;;
 restart) shift; bash $0 down; bash $0 up "$@" ;;
 mode)
@@ -79,13 +79,13 @@ mode)
     [ -z "$nb" ] || echo "   VA_MODEL_SELECT=1 but no Baseline engine for:$nb - those requests run as ${VA_MODEL:-26x}: scripts/build_yolo_engines_mig.sh$nb  (after MIG on)"; fi
   echo "   next: $0 up <name>" ;;
 status)
-  echo "mode      : $MODE$( [ "$MODE" = baseline ] && echo " (vanilla cuBB 25-3 on MIG 4g + naive YOLO on MIG 3g, no xApp)")"
+  echo "mode      : $MODE$( [ "$MODE" = baseline ] && echo " (our L1 build with dApp off on MIG 4g + naive YOLO on MIG 3g, no xApp)")"
   echo "traffic gen: $(bash $D/tgen.sh status-line 2>/dev/null)"
   echo "core      : $(core_up && echo up || echo DOWN) (Open5GS, ogstun 10.45.0.1)"
   echo "L1 / gNB  : $(c_up dgist-l1 && echo "l1 up" || echo "l1 DOWN") / $(c_up dgist-gnb && echo "gnb up" || echo "gnb DOWN") | dApp agent $(port_open ${DAPP_AGENT_PORT:-9810} && echo open || echo closed) | run: $(cat $D/runs/current_run 2>/dev/null || echo none)"
   echo "VA        : $(port_open ${VA_PORT:-8000} && echo "up :${VA_PORT:-8000}" || echo DOWN) | non-VA: $(port_open ${NONVA_PORT:-8001} && echo "up :${NONVA_PORT:-8001}" || echo DOWN)"
   echo "RIC       : $(sctp_listen 36422 && echo "up (E2 36421 / E42 36422)" || echo DOWN) | PPO xApp: $( [ -f $D/runs/xapp/xapp.pid ] && kill -0 $(cat $D/runs/xapp/xapp.pid) 2>/dev/null && echo "running ($(grep -E 'STORED|unchanged|HOLD' $D/runs/xapp/xapp.log 2>/dev/null | tail -1 | sed -E 's/.*\[PPO\] //' | cut -c1-60))" || echo stopped)"
-  echo "xApp side : monitor $(pgrep -f '_dgist/.*xapp_ul_input_moni' > /dev/null && echo running || echo stopped) | compute writer $(pgrep -f '_dgist/.*dapp_compute_writer' > /dev/null && echo running || echo stopped) | guard $( [ -f $D/runs/xapp/guard.pid ] && kill -0 $(cat $D/runs/xapp/guard.pid) 2>/dev/null && echo running || echo off)"
+  echo "xApp side : monitor $(pgrep -f "$D/.*xapp_ul_input_moni" > /dev/null && echo running || echo stopped) | compute writer $(pgrep -f "$D/.*dapp_compute_writer" > /dev/null && echo running || echo stopped) | guard $( [ -f $D/runs/xapp/guard.pid ] && kill -0 $(cat $D/runs/xapp/guard.pid) 2>/dev/null && echo running || echo off)"
   if c_up dgist-l1; then bash $D/dgist.sh status 2>/dev/null | grep -E '^(L1|GPU|gNB)' | sed 's/^/   /'; fi
   echo "UEs:"; python3 $D/ue_table.py 2>/dev/null | sed 's/^/   /' ;;
 tgen) shift; bash $D/tgen.sh "$@" ;;

@@ -1,6 +1,6 @@
 # hsw 연구실 OAI 변경점 (Aerial 25-3 기준 OAI 대비)
 
-트리: `_dgist/openairinterface5g/` = `/home/nvidia/hsw/25_3_hsw/openairinterface5g`의 복사본 (2026-11-05).
+트리: `openairinterface5g/` = `./oai/fetch_oai.sh`가 만드는 트리(업스트림 커밋 + `oai/`의 패치 묶음). 내용은 연구실 서버의 OAI 트리를 2026-11-05에 옮긴 것이다.
 기준 커밋: OAI `87c016b5842cb7e9952718fbac99f876a543d84a` (2026-01-30 "Make L1 registry overridable", Aerial 25-3 연동 커밋). 변경 전체는
 `git -C openairinterface5g diff` 또는 `docs/patches/hsw_oai_mac_e2.patch`(8 파일, +531/-132)로 볼 수 있다. 여기에 DGIST의 1-hunk 수정
 (`docs/patches/oai_empty_uci.patch`, NR_IF_Module.c)이 추가되어 트리의 diff는 9 파일 +544/-134 이다 (= 검증된 `oai-gnb-aerial_hsw:hybrid-uci` 소스와 동일).

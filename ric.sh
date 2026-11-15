@@ -7,13 +7,13 @@
 #   build         (re)build FlexRIC: cmake + ninja into $FLEXRIC_BUILD on the housekeeping cores (about 10 min)
 # settings: .env FLEXRIC_BUILD, FLEXRIC_SM_DIR, RIC_IP | config/flexric.conf | logs: runs/ric/
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
-set -a; . $D/.env; set +a
+set -a; . $D/.env; set +a; . $D/scripts/paths.sh
 FR=$D/openairinterface5g/openair2/E2AP/flexric; B=$FR/${FLEXRIC_BUILD:-build_dgist}
 RIC=$B/examples/ric/nearRT-RIC; SM=${FLEXRIC_SM_DIR:-$D/flexric_sm}; CONF=$D/config/flexric.conf
 R=$D/runs/ric; PIDF=$R/ric.pid; mkdir -p $R
-pid() { p=$(cat $PIDF 2>/dev/null); [ -n "$p" ] && kill -0 $p 2>/dev/null && { echo $p; return; }; pgrep -f "_dgist/.*examples/ric/nearRT-RIC" | head -1; }   # pid file, else a running nearRT-RIC of this package (the lab's own RIC on 127.0.0.1 is not ours)
+pid() { p=$(cat $PIDF 2>/dev/null); [ -n "$p" ] && kill -0 $p 2>/dev/null && { echo $p; return; }; pgrep -f "$D/.*examples/ric/nearRT-RIC" | head -1; }   # pid file, else a running nearRT-RIC of this package (the lab's own RIC on 127.0.0.1 is not ours)
 alive() { [ -n "$(pid)" ]; }
 port_open() { (echo > /dev/tcp/127.0.0.1/$1) 2>/dev/null; }
 sctp_listen() { ss -lnS 2>/dev/null | grep -q ":$1 "; }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# dash.sh - the experiment dashboard of the 1-cell demo, run from /home/nvidia/_dgist (nvidia account, no sudo)
+# dash.sh - the experiment dashboard of the 1-cell demo, run from this directory by the account that owns it (no sudo)
 #   One web page for the researchers (PC on the lab LAN): http://<host>:8010/
 #   live metrics per UE / service / GPU slot / radio, "측정 시작" (asks for a name) ... "측정 종료" (summary), every measurement saved under
 #   runs/dash/<name>_<time>/ and replayable on the same page (tab "기록 · Replay"). The measurement side is READ-ONLY towards the stack and sends
@@ -20,7 +20,7 @@
 #   sim stop | sim logs
 # settings: .env DASH_* (all optional, see dash/README.md) | logs: runs/dash_service/ | measurements: runs/dash/ (sim: runs/dash_sim/)
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
 P=$D/dash; VENV=$D/va_service/yolo_env; R=$D/runs/dash_service

@@ -6,7 +6,7 @@ SMF journal (IMSI -> UE IPv4), VA/non-VA uvicorn logs (which IPs post frames). T
 
   python3 ue_table.py            table
   python3 ue_table.py --rntis    VA_RNTIS=a,b NONVA_RNTIS=c,d  (exit 1 when the mapping is not exactly 2 + 2)
-Reads the journal directly (the nvidia account may), docker logs via the docker group.
+Reads the journal directly (the account needs journal access, e.g. group systemd-journal), docker logs via the docker group.
 """
 import argparse
 import os
@@ -26,7 +26,7 @@ def sh(cmd, timeout=20):
 
 
 def journal(unit, since):
-    """plain journalctl first (the nvidia account can read the journal), sudo -n as a fallback"""
+    """plain journalctl first (an account with journal access), sudo -n as a fallback"""
     out = sh(f"journalctl -q -u {unit} --since '{since}' --no-pager 2>/dev/null")
     if unit not in out:   # a user outside the systemd-journal group gets only "No entries": try sudo -n (works for troy, not for nvidia)
         out = sh(f"sudo -n journalctl -q -u {unit} --since '{since}' --no-pager 2>/dev/null")

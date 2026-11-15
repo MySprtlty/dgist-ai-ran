@@ -1,5 +1,5 @@
 #!/bin/bash
-# va.sh - the VA (video analytics) service of the 1-cell demo, run from /home/nvidia/_dgist (nvidia account, no sudo)
+# va.sh - the VA (video analytics) service of the 1-cell demo, run from this directory by the account that owns it (no sudo)
 #   The phone (COTS UE) opens https://10.45.0.1:8000/ and sends 4K camera frames at 5 req/s per UE; this service forwards every frame
 #   as one RUN request (model VA_MODEL or, with VA_MODEL_SELECT=1, a model drawn by the VA_MODEL_WEIGHTS rule; QoS deadline 200 ms) to the dApp agent inside the L1 container (TCP 9810) and returns the agent's
 #   reply (result figures + detections) to the phone, which draws the boxes and logs the UL / AI / DL latency split.
@@ -18,7 +18,7 @@
 #   make-frame           (re)create the VA_CAMERA_WIDTH x VA_CAMERA_HEIGHT test JPEG from the Aerial tree's 4K images
 # settings: .env VA_* | logs: runs/va_service/ (uvicorn) and runs/va_service_log/ (per-session CSV, phone and ue_sim.py)
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
 set -a; . $D/.env; set +a
 V=$D/va_service; VENV=$V/yolo_env; R=$D/runs/va_service; PIDF=$R/uvicorn.pid

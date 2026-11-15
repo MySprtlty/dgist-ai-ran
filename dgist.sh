@@ -1,5 +1,5 @@
 #!/bin/bash
-# dgist.sh - the two labs' 1-cell COTS-UE stack on this GH200, run from /home/nvidia/_dgist (nvidia account; docker group, sudo only for 'core')
+# dgist.sh - the two labs' 1-cell COTS-UE stack on one GH200, run from this directory by the account that owns it (docker group, sudo only for 'core')
 #   L1   = DGIST cuphycontroller: CUDA green contexts, per-channel SM sizer, in-process YOLO dApp, xApp agent (TCP)  -> container dgist-l1
 #   L2+  = hsw OAI gNB: MAC scheduler UL count-quota + E2 agent changes, DGIST empty-UCI fix                           -> container dgist-gnb
 #   core = Open5GS, native systemd services of this host                                                                -> scripts/core.sh
@@ -23,21 +23,21 @@
 #   build-l1 [ninja targets]         incremental build of ./aerial-cuda-accelerated-ran/$BUILD_DIR in a throwaway Aerial container (FULL=1 reconfigures)
 #   build-oai                        rebuild $OAI_IMAGE from ./openairinterface5g
 # settings: .env | env: NO_CORE=1 (skip the Open5GS check), ALL_CPUS=1 (builds on every core)
-# modes (.env DEMO_MODE, 2026-11-12): ours = this L1 on the whole GPU (default) | baseline = the researchers' vanilla cuBB 25-3 on MIG 4g + a naive
+# modes (.env DEMO_MODE, 2026-11-12): ours = this L1 on the whole GPU (default) | baseline = the same L1 build with every dApp feature off on MIG 4g + a naive
 #   YOLO server on MIG 3g (docker-compose.baseline.yaml, containers dgist-l1 + dgist-yolo); switch with ./all.sh mode baseline|ours (MIG: sudo -n scripts/mig.sh)
 # traffic generator (.env TRAFFIC_GEN=1, 2026-11-13, both modes): the l1 container also runs the RU emulator + testMAC for 5 emulator cells
 #   (L1 cells 0-4, NIC loop aerial02 <-> aerial03) and the phones' Benetel cell becomes L1 cell 5 (docker-compose.tgen[.baseline].yaml,
-#   scripts/l1_entrypoint_tg.sh, config/tgen/); Baseline then runs OUR build with every dApp feature off on MIG 4g. Switch: ./tgen.sh on|off
+#   scripts/l1_entrypoint_tg.sh, config/tgen/). Switch: ./tgen.sh on|off. Paths: everything lives under this directory (scripts/paths.sh)
 set -u
-[ "$(id -u)" = 0 ] && { echo "!! run this as the nvidia user (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
+[ "$(id -u)" = 0 ] && { echo "!! run this as the account that owns this directory (not root / sudo): processes and files would become root-owned and the other scripts could not stop them"; exit 1; }
 D=$(cd "$(dirname "$0")" && pwd); cd $D
-set -a; . $D/.env; set +a
+set -a; . $D/.env; set +a; . $D/scripts/paths.sh
 CL=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80}; [ "${DAPP_INPUT:-4k}" = fhd ] && CL=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}   # dApp SM classes of the input profile
 OUT=$D/runs; CUR=$OUT/current_run; L1C=dgist-l1; GNBC=dgist-gnb; YOLOC=dgist-yolo; PHYLOG=/tmp/phy.log; T=$D/aerial-cuda-accelerated-ran; mkdir -p $OUT
 MODE=${DEMO_MODE:-ours}; COMPOSE="docker compose"
-if [ "$MODE" = baseline ]; then   # vanilla cuBB on MIG 4g + naive YOLO on MIG 3g (docker-compose.baseline.yaml needs MIG_4G / MIG_3G from runs/mig.env)
+if [ "$MODE" = baseline ]; then   # our L1 build with dApp off on MIG 4g + naive YOLO on MIG 3g (docker-compose.baseline.yaml needs MIG_4G / MIG_3G from runs/mig.env)
   [ -f $OUT/mig.env ] && { set -a; . $OUT/mig.env; set +a; }
-  export BASELINE_TREE=${BASELINE_TREE:-/home/nvidia/hsw/25_3_hsw/aerial-cuda-accelerated-ran} BASELINE_L1_CONFIG=${BASELINE_L1_CONFIG:-baseline} BASELINE_YOLO_SM=${BASELINE_YOLO_SM:-auto} MIG_4G=${MIG_4G:-} MIG_3G=${MIG_3G:-}
+  export BASELINE_L1_CONFIG=${BASELINE_L1_CONFIG:-dgist_base} BASELINE_YOLO_SM=${BASELINE_YOLO_SM:-auto} MIG_4G=${MIG_4G:-} MIG_3G=${MIG_3G:-}
   COMPOSE="docker compose -f docker-compose.baseline.yaml"
 elif [ "$MODE" != ours ]; then echo "!! .env DEMO_MODE=$MODE unknown (ours|baseline)"; exit 2; fi
 cmd=${1:-status}
@@ -49,10 +49,10 @@ port_open() { (echo > /dev/tcp/127.0.0.1/$DAPP_AGENT_PORT) 2>/dev/null; }
 mps_on() { pgrep -f "nvidia-cuda-mps-serve[r]" > /dev/null; }
 gnb_started() { if [ "$TG" = 1 ]; then grep -qE "Cell +$PC Received START.request" $(clog) 2>/dev/null; else in_l1 "grep -qE 'START.req received|Received START.request' $PHYLOG"; fi; }
 # traffic generator: .env TRAFFIC_GEN decides for 'up' / 'check'; while an L1 container runs, its entrypoint tells which layout is live
-TG=${TRAFFIC_GEN:-0}; TGTV=${TRAFFIC_GEN_TV_DIR:-/data/dgist_tgen/testVectors}; TGLOG=${TRAFFIC_GEN_LOG_DIR:-/data/dgist_tgen/log}
+TG=${TRAFFIC_GEN:-0}; TGTV=$TRAFFIC_GEN_TV_DIR; TGLOG=$TRAFFIC_GEN_LOG_DIR   # absolute paths from scripts/paths.sh
 if c_up $L1C; then docker inspect -f '{{join .Config.Cmd " "}}' $L1C 2>/dev/null | grep -q l1_entrypoint_tg && TG=1 || TG=0; fi
-# Baseline L1 label: the researchers' vanilla build, or - with the traffic generator - our build with every dApp feature off (the vanilla tree has no hybrid 6-cell support)
-BL1='vanilla L1'; [ "$TG" = 1 ] && BL1='L1 (our build, dApp features off, 6 cells)'
+# Baseline L1 label: the same build as Ours with every dApp feature off, in both layouts (1 cell / 6 cells)
+BL1='L1 (our build, dApp features off)'; [ "$TG" = 1 ] && BL1='L1 (our build, dApp features off, 6 cells)'
 PC=0; DT=40   # L1 cell index of the phones' cell, compose stop timeout
 if [ "$TG" = 1 ]; then PC=5; DT=90   # emulator cells 0-4 come first; stop order testMAC -> L1 -> RU emulator + log collection
   [ "$MODE" = baseline ] && COMPOSE="$COMPOSE -f docker-compose.tgen.baseline.yaml" || COMPOSE="docker compose -f docker-compose.yaml -f docker-compose.tgen.yaml"
@@ -67,11 +67,13 @@ check() {
   docker compose version > /dev/null 2>&1 || { echo "!! docker compose v2 missing"; ok=0; }
   nvidia-smi -L > /dev/null 2>&1 || { echo "!! no GPU visible"; ok=0; }
   for im in $AERIAL_IMAGE $OAI_IMAGE; do docker image inspect $im > /dev/null 2>&1 || { echo "!! image $im missing ($0 build-oai builds the gNB image)"; ok=0; }; done
+  # one L1 build for both modes (Baseline = the same binary with every dApp feature off)
+  [ -x $T/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf ] || { echo "!! L1 binary $BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf missing ($0 build-l1)"; ok=0; }
+  for kv in SCF_FAPI_10_04:BOOL=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH:BOOL=OFF SCF_FAPI_10_04_SRS:BOOL=ON ENABLE_DAPP_HOOK:BOOL=ON; do grep -q "^$kv\$" $T/$BUILD_DIR/CMakeCache.txt 2>/dev/null || { echo "!! $BUILD_DIR/CMakeCache.txt: expected $kv (validated FAPI wire layout + dApp hook)"; ok=0; }; done
   if [ "$MODE" = baseline ]; then
     nvidia-smi -L 2>/dev/null | grep -q 'MIG 4g' && nvidia-smi -L 2>/dev/null | grep -q 'MIG 3g' || { echo "!! baseline needs the MIG 4g + 3g instances: sudo -n scripts/mig.sh on"; ok=0; }
     [ -n "$MIG_4G" ] && [ -n "$MIG_3G" ] || { echo "!! runs/mig.env lacks MIG_4G / MIG_3G (sudo -n scripts/mig.sh on)"; ok=0; }
-    [ -r $BASELINE_TREE/build.aarch64/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf ] || { echo "!! vanilla L1 binary missing/unreadable: $BASELINE_TREE/build.aarch64/.../cuphycontroller_scf (.env BASELINE_TREE)"; ok=0; }
-    [ -r $D/config/baseline_cuphy_config/cuphycontroller_$BASELINE_L1_CONFIG.yaml ] || { echo "!! config/baseline_cuphy_config/cuphycontroller_$BASELINE_L1_CONFIG.yaml missing (copy of the lab config dir + the fitted yaml)"; ok=0; }
+    [ -f $D/config/cuphycontroller_$BASELINE_L1_CONFIG.yaml ] && [ -f $D/config/l2_adapter_$BASELINE_L1_CONFIG.yaml ] || { echo "!! config/cuphycontroller_$BASELINE_L1_CONFIG.yaml / l2_adapter_$BASELINE_L1_CONFIG.yaml missing (.env BASELINE_L1_CONFIG)"; ok=0; }
     [ -x $T/$BUILD_DIR/cuPHY-CP/dapp_hook/dapp_tenant_main ] || { echo "!! $BUILD_DIR/cuPHY-CP/dapp_hook/dapp_tenant_main missing ($0 build-l1)"; ok=0; }
     ls $T/cuPHY-CP/dapp_hook/models/migfhd26${VA_MODEL#26}/seg00_sm*.engine > /dev/null 2>&1 || { echo "!! Baseline engine models/migfhd26${VA_MODEL#26}/seg00_sm<N>.engine missing (scripts/build_yolo_engines_mig.sh ${VA_MODEL#26} after MIG on)"; ok=0; }
     if [ "${VA_MODEL_SELECT:-0}" = 1 ]; then local wt i=0 w nb=""; IFS=, read -r -a wt <<< "${VA_MODEL_WEIGHTS:-}"   # rule-based model selection: the other models need a Baseline engine too
@@ -79,8 +81,6 @@ check() {
       [ -z "$nb" ] || echo "   note: VA_MODEL_SELECT=1 but no Baseline engine for:$nb - those requests run as ${VA_MODEL:-26x} (scripts/build_yolo_engines_mig.sh$nb after MIG on)"; fi
   else
   [ "$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null)" = Disabled ] || { echo "!! GPU MIG mode is not Disabled (./all.sh mode ours / sudo -n scripts/mig.sh off)"; ok=0; }
-  [ -x $T/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf ] || { echo "!! L1 binary $BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf missing ($0 build-l1)"; ok=0; }
-  for kv in SCF_FAPI_10_04:BOOL=OFF ENABLE_CONFORMANCE_TM_PDSCH_PDCCH:BOOL=OFF SCF_FAPI_10_04_SRS:BOOL=ON ENABLE_DAPP_HOOK:BOOL=ON; do grep -q "^$kv\$" $T/$BUILD_DIR/CMakeCache.txt 2>/dev/null || { echo "!! $BUILD_DIR/CMakeCache.txt: expected $kv (validated FAPI wire layout + dApp hook)"; ok=0; }; done
   ESET=full26; [ "${DAPP_INPUT:-4k}" = fhd ] && ESET=fhd26
   for m in n s m l x; do [ -e $T/cuPHY-CP/dapp_hook/models/$ESET$m/seg00_sm${CL##*,}.engine ] || { echo "!! YOLO engine models/$ESET$m/seg00_sm${CL##*,}.engine missing (DAPP_INPUT=${DAPP_INPUT:-4k}: scripts/build_yolo_engines.sh ${DAPP_INPUT:-4k})"; ok=0; }; done
   fi
@@ -91,8 +91,9 @@ check() {
     for b in cuphycontroller/examples/cuphycontroller_scf ru-emulator/ru_emulator/ru_emulator testMAC/testMAC/test_mac; do [ -x $T/$BUILD_DIR/cuPHY-CP/$b ] || { echo "!! traffic generator: $BUILD_DIR/cuPHY-CP/$b missing ($0 build-l1)"; ok=0; }; done
     for f in cuphycontroller_$TGC.yaml l2_adapter_$TGC.yaml nvipc_multi_dgist_tg.yaml ru_dgist_tg.yaml testmac_dgist_tg.yaml; do [ -f $D/config/tgen/$f ] || { echo "!! traffic generator: config/tgen/$f missing"; ok=0; }; done
     [ -f $D/scripts/l1_entrypoint_tg.sh ] && [ -f $D/scripts/tgen_load.py ] || { echo "!! traffic generator: scripts/l1_entrypoint_tg.sh / scripts/tgen_load.py missing"; ok=0; }
-    [ -f $TGTV/multi-cell/launch_pattern_F08_5C_${TRAFFIC_GEN_PATTERN:-tmp_fluct}.yaml ] && [ -f $TGTV/cuPhyChEstCoeffs.h5 ] || { echo "!! traffic generator: launch pattern F08_5C_${TRAFFIC_GEN_PATTERN:-tmp_fluct} / cuPhyChEstCoeffs.h5 missing in $TGTV (.env TRAFFIC_GEN_TV_DIR)"; ok=0; }
+    [ -f $TGTV/multi-cell/launch_pattern_F08_5C_${TRAFFIC_GEN_PATTERN:-tmp_fluct}.yaml ] && [ -f $TGTV/cuPhyChEstCoeffs.h5 ] || { echo "!! traffic generator: launch pattern F08_5C_${TRAFFIC_GEN_PATTERN:-tmp_fluct} / cuPhyChEstCoeffs.h5 missing in $TGTV (.env TRAFFIC_GEN_TV_DIR; scripts/fetch_testvectors.sh installs the set)"; ok=0; }
     for i in aerial02 aerial03; do [ "$(cat /sys/class/net/$i/operstate 2>/dev/null)" = up ] || { echo "!! traffic generator: $i (emulator loop aerial02 <-> aerial03) is not up"; ok=0; }; done
+    mkdir -p $TGLOG 2>/dev/null   # created by this account (docker would create a missing bind-mount source as root)
     [ -d $TGLOG ] && [ -w $TGLOG ] || { echo "!! traffic generator: log directory $TGLOG missing or not writable (.env TRAFFIC_GEN_LOG_DIR)"; ok=0; }
     [ -d $TGLOG ] && { [ "$(df --output=avail -BG $TGLOG | tail -1 | tr -dc 0-9)" -ge 100 ] || echo "!! traffic generator: less than 100 GB free for the full logs in $TGLOG"; }
     case ${TRAFFIC_LOAD:-low} in low|mid|high|auto) ;; *) echo "   note: .env TRAFFIC_LOAD=${TRAFFIC_LOAD} is not low|mid|high|auto (a name of TRAFFIC_LEVELS or a block number is expected)" ;; esac
@@ -121,9 +122,9 @@ slotmap)
 up)
   NAME=${2:-dgist_$(date +%m%d_%H%M)}; RUN=$OUT/$NAME
   [ -f $CUR ] && { echo "!! a run is registered as current ($(cat $CUR)): $0 down first"; exit 1; }
-  if [ "$MODE" = baseline ]; then echo "== $NAME [BASELINE]: vanilla cuBB 25-3 L1 ($BASELINE_TREE, config $BASELINE_L1_CONFIG) on MIG 4g + naive YOLO ${VA_MODEL:-26x}$([ "${VA_MODEL_SELECT:-0}" = 1 ] && echo " + the VA_MODEL_WEIGHTS models that have an engine") (whole MIG 3g instance) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
+  if [ "$MODE" = baseline ]; then echo "== $NAME [BASELINE]: L1 (our build with every dApp feature off, $BUILD_DIR, config $( [ "$TG" = 1 ] && echo $TGC || echo $BASELINE_L1_CONFIG)) on MIG 4g + naive YOLO ${VA_MODEL:-26x}$([ "${VA_MODEL_SELECT:-0}" = 1 ] && echo " + the VA_MODEL_WEIGHTS models that have an engine") (whole MIG 3g instance) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"
   else echo "== $NAME [OURS]: L1 (DGIST, $BUILD_DIR, config $L1_CONFIG, dApp classes $CL, input ${DAPP_INPUT:-4k}) + OAI gNB ($OAI_IMAGE, cpuset $OAI_CPUSET) $(date +%T)"; fi
-  [ "$TG" = 1 ] && echo "   + traffic generator: 5 RU-emulator cells with testMAC in the l1 container (L1 cells 0-4, config $TGC, initial load ${TRAFFIC_LOAD:-low}); the phones' cell is L1 cell $PC$( [ "$MODE" = baseline ] && echo '; the L1 is OUR build with every dApp feature off (the vanilla tree has no tools for this layout)' || echo "; PUSCH profiles ${TG_PUSCH_PROFILES:-16,24,32,40,48,56,64,72,88,104}")"
+  [ "$TG" = 1 ] && echo "   + traffic generator: 5 RU-emulator cells with testMAC in the l1 container (L1 cells 0-4, config $TGC, initial load ${TRAFFIC_LOAD:-low}); the phones' cell is L1 cell $PC$( [ "$MODE" = baseline ] || echo "; PUSCH profiles ${TG_PUSCH_PROFILES:-16,24,32,40,48,56,64,72,88,104}")"
   check || { echo "precheck failed"; exit 1; }
   mkdir -p $RUN; echo "$NAME" > $CUR
   echo "   $COMPOSE up -d: the gNB starts once the L1 is healthy ($( [ "$MODE" = baseline ] && echo "$BL1 ready + YOLO server port open" || echo 'L1 ready + dApp engines loaded + agent port open'); up to ~10 min)"
@@ -161,7 +162,7 @@ status)
   if c_up $L1C && [ "$TG" = 1 ]; then CL1=$(clog)   # with the generator the full nvlog grows by GBs: read the console copy on the host instead
     echo "L1 (6 cells): Err.ind $(grep -c 'Send Err.ind' $CL1 2>/dev/null) FATAL $(grep -c FATAL $CL1 2>/dev/null) | phone cell $PC: $(tail -n 20000 $CL1 2>/dev/null | grep -E "\] Cell +$PC \| DL" | tail -1 | sed -E 's/.*(DL +[0-9.]+ Mbps).*(UL +[0-9.]+ Mbps +[0-9]+ Slots CRC +[0-9]+).*/\1 \2/')$( [ "$MODE" = ours ] && echo " | dApp: $(in_l1 'grep -E "agent ok" /tmp/dapp_tenant.log | tail -1' | sed -E 's/.*(agent ok [0-9]+ fail [0-9]+ queue [0-9]+).*/\1/')")"
     echo "traffic generator: $(bash $D/tgen.sh status-line 2>&1)"
-  elif c_up $L1C; then echo "L1: Err.ind $(in_l1 "grep -c 'Send Err.ind' $PHYLOG") FATAL $(in_l1 "grep -c FATAL $PHYLOG") | cell 0: $(in_l1 "grep -E '\] Cell +0 \| DL' $PHYLOG | tail -1" | sed -E 's/.*(DL +[0-9.]+ Mbps).*(UL +[0-9.]+ Mbps +[0-9]+ Slots CRC +[0-9]+).*/\1 \2/') | dApp: $(in_l1 'grep -E "agent ok" /tmp/dapp_tenant.log | tail -1' | sed -E 's/.*(agent ok [0-9]+ fail [0-9]+ queue [0-9]+).*/\1/')"; fi
+  elif c_up $L1C; then echo "L1: Err.ind $(in_l1 "grep -c 'Send Err.ind' $PHYLOG") FATAL $(in_l1 "grep -c FATAL $PHYLOG") | cell 0: $(in_l1 "grep -E '\] Cell +0 \| DL' $PHYLOG | tail -1" | sed -E 's/.*(DL +[0-9.]+ Mbps).*(UL +[0-9.]+ Mbps +[0-9]+ Slots CRC +[0-9]+).*/\1 \2/')$( [ "$MODE" = ours ] && echo " | dApp: $(in_l1 'grep -E "agent ok" /tmp/dapp_tenant.log | tail -1' | sed -E 's/.*(agent ok [0-9]+ fail [0-9]+ queue [0-9]+).*/\1/')")"; fi
   if c_up $GNBC; then docker logs $GNBC > $OUT/oai_live.log 2>&1; echo "gNB: NGSetup $(grep -c NGSetupResponse $OUT/oai_live.log) | UE: $(ue_counts $OUT/oai_live.log)"; fi
   c_up $L1C || { [ "${TRAFFIC_GEN:-0}" = 1 ] && echo "traffic generator: on in .env (starts with the next up, initial load ${TRAFFIC_LOAD:-low})"; }
   echo "VA service (port ${VA_PORT:-8000}): $( (echo > /dev/tcp/127.0.0.1/${VA_PORT:-8000}) 2>/dev/null && echo "up - ./va.sh status" || echo "down - ./va.sh start")"

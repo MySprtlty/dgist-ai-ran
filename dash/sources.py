@@ -31,7 +31,7 @@ def _ints(s):
 
 
 def load_cfg(root, env=None):
-    """the dashboard's static configuration from /home/nvidia/_dgist/.env (process environment wins, like in va.sh)"""
+    """the dashboard's static configuration from the package's .env (process environment wins, like in va.sh)"""
     e = read_env(Path(root) / ".env"); e.update({k: v for k, v in (env or os.environ).items() if k.split("_")[0] in ("DASH", "VA", "NONVA", "DAPP", "VCAM", "DEMO", "TRAFFIC", "TG")})
     inp = e.get("DAPP_INPUT", "4k")
     mp = {}

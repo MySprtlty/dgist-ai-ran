@@ -1,9 +1,9 @@
-l2adapter_filename: l2_adapter_config_P5G_GH.yaml
+# dgist-6g demo BASELINE L1 configuration (1 cell, .env DEMO_MODE=baseline, traffic generator off) = the researchers' Benetel COTS-UE
+# baseline (cuphycontroller_config_benetal.yaml): no green contexts, static mps_sm_* inside the MIG 4g instance (64 SMs), dApp hook off (l2 adapter below).
+l2adapter_filename: l2_adapter_dgist_base.yaml
 aerial_metrics_backend_address: 127.0.0.1:8081
 
 aerial_sdk_version: 25-3-cubb
-#aerial_sdk_version: 25-2-cubb
-# CPU core shared by all low-priority threads
 low_priority_core: 10
 enable_ptp_svc_monitoring: 0
 nic_tput_alert_threshold_mbps: 85000
@@ -20,8 +20,8 @@ cuphydriver_config:
   accu_tx_sched_disable: 0 #Flag applicable only for CX6-DX : BF3/CX7 HW and beyond support accurate send scheduling directly on timestamp, for CX6-DX this is implemented via software emulation
   fh_stats_dump_cpu_core: -1
   pdump_client_thread: -1
-  use_green_contexts: 0 # Experimental feature; disabled by default
-  mps_sm_pusch: 120
+  use_green_contexts: 0   # Baseline: static MPS split, no green contexts
+  mps_sm_pusch: 64     # Baseline: the MIG 4g instance has 64 SMs (the researchers' whole-GPU value is 120)
   mps_sm_pucch: 20
   mps_sm_prach: 20
   mps_sm_ul_order: 40
@@ -34,7 +34,7 @@ cuphydriver_config:
   dpdk_file_prefix: cuphycontroller
   nics:
     - nic: '0002:01:00.0'
-      mtu: 9216
+      mtu: 9000
       cpu_mbufs: 196608
       uplane_tx_handles: 64
       txq_count: 60
@@ -45,8 +45,6 @@ cuphydriver_config:
   cus_port_failover: 0
   gpus:
     - 0
-    # Set GPUID to the GPU sharing the PCIe switch as NIC
-    # run nvidia-smi topo -m to find out which GPU
   workers_ul: [4,5]
   workers_dl: [6,7,8]
   debug_worker: -1
@@ -121,15 +119,13 @@ cuphydriver_config:
       cell_id: 1
       ru_type: 1
       # set to 00:00:00:00:00:00 to use the MAC address of the NIC port to use
-      src_mac_addr: d8:94:24:57:7f:f2
-      #src_mac_addr: 00:00:00:00:00:00
-        #dst_mac_addr: 8c:1f:64:d1:15:11
+      src_mac_addr: 00:00:00:00:00:00
+#      dst_mac_addr: 8c:1f:64:d1:11:c0 #Benetel 550
       #dst_mac_addr: 8c:1f:64:d1:12:b6 #Benetel 650 1e
-      dst_mac_addr: 8c:1f:64:d1:15:11
-        #nic: '0000:b5:00.0'
+      dst_mac_addr: 8c:1f:64:d1:15:11 #Benetel 550 1e
       nic: '0002:01:00.0'
-      vlan: 3
-      pcp: 7 #7
+      vlan: 1
+      pcp: 0 #7
       txq_count_uplane: 1
 
       eAxC_id_ssb_pbch: [0, 1, 2, 3]
@@ -150,16 +146,16 @@ cuphydriver_config:
       exponent_ul: 4
       max_amp_ul: 65504
       mu: 1
-      T1a_max_up_ns: 345000
-      T1a_max_cp_ul_ns: 336000
-      Ta4_min_ns: 0
-      Ta4_max_ns: 200000
+      T1a_max_up_ns: 280000
+      T1a_max_cp_ul_ns: 495000
+      Ta4_min_ns: 50000
+      Ta4_max_ns: 331000
       Tcp_adv_dl_ns: 125000
       ul_u_plane_tx_offset_ns: 280000
       fh_len_range: 0
-      pusch_prb_stride: 51
+      pusch_prb_stride: 273
       prach_prb_stride: 12
-      srs_prb_stride: 51
+      srs_prb_stride: 273
       pusch_ldpc_max_num_itr_algo_type: 1
       pusch_fixed_max_num_ldpc_itrs: 10
       pusch_ldpc_n_iterations: 7
@@ -167,7 +163,7 @@ cuphydriver_config:
       pusch_ldpc_algo_index: 0
       pusch_ldpc_flags: 2
       pusch_ldpc_use_half: 1
-      pusch_nMaxPrb: 51
+      pusch_nMaxPrb: 273
       pusch_nMaxRx: 4
       ul_gain_calibration: 78.68
       lower_guard_bw: 845

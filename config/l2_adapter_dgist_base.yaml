@@ -1,3 +1,4 @@
+# dgist-6g demo BASELINE L2 adapter configuration = the researchers' l2_adapter_config_P5G_GH.yaml; the dApp FAPI hook line is present but disabled.
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -25,6 +26,9 @@ tick_generator_mode: 1
 
 # Allowed maximum latency of SLOT FAPI messages which send from L2 to L1. Unit: slot
 allowed_fapi_latency: 0
+
+# dgist-6g: the FAPI hook (UL_TTI/DL_TTI export -> per-slot sizer -> dApp tenant); export_cpu = an isolated core
+dapp_hook: {enable: 0, shm_name: /aerial_dapp_ring, ring_len: 65536, mlock: 1, export_ul: 1, export_dl: 1, export_pdus: 1}
 
 # Allowed tick interval error. Unit: us
 allowed_tick_error: 10

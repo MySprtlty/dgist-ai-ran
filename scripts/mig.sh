@@ -1,6 +1,6 @@
 #!/bin/bash
-# scripts/mig.sh on|off|status - GPU 0 MIG partition for the Baseline mode (2026-11-12): 4g.48gb (Aerial, 72 SMs) + 3g.48gb (YOLO, 60 SMs).
-#   Needs root (nvidia-smi -mig / mig -cgi): run as  sudo -n scripts/mig.sh on   (the troy account has sudo; the nvidia account does not).
+# scripts/mig.sh on|off|status - GPU 0 MIG partition for the Baseline mode (2026-11-12): 4g.48gb (Aerial, 64 SMs) + 3g.48gb (YOLO, 60 SMs).
+#   Needs root (nvidia-smi -mig / mig -cgi): run as  sudo scripts/mig.sh on   from an account with sudo (the stack's own account needs none).
 #   on     : refuses while any process uses the GPU; MPS off; -mig 1 (gpu-reset when pending); creates the two instances; writes runs/mig.env
 #            (MIG_4G=<uuid> MIG_3G=<uuid>) that docker-compose.baseline.yaml and dgist.sh read
 #   off    : destroys the instances, -mig 0 (gpu-reset when pending), removes runs/mig.env -> back to the Ours mode (whole GPU, green contexts)

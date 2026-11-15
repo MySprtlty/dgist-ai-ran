@@ -31,3 +31,6 @@ va_service/certs/
 nonva_service/certs/
 core/etc/tls/*.key
 core/etc/hnet/
+
+# traffic generator: test vectors (scripts/fetch_testvectors.sh) and full nvlog files of the runs; ./tgen may be a link to a big disk
+/tgen

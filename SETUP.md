@@ -57,10 +57,10 @@ vi .env                       # 서버에 맞게 고친다 (7절)
 ## 3. 빌드 (순서대로. 4~5시간 가운데 대부분은 엔진)
 
 ```bash
-./dgist.sh build-l1                               # (1) cuphycontroller_scf, dapp_tenant_main, dapp_agent_test, ru_emulator, test_mac. 재구성은 FULL=1 ./dgist.sh build-l1   ~40분
+./dgist.sh build-l1                               # (1) cuphycontroller_scf, dapp_tenant_main, dapp_agent_test, ru_emulator, test_mac. 새 클론은 구성부터 한다 (툴체인 .env L1_TOOLCHAIN)   ~4분
 (cd openairinterface5g && docker build -f docker/Dockerfile.base.ubuntu -t ran-base:latest .)   # (2a) OAI 베이스 이미지 (한 번)
 ./dgist.sh build-oai                              # (2b) dgist-oai-gnb-aerial:latest (E2 agent, nvipc_src 포함)  ~40분
-./ric.sh build                                    # (3) FlexRIC nearRT-RIC + xApp (build_dgist) + E2 SM 라이브러리 → flexric_sm/
+./ric.sh build                                    # (3) FlexRIC nearRT-RIC + xApp (build_dgist) + E2 SM 라이브러리 → flexric_sm/   ~1분
 ./scripts/setup_venvs.sh                          # (4) va_service/yolo_env (서비스 · 대시보드 · 엔진 내보내기), xapp_ppo venv
 ./scripts/make_certs.sh                           # (5) HTTPS 인증서 CN=10.45.0.1 (전화기에 ca.crt를 설치하거나 경고를 넘긴다)
 ./scripts/build_yolo_engines.sh fhd               # (6) YOLO26 n/s/m/l/x × SM 등급(.env DAPP_TENANT_CLASSES_FHD) 엔진. GPU가 비어 있어야 한다  ~3시간
@@ -68,6 +68,8 @@ for nf in amf smf upf nrf ausf udm udr pcf nssf bsf scp; do ./core.sh install-co
 ./dgist.sh check                                  # (8) 사전 점검: 이미지 · 엔진 · 인터페이스 · PTP · 코어 · 테스트 벡터 · 디스크
 ```
 
+- (1)은 빌드 디렉터리가 아직 구성되어 있지 않으면(새 클론, 중간에 끊긴 구성) cmake 구성부터 한다. 툴체인 파일은 `.env L1_TOOLCHAIN`(기본 `grace-cross` = GH200)이고, 옵션은 처음 서버의 빌드와 같다.
+  다시 구성하려면 `FULL=1 ./dgist.sh build-l1`. 실패하면 0이 아닌 종료 코드로 끝나고, 전체 출력은 `runs/build_l1_<시각>.log`에 있다.
 - (6)은 가중치 `yolo26{n,s,m,l,x}.pt`를 ultralytics로 내려받아(인터넷 필요) ONNX로 내보내고, Aerial 컨테이너 안에서 SM 등급마다 엔진을 만든다.
   `.env DAPP_INPUT=fhd`(기본)이면 `fhd`, `4k`로 바꿔 쓸 때만 `./scripts/build_yolo_engines.sh 4k`가 더 필요하다.
 - 가입자: WebUI에 전화기 네 대의 IMSI(`.env`의 값) · K · OPc를 등록한다. 기존 서버에서 옮길 때는 그 서버의 MongoDB에서 내보낸다(이 저장소에는 없다).
@@ -129,6 +131,7 @@ sudo <패키지>/scripts/mig.sh off                  # Ours로 돌아갈 때
 | 프런트홀 NIC의 PCI 주소, RU의 MAC · VLAN | `config/cuphycontroller_dgist.yaml`, `config/cuphycontroller_dgist_base.yaml`, `config/tgen/cuphycontroller_dgist_tg*.yaml`의 `nic`, `dst_mac_addr`, `vlan` | `0002:01:00.0`, Benetel 550 |
 | 생성기 루프 NIC의 PCI 주소와 MAC | `config/tgen/cuphycontroller_dgist_tg*.yaml`의 `nic` · `src_mac_addr`(L1 쪽 포트), `config/tgen/ru_dgist_tg.yaml`의 `nic_interface` · `peerethaddr`(에뮬레이터 쪽) | `0000:01:00.0` / `0000:01:00.1` |
 | 루프 인터페이스 이름 | `dgist.sh`의 사전 점검(`aerial02`, `aerial03`) | — |
+| L1 빌드 툴체인 | `.env L1_TOOLCHAIN` = `aerial-cuda-accelerated-ran/cuPHY/cmake/toolchains/` 안의 파일 이름. GH200이 아닌 서버에서는 그 서버에 맞는 것으로 바꾼다(`x86-64`, `native` 등. 처음 서버 밖에서는 빌드해 보지 않았다) | `grace-cross` |
 | CPU 코어 배정 | `.env BUILD_CPUS`(빌드, 격리되지 않은 코어), `OAI_CPUSET`, `DAPP_TENANT_CPU`, `DAPP_AGENT_CPU`. L1 · RU 에뮬레이터 · testMAC의 워커 코어는 `config/` 아래 yaml. `dgist.sh test`는 코어 65-71을 쓴다 | 격리 코어 4-64 |
 | 전화기 | `.env VA_IMSIS`, `NONVA_IMSIS`(각 2대), WebUI의 가입자 | — |
 | gNB | `config/gnb.conf`(AMF 주소, PLMN, 주파수, 전력 제어 목표) | — |
@@ -145,5 +148,22 @@ sudo <패키지>/scripts/mig.sh off                  # Ours로 돌아갈 때
 
 - 공통 수정은 `demo`에 넣고 `demo-slot-level`로 병합한다(`git checkout demo-slot-level && git merge demo`). 슬롯 단위 전환에만 해당하는 것은 `demo-slot-level`에만 넣는다. 두 저장소 모두 같은 규칙이다.
 - `.env`는 추적되는 파일이다. 비밀 값(SIM 키, 토큰)은 넣지 않는다.
+
+## 9. 새 클론에서 확인한 범위 (2026-11-15, 처음 서버)
+
+`demo` 브랜치를 빈 디렉터리에 클론해서 해 본 것과 해 보지 못한 것이다. 다른 서버에서 막히면 "해 보지 못한 것"부터 의심한다.
+
+| 단계 | 결과 |
+|---|---|
+| 클론 + 서브모듈 + LFS | 서브모듈 두 개가 기록된 커밋으로 채워졌고, LFS 파일 43개의 sha256이 포인터와 맞았다 |
+| `./oai/fetch_oai.sh` | 13초. 만들어진 트리의 파일 9,407개가 처음 서버에서 돌리던 트리와 내용이 같았다 |
+| `./scripts/fetch_testvectors.sh <아카이브>` | 파일 187개, 809 MB, 파일마다 sha256 일치. 릴리스에서 내려받는 경로는 해 보지 못했다 |
+| `./dgist.sh build-l1` | 새 구성 + 다섯 타깃 3분 23초(코어 11개). 다섯 실행 파일은 처음 서버에서 돌리던 것과 크기가 같고, 다른 바이트는 컴파일러 임시 파일 이름뿐이었다 |
+| `./ric.sh build` | 41초(코어 11개). 실행 파일 37개, E2 SM 라이브러리 8개 |
+| `./scripts/make_certs.sh` | CA와 서버 인증서 두 개, `openssl verify` 통과 |
+| compose 구성 네 가지 (Ours / Baseline × 생성기 켬 / 끔) | 오류 없이 풀렸고, 마운트 원본은 호스트의 `/dev/hugepages`, `/lib/modules`, `/usr/src`를 빼면 모두 `<패키지>` 안이었다 |
+| `./dgist.sh check` | 남은 `!!`는 YOLO 엔진이 없다는 줄뿐이었다 |
+
+해 보지 못한 것(새 클론에서 실행한 적이 없다): (2a) · (2b) 이미지 빌드, (4) venv, (6) 엔진 빌드와 4절의 MIG 엔진, (7) 코어 설정 설치, 스택을 켜는 것(`./all.sh up`), 테스트 벡터를 릴리스에서 내려받는 것, GH200이 아닌 서버에서의 빌드.
 
 버전: Aerial 25-3(커밋 654c249) 기반 포크. OAI `87c016b5` + FlexRIC `ef6d722f`(`oai/README.md`). Open5GS v2.8.0. 변경 요약 `docs/CHANGES_DGIST_AERIAL.md`, `docs/CHANGES_HSW_OAI.md`, 개별 패치 `docs/patches/`.

@@ -1,25 +1,28 @@
 #!/bin/bash
 # build_yolo_engines.sh [4k|fhd] [sm ...] - YOLO26 n/s/m/l/x TensorRT engines for the in-process tenant, one per SM class (a TensorRT engine
-#   only runs near the SM count its builder saw). Default profile = .env DAPP_INPUT (4k), default classes = .env DAPP_TENANT_CLASSES (24,...,80).
+#   only runs near the SM count its builder saw). Default profile = .env DAPP_INPUT (4k); default classes = the list the L1 loads for that profile:
+#   .env DAPP_TENANT_CLASSES for 4k (24,...,80), .env DAPP_TENANT_CLASSES_FHD for fhd (24,...,88) - the list ./dgist.sh check looks for.
 #   profile 4k : ONNX batch 8, 1280x1280, NMS-free head -> models/full26<m>/seg00_sm<sm>.engine  (4K frame = 6 native 1280 crops + 2 whole views)
 #   profile fhd: ONNX batch 3, same network           -> models/fhd26<m>/seg00_sm<sm>.engine   (FHD frame = 2 native 1280x1080 crops + 1 whole view)
 #   (1) weights yolo26{n,s,m,l,x}.pt (downloaded by ultralytics on first use) -> ONNX (aerial-cuda-accelerated-ran/cuPHY-CP/dapp_hook/models/export_1280.py,
 #       CPU, va_service/yolo_env - needs onnx + onnxslim from va_service/requirements.txt)
 #   (2) trtexec inside a throwaway Aerial container under an MPS active-thread cap that grants exactly <sm> SMs (GH200: floor(pct/100*66 TPC)*2,
 #       confirmed by models/mps_sm_probe.py)
-#   GPU must be idle (./all.sh down): an MPS daemon runs inside the container (as root: pipe dir /var) for the build only. 3-8 min per engine; 5 models x 7 classes ~ 2-3 h.
+#   GPU must be idle (./all.sh down): an MPS daemon runs inside the container (as root: pipe dir /var) for the build only. 3-8 min per engine; 5 models x 7 classes ~ 2-3 h (fhd: 8 classes).
 #   fhd classes >= 80 of models s and l, and 88 of model x (2026-11-10/11): built with the timing cache of a fresh sm72 build of the same model (models/fhd26<m>/sm72.timing.cache,
 #   made here when missing). With TensorRT 10.3 the sm80 tactics of those two engines cannot run in one process next to another class of the same
 #   model ("Cask Gemm execution" at the first enqueue, reproduced with models/trt_pair.py); the sm72 tactics at 80 SMs cost 26s 3.6 / 26l 7.9 ms (same as native).
 #   26x at 88 with native tactics hit the same "Cask Gemm execution" next to its other classes (2026-11-11 18:38), hence the cache for x >= 88 too.
 #   class 88 (2026-11-11) = the (P132,N24) gap of the union layout: D slots with no UL work within ul_back 4 slots (DDDDDDSUUU slots 4-6); the
-#   tenant uses it only when the engine exists, so build it with `build_yolo_engines.sh fhd 88` and then add 88 to .env DAPP_TENANT_CLASSES_FHD.
+#   tenant uses it only when the engine exists. 88 is in the tracked .env DAPP_TENANT_CLASSES_FHD, so the default fhd build makes it
+#   (./dgist.sh check asks for the last class of that list).
 set -eu
 D=$(cd "$(dirname "$0")/.." && pwd); . $D/.env
 A=$D/aerial-cuda-accelerated-ran; M=$A/cuPHY-CP/dapp_hook/models; MODELS=${MODELS:-n s m l x}
 INPUT=${DAPP_INPUT:-4k}; case "${1:-}" in 4k|fhd) INPUT=$1; shift ;; esac
 case $INPUT in fhd) B=3; SET=fhd26 ;; 4k) B=8; SET=full26 ;; *) echo "!! unknown profile '$INPUT' (4k|fhd)"; exit 2 ;; esac
-CLASSES=${*:-$(echo ${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80} | tr ',' ' ')}
+DEF=${DAPP_TENANT_CLASSES:-24,40,48,56,64,72,80}; [ $INPUT = fhd ] && DEF=${DAPP_TENANT_CLASSES_FHD:-24,40,48,56,64,72,80,88}   # the class list of the profile (as scripts/l1_entrypoint.sh)
+CLASSES=${*:-$(echo $DEF | tr ',' ' ')}
 PY=$D/va_service/yolo_env/bin/python; [ -x $PY ] || { echo "!! va_service/yolo_env missing (scripts/setup_venvs.sh)"; exit 1; }
 need=""; for m in $MODELS; do [ -s $M/yolo26${m}_1280_b${B}_e2e.onnx ] || need="$need yolo26$m"; done
 if [ -n "$need" ]; then echo "== ONNX export, batch $B (CPU, a few minutes per model):$need"; (cd $M && $PY export_1280.py --models $need --batches $B --nms-free | grep -E 'onnx:|rror' ); fi

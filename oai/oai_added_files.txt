@@ -40,6 +40,7 @@ openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_slice_2ue.c
 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_slice_original.c
 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_slice_ppo_ver1.c
 openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_slice_ppo_ver2.c
+openair2/LAYER2/NR_MAC_gNB/ccma_e2.h
 openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_RA.c_aerial_success
 openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch_fix.c
 openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch_original.c

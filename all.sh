@@ -3,7 +3,7 @@
 #   up [name] [--xapp]   idempotent: starts what is down, in order: core (sudo password if down) -> nearRT-RIC -> L1 + gNB (dgist.sh up) -> VA service
 #                        -> non-VA service [-> PPO slicing xApp, once 2 VA + 2 non-VA phones stream].  RIC before gNB: the OAI E2 agent
 #                        aborts the gNB if its RIC disappears, so never restart the RIC while the gNB runs.
-#   down [--core]        PPO xApp (+writer, guard) -> monitor -> non-VA -> VA -> gNB + L1 (dgist.sh down) -> nearRT-RIC  [-> core]; ends with what is still running
+#   down [--core]        PPO xApp (+writer, guard) -> RA (if started) -> monitor -> non-VA -> VA -> gNB + L1 (dgist.sh down) -> nearRT-RIC  [-> core]; ends with what is still running
 #   status               everything on one screen
 #   restart [name]       down + up
 #   mode [ours|baseline] show or switch the demo mode (.env DEMO_MODE; stack must be down). baseline = vanilla cuBB 25-3 on MIG 4g + naive YOLO on MIG 3g,
@@ -51,6 +51,7 @@ up)
 down)
   shift; CORE=0; for a in "$@"; do [ "$a" = --core ] && CORE=1; done
   step "PPO xApp + compute writer + guard"; bash $D/xapp.sh stop
+  if [ -f $D/runs/ra/ra.pid ] || [ -f $D/runs/ra/e2.pid ]; then step "Resource Allocator (ICNL)"; bash $D/ra.sh stop; fi
   step "monitor xApp"; bash $D/xapp.sh moni stop
   step "non-VA service"; bash $D/nonva.sh stop
   step "VA service"; bash $D/va.sh stop

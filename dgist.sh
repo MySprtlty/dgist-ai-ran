@@ -17,6 +17,7 @@
 #   nonva start|stop|status|test     non-VA live-streaming service of the other phone (nonva_service/, no inference) = ./nonva.sh
 #   ric start|stop|status|build      FlexRIC nearRT-RIC of this package                                  = ./ric.sh
 #   xapp start|stop|status|rntis    hsw GPU-aware PPO slicing xApp + dApp feed                          = ./xapp.sh
+#   ra build|start|stop|status|logs ICNL Resource Allocator: per VA frame UL PRB floor + YOLO model   = ./ra.sh
 #   tgen on|off|load <level>|status  5-cell traffic generator (RU emulator + testMAC in dgist-l1), load low|mid|high|auto at run time = ./tgen.sh
 #   all up|down|status               everything in order                                                 = ./all.sh
 #   logs <target>                    readable live logs                                                  = ./logs.sh
@@ -202,6 +203,7 @@ va) shift; bash $D/va.sh "$@" ;;
 nonva) shift; bash $D/nonva.sh "$@" ;;
 ric) shift; bash $D/ric.sh "$@" ;;
 xapp) shift; bash $D/xapp.sh "$@" ;;
+ra) shift; bash $D/ra.sh "$@" ;;
 all) shift; bash $D/all.sh "$@" ;;
 tgen) shift; bash $D/tgen.sh "$@" ;;
 logs) shift; bash $D/logs.sh "$@" ;;

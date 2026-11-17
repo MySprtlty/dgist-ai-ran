@@ -1,0 +1,38 @@
+# xapp_ccma_ra: the E2 side of the Resource Allocator (ICNL, 2026-11-11). Built out of the FlexRIC tree, like DGIST's
+# cuPHY-CP/dapp_hook/xapp_flexric/CMakeLists.txt, so the FlexRIC tree itself is not modified.
+#   cmake -S . -B build -DFLEXRIC_DIR=/path/to/flexric      # the tree the gNB's E2 agent and the nearRT-RIC were built from (needs its build dir)
+#   cmake --build build
+cmake_minimum_required(VERSION 3.16)
+project(xapp_ccma_ra C)
+
+set(FLEXRIC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../openairinterface5g/openair2/E2AP/flexric" CACHE PATH "FlexRIC source tree (oai/fetch_oai.sh)")
+set(FLEXRIC_BUILD "${FLEXRIC_DIR}/build_dgist" CACHE PATH "its build directory (.env FLEXRIC_BUILD, ./ric.sh build)")
+set(E2AP_VERSION "E2AP_V2" CACHE STRING "must match the FlexRIC build (build/CMakeCache.txt)")
+set(KPM_VERSION "KPM_V2_03" CACHE STRING "must match the FlexRIC build")
+set(LINK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ra_slicing_link" CACHE PATH "ra_slicing_link.h")
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_EXTENSIONS ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+find_package(Threads REQUIRED)
+
+set(E42_LIB "${FLEXRIC_BUILD}/src/xApp/libe42_xapp.a")
+if(NOT EXISTS "${E42_LIB}")
+  message(FATAL_ERROR "FlexRIC xApp library not found: ${E42_LIB} (set -DFLEXRIC_DIR / -DFLEXRIC_BUILD)")
+endif()
+add_executable(xapp_ccma_ra xapp_ccma_ra.c)
+target_include_directories(xapp_ccma_ra PRIVATE "${FLEXRIC_DIR}/src" "${LINK_DIR}")
+target_compile_definitions(xapp_ccma_ra PRIVATE ASN ${E2AP_VERSION} ${KPM_VERSION} SQLITE3_XAPP)
+find_library(SQLITE3_LIB sqlite3)
+set(EXTRA_LIBS "")
+if(SQLITE3_LIB)
+  list(APPEND EXTRA_LIBS ${SQLITE3_LIB})
+endif()
+file(GLOB RRC_ASN1_LIB "${FLEXRIC_BUILD}/examples/xApp/c/monitor/RRC_MESSAGES/libasn1_nr_rrc.a")
+if(RRC_ASN1_LIB)
+  list(APPEND EXTRA_LIBS ${RRC_ASN1_LIB})
+endif()
+target_link_libraries(xapp_ccma_ra PRIVATE "${E42_LIB}" Threads::Threads sctp dl m ${EXTRA_LIBS})

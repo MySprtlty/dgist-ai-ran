@@ -6,6 +6,7 @@ SMF journal (IMSI -> UE IPv4), VA/non-VA uvicorn logs (which IPs post frames). T
 
   python3 ue_table.py            table
   python3 ue_table.py --rntis    VA_RNTIS=a,b NONVA_RNTIS=c,d  (exit 1 when the mapping is not exactly 2 + 2)
+  python3 ue_table.py --ue-ips   RA_UE_IPS=ip=rnti,...  of the in-sync UEs with a known IP, for ra.sh (exit 1 when there is none)
 Reads the journal directly (the nvidia account may), docker logs via the docker group.
 """
 import argparse
@@ -38,6 +39,7 @@ def journal(unit, since):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rntis", action="store_true", help="print VA_RNTIS=.. NONVA_RNTIS=.. for xapp.sh")
+    ap.add_argument("--ue-ips", action="store_true", help="print RA_UE_IPS=ip=rnti,... for ra.sh (ICNL Resource Allocator)")
     ap.add_argument("--va-imsis", default=os.environ.get("VA_IMSIS", ""), help="comma list: the two VA phones' IMSIs (stable across re-attach)")
     ap.add_argument("--nonva-imsis", default=os.environ.get("NONVA_IMSIS", ""), help="comma list: the two non-VA phones' IMSIs")
     ap.add_argument("--since", default=None, help="journal window for the IMSI mapping (default: since the running gNB container started, else 12 hours ago)")
@@ -107,6 +109,13 @@ def main():
         rows.append(dict(rnti=rnti, ueid=lv["ueid"], imsi=imsi or "?", ip=ip or "?", sync=lv["sync"], rsrp=lv["rsrp"], pcmax=lv["pcmax"],
                          mcs=r.get("mcs"), bler=r.get("bler"), snr=r.get("snr"), svc=svc,
                          frames=va_ips.get(ip, 0) if svc == "VA" else nonva_ips.get(ip, 0) if svc == "non-VA" else 0))
+    if a.ue_ips:   # ICNL 2026-11-17: the Resource Allocator learns a frame's UE from the phone's IP (VA service) and needs its RNTI (MAC, E2)
+        pairs = [f"{r['ip']}={r['rnti']}" for r in rows if r["sync"] == "in-sync" and r["ip"] != "?"]
+        if pairs:
+            print("RA_UE_IPS=" + ",".join(pairs))
+            return 0
+        print(f"# no in-sync UE with a known IP (in-sync: {[(r['rnti'], r['ip']) for r in rows if r['sync'] == 'in-sync']})", file=sys.stderr)
+        return 1
     if a.rntis:
         if a.va_imsis and a.nonva_imsis:   # fixed SIM -> service assignment (.env VA_IMSIS / NONVA_IMSIS): robust to RNTI changes
             by_imsi = {r["imsi"]: r for r in rows if r["sync"] == "in-sync"}

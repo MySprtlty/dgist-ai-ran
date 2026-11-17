@@ -15,6 +15,7 @@
 | VA 서비스 (전화기 → YOLO via dApp, :8000) | `va_service/` uvicorn | `./va.sh start` | `./va.sh stop` | `./va.sh status`, `./logs.sh va` |
 | non-VA 서비스 (라이브 스트리밍, :8001) | `nonva_service/` uvicorn | `./nonva.sh start` | `./nonva.sh stop` | `./nonva.sh status`, `./logs.sh nonva` |
 | PPO 슬라이싱 xApp (+ compute writer + guard) | `xapp_slice_ppo_ctrl` + Python 액터 | `./xapp.sh start` | `./xapp.sh stop` | `./xapp.sh status`, `./xapp.sh trace`, `./logs.sh ppo\|xapp` |
+| ICNL Resource Allocator (VA 사진별 UL PRB 하한 + YOLO 모델) | `ra/xapp/xapp_ccma_ra` + `ra/ra_main.py` | `./ra.sh start` (먼저 `./ra.sh build`, `.env` `VA_RA_HOOK=127.0.0.1:9822` 후 `./va.sh restart`) | `./ra.sh stop` (쿼터 제거) | `./ra.sh status`, `./ra.sh logs` |
 | 모니터 xApp (읽기 전용) | `xapp_ul_input_moni` | `./xapp.sh moni start` (전경: `./xapp.sh moni`) | `./xapp.sh moni stop` | `./xapp.sh moni status`, `./logs.sh moni` |
 | 실험 대시보드 (측정 · 그래프 · Replay, :8010) | `dash/` uvicorn, 스택에 대해 읽기 전용 | `./dash.sh start` | `./dash.sh stop` | `./dash.sh status`, `./dash.sh logs`, `./dash.sh list` |
 | **전체** | 위 순서대로 | `./all.sh up [이름] [--xapp]` | `./all.sh down [--core]` | `./all.sh status` |

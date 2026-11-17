@@ -36,6 +36,22 @@ RAN function 142가 두 번 등록된다(동작 지장 없음).
 `NR_UL_indication`: `num_ucis == 0`인 UCI.indication을 AssertFatal 대신 버림. 하이브리드 L1(에뮬레이터 셀 동반)에서 필요했던 수정으로, 1셀에서는 발동하지 않지만
 같은 소스로 유지한다.
 
+## ICNL Resource Allocator: UE별 UL PRB 하한 (2026-11-11, 이 패키지에는 2026-11-17)
+
+곽정호 교수님 연구실(ICNL) Resource Allocator(`ra/`, `./ra.sh`)의 E2 xApp `xapp_ccma_ra`가 E2SM-RC Control Style 2 액션 101 파라미터 5로 보내는
+UE별 UL PRB 하한을 받아 MAC UL 스케줄러가 지킨다. 하한을 받지 않으면 동작은 이전과 같다. 따로 본 hunk는 `docs/patches/oai_ra_ul_prb_floor.patch`
+(위 hsw·DGIST 트리 기준).
+
+| 파일 | 내용 |
+|---|---|
+| `openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c` | RC 기능 정의에 Control Style 2 "Radio Resource Allocation Control", 액션 101 "CCMA UL link adaptation"(파라미터 1 C-RNTI, 2 MCS 상한, 3 PF 가중치, 4 유효 시간 ms, 5 UL PRB 하한)을 더해 광고하고, 받은 하한을 `ccma_e2_set_ul_floor`로 넘김. 2·3은 받기만 함 |
+| `openair2/LAYER2/NR_MAC_gNB/ccma_e2.h` (신규) | `int ccma_e2_set_ul_floor(uint16_t rnti, int floor_prb, int validity_ms)` |
+| `openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c` (hsw판 위) | 하한 표(UE 32개, mutex). `pf_ul`: UL 데이터가 있는 동안 매 UL 슬롯 그 UE에 최소 min(하한, 버퍼를 비우는 PRB)를 줌(신규 + 재전송 합). 아직 차례가 오지 않은 하한 UE의 몫을 같은 서비스 쿼터 안에서 앞 UE들로부터 예약해 두고, 하한 위는 기본 PF와 hsw 서비스 쿼터가 정함. PHR로 전력이 모자라면 PRB 대신 MCS가 내려감. 유효 시간(RA 기본 60 ms)이 지나면 하한이 풀려 RA가 멈춰도 기본 스케줄러로 돌아감. 로그 `[RA_FLOOR]` |
+
+hsw 회계(`AssertFatal`)는 그대로다: 모든 할당이 `ul_service_allowance`와 셀 남은 PRB 안이다. 재전송 루프와 HARQ drain은 바꾸지 않았다.
+확인: DGIST `Dockerfile.gNB.aerial.ubuntu.dgist`(`-Werror`, `--build-e2`)로 x86 빌드(2026-11-11), ICNL GH200(arm64)에서 이 패치 + 영상 tap 패치를 얹은
+gNB로 휴대폰 4대 시험(2026-11-14, 하한 명령 8,538개 모두 ack, gNB `[RA_FLOOR]` 집행 확인).
+
 ## 참고: 트리에 남아 있는 연구실 작업 파일
 
 `*_original.c/h`, `*_ppo_ver*.c/h`, `*_1ue/_2ue*`, `gNB_scheduler_uci.c_logging`, `ci-scripts/yaml_files/sa_gnb_aerial/original.txt_*` 등은 연구실의 실험 버전 백업이다.

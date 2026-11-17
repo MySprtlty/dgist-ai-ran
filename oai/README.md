@@ -6,7 +6,7 @@ commits plus the changes kept here**, recreated by `./oai/fetch_oai.sh` (≈1 mi
 | file | content |
 |---|---|
 | `oai_skipworktree.patch`, `oai_removed_files.txt` | state of the files the lab marked skip-worktree (ci-scripts run files, .dockerignore removed) |
-| `oai_lab.patch` | hsw lab's OAI changes (MAC UL count-quota scheduler, E2 agent / slice SM, NGAP) + DGIST fixes (`docs/patches/oai_*.patch` are the DGIST hunks on their own) |
+| `oai_lab.patch` | hsw lab's OAI changes (MAC UL count-quota scheduler, E2 agent / slice SM, NGAP) + DGIST fixes (`docs/patches/oai_*.patch` are the DGIST hunks on their own) + ICNL Resource Allocator UL PRB floor (`docs/patches/oai_ra_ul_prb_floor.patch`, 2026-11-17) |
 | `files/` + `oai_added_files.txt` | files added to the OAI tree (Dockerfile.gNB.aerial.ubuntu.dgist, lab scheduler variants, configs) |
 | `flexric_lab.patch`, `flexric_files/` + `flexric_added_files.txt` | FlexRIC changes: xApps `xapp_slice_ppo_ctrl`, `xapp_ul_input_moni`, MAC SM IEs |
 | `nvipc_src.2026.05.06.tar.gz` | nvIPC sources the OAI Aerial Dockerfile unpacks (from the Aerial 25-3 SDK; `cuPHY-CP/gt_common_libs/pack_nvipc.sh` regenerates one) |

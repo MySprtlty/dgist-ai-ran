@@ -1,0 +1,458 @@
+diff --git a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c
+index 14c3574..3f66c93 100644
+--- a/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c
++++ b/openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c
+@@ -32,6 +32,10 @@
+ #include <stdio.h>
+ #include <unistd.h>
+ #include "common/ran_context.h"
++#include "common/utils/LOG/log.h"
++#ifdef NGRAN_GNB_DU /* ICNL 11/11: the MAC (and so the RA UL PRB floor) exists where the DU is built in */
++#include "openair2/LAYER2/NR_MAC_gNB/ccma_e2.h"
++#endif
+ 
+ static pthread_once_t once_rc_mutex = PTHREAD_ONCE_INIT;
+ static rc_subs_data_t rc_subs_data = {0};
+@@ -268,16 +272,8 @@ static void fill_rc_report(ran_func_def_report_t* report)
+   report->seq_report_sty[1] = fill_report_style_4("UE Information");
+ }
+ 
+-static void fill_rc_control(ran_func_def_ctrl_t* ctrl)
++static void fill_rc_ctrl_style_1(seq_ctrl_style_t* ctrl_style)
+ {
+-  // Sequence of CONTROL styles
+-  // [1 - 63]
+-  ctrl->sz_seq_ctrl_style = 1;
+-  ctrl->seq_ctrl_style = calloc(ctrl->sz_seq_ctrl_style, sizeof(seq_ctrl_style_t));
+-  assert(ctrl->seq_ctrl_style != NULL && "Memory exhausted");
+-
+-  seq_ctrl_style_t* ctrl_style = &ctrl->seq_ctrl_style[0];
+-
+   // RIC Control Style Type
+   // Mandatory
+   // 9.3.3
+@@ -380,6 +376,57 @@ static void fill_rc_control(ran_func_def_ctrl_t* ctrl)
+   ctrl_style->ran_param_ctrl_out = NULL;
+ }
+ 
++/* ICNL 11/11 (IITP demo): E2SM-RC Control Style 2 "Radio Resource Allocation Control" for the Resource Allocator xApp
++ * (iitp_demo/ra/xapp/xapp_ccma_ra.c), as the 10/28 CCMA control (spark_realue/oai/ccma_e2rc_20261028.diff) but only:
++ *   action 101 "CCMA UL link adaptation" (vendor-specific): 1 C-RNTI, 2 UL MCS cap and 3 UL PF weight x1000 (accepted, not
++ *   used in this build), 4 validity ms (0 = until replaced), 5 UL PRB floor per slot (0 = none), applied by the UL scheduler
++ *   (ccma_e2.h, gNB_scheduler_ulsch.c pf_ul). */
++enum { CCMA_RC_ACT_UL_LA = 101 };
++enum { CCMA_RC_P_RNTI = 1, CCMA_RC_P_MCS_CAP = 2, CCMA_RC_P_WEIGHT = 3, CCMA_RC_P_VALIDITY = 4, CCMA_RC_P_UL_FLOOR = 5 };
++
++static void fill_assoc(seq_ran_param_3_t* p, uint32_t id, const char* name)
++{
++  p->id = id;
++  p->name = cp_str_to_ba(name);
++  p->def = NULL;
++}
++
++static void fill_rc_ctrl_style_2(seq_ctrl_style_t* ctrl_style)
++{
++  ctrl_style->style_type = 2;
++  ctrl_style->name = cp_str_to_ba("Radio Resource Allocation Control");
++  ctrl_style->hdr = FORMAT_1_E2SM_RC_CTRL_HDR;
++  ctrl_style->msg = FORMAT_1_E2SM_RC_CTRL_MSG;
++  ctrl_style->call_proc_id_type = NULL;
++  ctrl_style->out_frmt = FORMAT_1_E2SM_RC_CTRL_OUT;
++  ctrl_style->sz_seq_ctrl_act = 1;
++  ctrl_style->seq_ctrl_act = calloc(ctrl_style->sz_seq_ctrl_act, sizeof(seq_ctrl_act_2_t));
++  assert(ctrl_style->seq_ctrl_act != NULL && "Memory exhausted");
++  seq_ctrl_act_2_t* a = &ctrl_style->seq_ctrl_act[0];
++  a->id = CCMA_RC_ACT_UL_LA;
++  a->name = cp_str_to_ba("CCMA UL link adaptation");
++  a->sz_seq_assoc_ran_param = 5;
++  a->assoc_ran_param = calloc(a->sz_seq_assoc_ran_param, sizeof(seq_ran_param_3_t));
++  assert(a->assoc_ran_param != NULL && "Memory exhausted");
++  fill_assoc(&a->assoc_ran_param[0], CCMA_RC_P_RNTI, "C-RNTI");
++  fill_assoc(&a->assoc_ran_param[1], CCMA_RC_P_MCS_CAP, "UL MCS cap");
++  fill_assoc(&a->assoc_ran_param[2], CCMA_RC_P_WEIGHT, "UL PF weight x1000");
++  fill_assoc(&a->assoc_ran_param[3], CCMA_RC_P_VALIDITY, "Validity ms");
++  fill_assoc(&a->assoc_ran_param[4], CCMA_RC_P_UL_FLOOR, "UL PRB floor per slot");
++  ctrl_style->sz_ran_param_ctrl_out = 0;
++  ctrl_style->ran_param_ctrl_out = NULL;
++}
++
++static void fill_rc_control(ran_func_def_ctrl_t* ctrl)
++{
++  // Sequence of CONTROL styles [1 - 63]: Style 1 (stock OAI) and Style 2 (ICNL 11/11, RA UL PRB floor)
++  ctrl->sz_seq_ctrl_style = 2;
++  ctrl->seq_ctrl_style = calloc(ctrl->sz_seq_ctrl_style, sizeof(seq_ctrl_style_t));
++  assert(ctrl->seq_ctrl_style != NULL && "Memory exhausted");
++  fill_rc_ctrl_style_1(&ctrl->seq_ctrl_style[0]);
++  fill_rc_ctrl_style_2(&ctrl->seq_ctrl_style[1]);
++}
++
+ static ran_function_name_t fill_rc_ran_func_name(void)
+ {
+   ran_function_name_t dst = {
+@@ -889,16 +936,92 @@ sm_ag_if_ans_t write_subs_rc_sm(void const* src)
+ }
+ 
+ 
++#ifdef NGRAN_GNB_DU
++/* ICNL 11/11: an integer RAN parameter by ID anywhere in the message (elements, structures, lists) */
++static bool ccma_rc_find_int(const seq_ran_param_t* p, size_t n, uint32_t id, int64_t* out, int depth)
++{
++  if (p == NULL || depth > 8)
++    return false;
++  for (size_t i = 0; i < n; i++) {
++    const ran_param_val_type_t* v = &p[i].ran_param_val;
++    if (p[i].ran_param_id == id
++        && (v->type == ELEMENT_KEY_FLAG_TRUE_RAN_PARAMETER_VAL_TYPE || v->type == ELEMENT_KEY_FLAG_FALSE_RAN_PARAMETER_VAL_TYPE)) {
++      const ran_parameter_value_t* e = v->type == ELEMENT_KEY_FLAG_TRUE_RAN_PARAMETER_VAL_TYPE ? v->flag_true : v->flag_false;
++      if (e != NULL && e->type == INTEGER_RAN_PARAMETER_VALUE) {
++        *out = e->int_ran;
++        return true;
++      }
++    }
++    if (v->type == STRUCTURE_RAN_PARAMETER_VAL_TYPE && v->strct != NULL
++        && ccma_rc_find_int(v->strct->ran_param_struct, v->strct->sz_ran_param_struct, id, out, depth + 1))
++      return true;
++    if (v->type == LIST_RAN_PARAMETER_VAL_TYPE && v->lst != NULL)
++      for (size_t j = 0; j < v->lst->sz_lst_ran_param; j++)
++        if (ccma_rc_find_int(v->lst->lst_ran_param[j].ran_param_struct.ran_param_struct,
++                             v->lst->lst_ran_param[j].ran_param_struct.sz_ran_param_struct,
++                             id,
++                             out,
++                             depth + 1))
++          return true;
++  }
++  return false;
++}
++#endif
++
++/* ICNL 11/11: E2SM-RC Control Style 2 for the Resource Allocator xApp (see fill_rc_ctrl_style_2) */
++static void ccma_rc_style_2(rc_ctrl_req_data_t const* ctrl)
++{
++#ifndef NGRAN_GNB_DU
++  (void)ctrl;
++  LOG_W(NR_MAC, "RC CONTROL style 2: no MAC in this E2 node (no DU), ignored\n");
++#else
++  if (ctrl->hdr.frmt_1.ctrl_act_id != CCMA_RC_ACT_UL_LA) {
++    LOG_W(NR_MAC, "RC CONTROL style 2 action %u not supported, ignored\n", ctrl->hdr.frmt_1.ctrl_act_id);
++    return;
++  }
++  const seq_ran_param_t* rp = ctrl->msg.frmt_1.ran_param;
++  const size_t n = ctrl->msg.frmt_1.sz_ran_param;
++  int64_t rnti = 0, floor_prb = -1, validity = 0;
++  ccma_rc_find_int(rp, n, CCMA_RC_P_RNTI, &rnti, 0);
++  ccma_rc_find_int(rp, n, CCMA_RC_P_VALIDITY, &validity, 0);
++  if (!ccma_rc_find_int(rp, n, CCMA_RC_P_UL_FLOOR, &floor_prb, 0) || rnti <= 0 || rnti > 0xffff || floor_prb < 0
++      || validity < 0) {
++    LOG_W(NR_MAC,
++          "RC CONTROL style 2 action 101: needs C-RNTI and UL PRB floor (rnti %ld floor %ld validity %ld), ignored\n",
++          (long)rnti,
++          (long)floor_prb,
++          (long)validity);
++    return;
++  }
++  ccma_e2_set_ul_floor((uint16_t)rnti, (int)floor_prb, (int)validity);
++#endif
++}
++
+ sm_ag_if_ans_t write_ctrl_rc_sm(void const* data)
+ {
+   assert(data != NULL);
+ //  assert(data->type == RAN_CONTROL_CTRL_V1_03 );
+ 
+   rc_ctrl_req_data_t const* ctrl = (rc_ctrl_req_data_t const*)data;
++  sm_ag_if_ans_t ans = {.type = CTRL_OUTCOME_SM_AG_IF_ANS_V0};
++  ans.ctrl_out.type = RAN_CTRL_V1_3_AGENT_IF_CTRL_ANS_V0;
+ 
+-  assert(ctrl->hdr.format == FORMAT_1_E2SM_RC_CTRL_HDR && "Indication Header Format received not valid");
+-  assert(ctrl->msg.format == FORMAT_1_E2SM_RC_CTRL_MSG && "Indication Message Format received not valid");
+-  assert(ctrl->hdr.frmt_1.ctrl_act_id == 2 && "Currently only QoS flow mapping configuration supported");
++  /* ICNL 11/11: a CONTROL comes from the RIC, so check it instead of asserting (an assert would stop the gNB) */
++  if (ctrl->hdr.format != FORMAT_1_E2SM_RC_CTRL_HDR || ctrl->msg.format != FORMAT_1_E2SM_RC_CTRL_MSG) {
++    LOG_W(NR_MAC, "RC CONTROL: header/message format %d/%d not supported, ignored\n", ctrl->hdr.format, ctrl->msg.format);
++    return ans;
++  }
++  if (ctrl->hdr.frmt_1.ric_style_type == 2) {
++    ccma_rc_style_2(ctrl);
++    return ans;
++  }
++  if (ctrl->hdr.frmt_1.ric_style_type != 1 || ctrl->hdr.frmt_1.ctrl_act_id != 2) {
++    LOG_W(NR_MAC,
++          "RC CONTROL: style %u action %u not supported, ignored\n",
++          ctrl->hdr.frmt_1.ric_style_type,
++          ctrl->hdr.frmt_1.ctrl_act_id);
++    return ans;
++  }
+ 
+   printf("QoS flow mapping configuration\n");
+ 
+@@ -934,9 +1057,6 @@ sm_ag_if_ans_t write_ctrl_rc_sm(void const* data)
+ 
+   printf("qfi = %ld, dir %ld \n", qfi, dir);
+ 
+-
+-  sm_ag_if_ans_t ans = {.type = CTRL_OUTCOME_SM_AG_IF_ANS_V0};
+-  ans.ctrl_out.type = RAN_CTRL_V1_3_AGENT_IF_CTRL_ANS_V0;
+   return ans;
+ }
+ 
+diff --git a/openair2/LAYER2/NR_MAC_gNB/ccma_e2.h b/openair2/LAYER2/NR_MAC_gNB/ccma_e2.h
+new file mode 100644
+index 0000000..77d7b9c
+--- /dev/null
++++ b/openair2/LAYER2/NR_MAC_gNB/ccma_e2.h
+@@ -0,0 +1,16 @@
++/*
++ * ICNL 2026-11-11 (IITP 6G demo, Resource Allocator): UL PRB floor per slot and UE from the Resource Allocator xApp over
++ * E2SM-RC Control Style 2 action 101 parameter 5, handled in openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc.c and applied
++ * in gNB_scheduler_ulsch.c (pf_ul). Called from the E2 agent thread; the scheduler reads the table under a mutex.
++ */
++#ifndef CCMA_E2_H
++#define CCMA_E2_H
++#include <stdint.h>
++
++/* While the UE has UL data, each UL slot gives it at least min(floor_prb, the PRBs that empty its buffer) PRBs, new
++ * transmissions and retransmissions together; what is above the floor is left to the stock scheduler (PF order, the
++ * service quotas). floor_prb 0 = no floor. validity_ms 0 = until replaced; once it runs out the UE has no floor.
++ * Returns 0, or -1 for a bad RNTI / a full table. */
++int ccma_e2_set_ul_floor(uint16_t rnti, int floor_prb, int validity_ms);
++
++#endif
+diff --git a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+index 6a413dc..99a34ef 100644
+--- a/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
++++ b/openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_ulsch.c
+@@ -36,6 +36,8 @@
+ #include <openair2/UTIL/OPT/opt.h>
+ #include "LAYER2/nr_rlc/nr_rlc_oai_api.h"
+ #include <time.h>
++#include <pthread.h>
++#include "ccma_e2.h" /* ICNL 11/11: Resource Allocator UL PRB floor */
+ 
+ //#define SRS_IND_DEBUG
+ 
+@@ -2086,11 +2088,91 @@ static bool allocate_ul_retransmission(gNB_MAC_INST *nrmac,
+   return true;
+ }
+ 
++/* ICNL 11/11 (IITP demo, Resource Allocator): UL PRB floor per slot and UE from the RA xApp (E2SM-RC Style 2 action 101
++ * parameter 5, ran_func_rc.c; ccma_e2.h). Written by the E2 agent thread, read by pf_ul under ra_floor_mtx.
++ * Semantics in pf_ul: the stock order and sizes stay (retransmissions first, then new transmissions greedy in PF order),
++ * but the floors of the UEs not served yet in this slot are kept out of the grants of the UEs before them (within the
++ * same service quota), and a floor UE's own grant is at least its reservation; above the floor the stock rules decide. */
++#define RA_FLOOR_UES 32
++static pthread_mutex_t ra_floor_mtx = PTHREAD_MUTEX_INITIALIZER;
++static struct {
++  uint16_t rnti; /* 0 = free entry */
++  int prb;
++  uint64_t until_us; /* 0 = until replaced */
++} ra_floor_tab[RA_FLOOR_UES];
++static volatile int ra_floor_any; /* fast path: no floor received yet */
++static uint64_t ra_floor_log_n;
++
++static uint64_t ra_now_us(void)
++{
++  struct timespec t;
++  clock_gettime(CLOCK_MONOTONIC, &t);
++  return (uint64_t)t.tv_sec * 1000000ULL + (uint64_t)t.tv_nsec / 1000;
++}
++
++int ccma_e2_set_ul_floor(uint16_t rnti, int floor_prb, int validity_ms)
++{
++  if (rnti == 0 || floor_prb < 0)
++    return -1;
++  const uint64_t until = validity_ms > 0 ? ra_now_us() + (uint64_t)validity_ms * 1000 : 0;
++  int ret = -1;
++  pthread_mutex_lock(&ra_floor_mtx);
++  int k = -1;
++  for (int i = 0; i < RA_FLOOR_UES; i++) {
++    if (ra_floor_tab[i].rnti == rnti) {
++      k = i;
++      break;
++    }
++    if (k < 0 && ra_floor_tab[i].rnti == 0)
++      k = i;
++  }
++  if (k >= 0) {
++    if (floor_prb == 0) {
++      memset(&ra_floor_tab[k], 0, sizeof(ra_floor_tab[k]));
++    } else {
++      ra_floor_tab[k].rnti = rnti;
++      ra_floor_tab[k].prb = min(floor_prb, NR_UL_PRB_TOTAL_BUDGET);
++      ra_floor_tab[k].until_us = until;
++      ra_floor_any = 1;
++    }
++    ret = 0;
++  }
++  pthread_mutex_unlock(&ra_floor_mtx);
++  if (ra_floor_log_n < 100 || ra_floor_log_n % 1000 == 0)
++    LOG_I(NR_MAC, "[RA_FLOOR] E2 ctrl #%lu: UE %04x UL floor %d PRB/slot, validity %d ms%s\n", (unsigned long)ra_floor_log_n, rnti,
++          floor_prb, validity_ms, ret < 0 ? " (table full, ignored)" : "");
++  ra_floor_log_n++;
++  return ret;
++}
++
++/* this UE's floor now (0 = none or expired) */
++static int ra_floor_get(uint16_t rnti)
++{
++  if (!ra_floor_any)
++    return 0;
++  const uint64_t now = ra_now_us();
++  int f = 0;
++  pthread_mutex_lock(&ra_floor_mtx);
++  for (int i = 0; i < RA_FLOOR_UES; i++) {
++    if (ra_floor_tab[i].rnti != rnti)
++      continue;
++    if (ra_floor_tab[i].until_us && now > ra_floor_tab[i].until_us)
++      memset(&ra_floor_tab[i], 0, sizeof(ra_floor_tab[i])); /* expired: back to the stock scheduler */
++    else
++      f = ra_floor_tab[i].prb;
++    break;
++  }
++  pthread_mutex_unlock(&ra_floor_mtx);
++  return f;
++}
++
+ typedef struct UEsched_s {
+   float coef;
+   bool sched_inactive;
+   NR_UE_info_t * UE;
+   int selected_mcs;
++  int floor_reserve; /* ICNL 11/11: PRBs kept for this UE's RA floor in this slot (0 = no floor) */
++  unsigned svc;      /* ICNL 11/11: its service (e2_ul_slice_id, 0 = none) */
+ } UEsched_t;
+ 
+ static int comparator(const void *p, const void *q)
+@@ -2298,21 +2380,68 @@ static int  pf_ul(gNB_MAC_INST *nrmac,
+           tbs,
+           coeff_ue,
+           sched_inactive);
++    /* ICNL 11/11: RA floor reservation = min(floor, PRBs that empty the buffer at this MCS) - PRBs this UE already has
++     * in the target slot (retransmissions, earlier passes) */
++    int floor_reserve = 0;
++    const int floor_prb = B > 0 ? ra_floor_get(UE->rnti) : 0;
++    if (floor_prb > 0) {
++      uint16_t fR;
++      uint8_t fQm;
++      update_ul_ue_R_Qm(selected_mcs, current_BWP->mcs_table, current_BWP->pusch_Config, &fR, &fQm);
++      const NR_pusch_dmrs_t fdmrs = get_ul_dmrs_params(scc, current_BWP, tda_info, nrOfLayers);
++      const bwp_info_t fbi = get_pusch_bwp_start_size(UE);
++      uint32_t ftbs = 0;
++      uint16_t need = 0;
++      nr_find_nb_rb(fQm,
++                    fR,
++                    current_BWP->transform_precoding,
++                    nrOfLayers,
++                    tda_info->nrOfSymbols,
++                    fdmrs.N_PRB_DMRS * fdmrs.num_dmrs_symb,
++                    B,
++                    1,
++                    fbi.bwpSize,
++                    &ftbs,
++                    &need);
++      const int used = (int)ul_quota_used_prbs(budget_req, UE->rnti);
++      floor_reserve = max(0, min(floor_prb, (int)need) - used);
++    }
+     UE_sched[numUE].coef = coeff_ue;
+     UE_sched[numUE].sched_inactive = sched_inactive;
+     UE_sched[numUE].UE = UE;
+     UE_sched[numUE].selected_mcs = selected_mcs;
++    UE_sched[numUE].floor_reserve = floor_reserve;
++    UE_sched[numUE].svc = UE->e2_ul_slice_id <= 2 ? UE->e2_ul_slice_id : 0;
+     numUE++;
+   }
+ 
+   qsort(UE_sched, numUE, sizeof(UEsched_t), comparator);
+   UEsched_t *iterator=UE_sched;
++  /* ICNL 11/11: RA floors of the UEs that come later in this loop (kept out of the grants of the UEs before them) */
++  const bool ra_quotas_on = nrmac->e2_ul_slice_prbs[0] || nrmac->e2_ul_slice_prbs[1];
++  int ra_pend_total = 0, ra_pend_svc[3] = {0}, ra_pend_ues = 0;
++  for (int i = 0; i < numUE; i++) {
++    if (UE_sched[i].floor_reserve <= 0)
++      continue;
++    ra_pend_total += UE_sched[i].floor_reserve;
++    ra_pend_svc[UE_sched[i].svc] += UE_sched[i].floor_reserve;
++    ra_pend_ues++;
++  }
+ 
+   /* Loop UE_sched to find max coeff and allocate transmission */
+   while (iterator->UE != NULL) {
+     NR_UE_UL_BWP_t *current_BWP = &iterator->UE->current_UL_BWP;
+     NR_UE_sched_ctrl_t *sched_ctrl = &iterator->UE->UE_sched_ctrl;
+-    const int service_remaining = ul_service_allowance(nrmac, budget_req, iterator->UE, shared_prbs_remaining, false);
++    /* ICNL 11/11: from here this UE is not "later" any more, served or skipped: its reservation stops limiting others */
++    const int ra_reserve = iterator->floor_reserve;
++    if (ra_reserve > 0) {
++      ra_pend_total -= ra_reserve;
++      ra_pend_svc[iterator->svc] -= ra_reserve;
++      ra_pend_ues--;
++    }
++    const int ra_kept = ra_quotas_on ? ra_pend_svc[iterator->svc] : ra_pend_total;
++    const int service_remaining =
++        max(0, ul_service_allowance(nrmac, budget_req, iterator->UE, shared_prbs_remaining, false) - ra_kept);
+ 
+     NR_beam_alloc_t beam = beam_allocation_procedure(&nrmac->beam_info, sched_frame, sched_slot, iterator->UE->UE_beam_index, slots_per_frame);
+     if (beam.idx < 0) {
+@@ -2321,7 +2450,11 @@ static int  pf_ul(gNB_MAC_INST *nrmac,
+       continue;
+     }
+ 
+-    if (remainUEs[beam.idx] == 0 || n_rb_sched[beam.idx] < min_rb || service_remaining < min_rb) {
++    /* ICNL 11/11: RBs of this beam left after the later floors; a UE without a floor also leaves the UE slots
++     * (max_num_ue) the later floor UEs need */
++    const int ra_rb_left = n_rb_sched[beam.idx] - ra_pend_total;
++    if (remainUEs[beam.idx] == 0 || (ra_reserve == 0 && remainUEs[beam.idx] <= ra_pend_ues) || ra_rb_left < min_rb
++        || service_remaining < min_rb) {
+       reset_beam_status(&nrmac->beam_info, sched_frame, sched_slot, iterator->UE->UE_beam_index, slots_per_frame, beam.new_beam);
+       iterator++;
+       continue;
+@@ -2364,11 +2497,15 @@ static int  pf_ul(gNB_MAC_INST *nrmac,
+     bwp_info_t bi = get_pusch_bwp_start_size(iterator->UE);
+     /* Select positions from the whole BWP, but cap grant LENGTH by the
+      * remaining count shared by all UEs, including retransmissions. */
+-    int grant_budget = min(n_rb_sched[beam.idx], service_remaining);
++    int grant_budget = min(ra_rb_left, service_remaining);
+     if (iterator->sched_inactive)
+       grant_budget = min(grant_budget, min_rb);
++    /* ICNL 11/11: a floor UE looks for a run of at least its reservation first, else the stock minimum */
++    const int ra_min = ra_reserve > 0 ? max(min_rb, min(ra_reserve, grant_budget)) : min_rb;
+     uint16_t available_rb = ul_fixed_find_run(rballoc_mask, bi.bwpStart, bi.bwpSize,
+-                                            slbitmap, min_rb, grant_budget, &rbStart);
++                                            slbitmap, ra_min, grant_budget, &rbStart);
++    if (available_rb < ra_min && ra_min > min_rb)
++      available_rb = ul_fixed_find_run(rballoc_mask, bi.bwpStart, bi.bwpSize, slbitmap, min_rb, grant_budget, &rbStart);
+ 
+     if (available_rb < min_rb) {
+       reset_beam_status(&nrmac->beam_info, frame, slot, iterator->UE->UE_beam_index, slots_per_frame, dci_beam.new_beam);
+@@ -2411,9 +2548,12 @@ static int  pf_ul(gNB_MAC_INST *nrmac,
+ 
+     /* Calculate the current scheduling bytes */
+     const int B = cmax(sched_ctrl->estimated_ul_buffer - sched_ctrl->sched_ul_bytes, 0);
++    /* ICNL 11/11: the grant of a floor UE is at least its reservation (when the run allows it): under a PHR limit the
++     * MCS goes down instead of the PRBs below the floor */
++    const uint16_t ra_min_rb = ra_reserve > 0 ? (uint16_t)max(min_rb, min(ra_reserve, (int)available_rb)) : (uint16_t)min_rb;
+     /* adjust rbSize and MCS according to PHR and BPRE, only if there is data */
+     if((sched_ctrl->pcmax != 0 || sched_ctrl->ph != 0) && B > 0)
+-      nr_ue_max_mcs_min_rb(current_BWP->scs, sched_ctrl->ph, &sched, current_BWP, min_rb, B, &available_rb, &sched.mcs);
++      nr_ue_max_mcs_min_rb(current_BWP->scs, sched_ctrl->ph, &sched, current_BWP, ra_min_rb, B, &available_rb, &sched.mcs);
+ 
+     if (sched.mcs < sched_ctrl->ul_bler_stats.mcs)
+       sched_ctrl->ul_bler_stats.mcs = sched.mcs; /* force estimated MCS down */
+@@ -2429,7 +2569,7 @@ static int  pf_ul(gNB_MAC_INST *nrmac,
+                     sched.tda_info.nrOfSymbols,
+                     sched.dmrs_info.N_PRB_DMRS * sched.dmrs_info.num_dmrs_symb,
+                     B,
+-                    min_rb,
++                    ra_min_rb, /* ICNL 11/11: min_rb, or the floor reservation */
+                     available_rb,
+                     &sched.tb_size,
+                     &sched.rbSize);
+@@ -2497,6 +2637,9 @@ static int  pf_ul(gNB_MAC_INST *nrmac,
+     if (frame % 100 == 0)
+       LOG_I(NR_MAC, "[UL_TOTAL_PRB_GRANT] pusch=%d.%d rnti=%04x new_tx=1 rbStart=%d allocated=%u remaining=%d\n",
+             sched_frame, sched_slot, iterator->UE->rnti, rbStart, (unsigned)sched.rbSize, shared_prbs_remaining);
++    if (ra_reserve > 0 && frame % 100 == 0)
++      LOG_I(NR_MAC, "[RA_FLOOR] pusch=%d.%d rnti=%04x reserve=%d granted=%u B=%d kept_for_later=%d\n",
++            sched_frame, sched_slot, iterator->UE->rnti, ra_reserve, (unsigned)sched.rbSize, B, ra_pend_total);
+ 
+     n_rb_sched[beam.idx] -= sched.rbSize;
+     for (int rb = 0; rb < sched.rbSize; rb++)
